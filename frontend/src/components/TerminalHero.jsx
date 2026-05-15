@@ -1,0 +1,78 @@
+import React, { useEffect, useState } from "react";
+
+const ASCII = `
+  ____  _____ ____ _   _ ____  ____ ___ _   _ _____   ____  ____ ____  
+ |  _ \\| ____/ ___| | | |  _ \\/ ___|_ _| | | | ____| | __ )| __ ) ___| 
+ | |_) |  _|| |   | | | | |_) \\___ \\| || | | |  _|   |  _ \\|  _ \\___ \\ 
+ |  _ <| |__| |___| |_| |  _ < ___) | || \\_/ | |___ _| |_) | |_) |__) |
+ |_| \\_\\_____\\____|\\___/|_| \\_\\____/___|\\___/|_____(_)____/|____/____/ 
+`;
+
+export const TerminalHero = ({ status }) => {
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setTick((t) => t + 1), 1200);
+    return () => clearInterval(id);
+  }, []);
+
+  const date = new Date().toISOString().replace("T", " ").slice(0, 19);
+
+  return (
+    <header
+      className="panel relative overflow-hidden p-4 sm:p-6 md:p-8"
+      data-testid="terminal-hero"
+      style={{ borderColor: "rgba(57,255,20,0.45)" }}
+    >
+      <div className="flex flex-col gap-4">
+        <div className="flex items-center justify-between text-[10px] sm:text-xs label-xs text-neon_cyan neon-cyan">
+          <span data-testid="hero-system-tag">[ SYS:RECURSIVE.BBS // NODE-{(tick % 9) + 1} ]</span>
+          <span className="hidden sm:inline">[ LOCAL://{date} UTC ]</span>
+          <span>
+            STATUS:{" "}
+            <span
+              className={
+                !status ? "text-phosphor3" : status.stub_mode ? "text-amber_warn" : "text-phosphor"
+              }
+            >
+              {!status ? "BOOTING" : status.stub_mode ? "STUB-LOOP" : "LIVE-NIM"}
+            </span>
+            <span className="animate-blink ml-1">_</span>
+          </span>
+        </div>
+
+        <pre
+          className="ascii text-phosphor neon-text text-[8px] sm:text-[10px] md:text-xs overflow-x-auto"
+          aria-hidden
+        >
+{ASCII}
+        </pre>
+
+        <div className="font-bbs text-3xl sm:text-5xl lg:text-6xl uppercase tracking-widest text-phosphor neon-text leading-none">
+          a bot that improves itself
+        </div>
+        <div className="font-bbs text-2xl sm:text-3xl lg:text-4xl uppercase tracking-widest text-neon_magenta neon-magenta leading-none glitch-on-hover">
+          by building app-builders that build app-builders.
+        </div>
+
+        <div className="font-mono text-sm sm:text-base text-phosphor2 max-w-3xl mt-2">
+          PIPELINE :: <span className="text-neon_cyan">GLM-5.1</span> generates a meta-builder spec →{" "}
+          <span className="text-neon_magenta">MiniMax-M2.7</span> critiques it →{" "}
+          <span className="text-neon_yellow">Nemotron-70B-Reward</span> scores it. Top-rated DNA is
+          fed back into the next generation.
+        </div>
+
+        <div className="flex flex-wrap gap-2 sm:gap-4 text-[10px] sm:text-xs label-xs mt-2">
+          <span className="border border-phosphor/40 px-2 py-1 text-phosphor">
+            BUILDS :: {status?.total_builds ?? "—"}
+          </span>
+          <span className="border border-neon_cyan/40 px-2 py-1 text-neon_cyan neon-cyan">
+            MODE :: {!status ? "BOOTING…" : status.stub_mode ? "OFFLINE/STUB" : "ONLINE/NVIDIA-NIM"}
+          </span>
+          <span className="border border-neon_magenta/40 px-2 py-1 text-neon_magenta neon-magenta">
+            EVOLUTION :: ENABLED
+          </span>
+        </div>
+      </div>
+    </header>
+  );
+};
