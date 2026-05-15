@@ -31,11 +31,11 @@ export const PromptConsole = ({ onSubmit, busy, parentId, onClearParent }) => {
         </div>
         {parentId && (
           <button
-            data-testid="clear-parent-btn"
+            data-testid="parent-chip"
             onClick={onClearParent}
             className="text-[10px] label-xs text-amber_warn border border-amber_warn/50 px-2 py-1 hover:bg-amber_warn hover:text-black transition-colors"
           >
-            FORK FROM :: {parentId.slice(0, 8)} ✕
+            FORK FROM :: {parentId.slice(0, 8)} <span data-testid="clear-parent-btn">✕</span>
           </button>
         )}
       </div>

@@ -137,7 +137,10 @@ export const BuildDetail = ({ build, onFeedback, onFork }) => {
         <Bar label="VERBOSITY" value={r.verbosity || 0} max={3} color="yellow" />
         <div className="flex justify-between mt-3 pt-2 border-t border-phosphor/30 font-mono">
           <span className="label-xs text-phosphor2">COMPOSITE</span>
-          <span className="text-phosphor neon-text text-lg tabular-nums">
+          <span
+            data-testid="composite-score"
+            className="text-phosphor neon-text text-lg tabular-nums"
+          >
             {build.composite_score?.toFixed?.(3) ?? "0.000"}
           </span>
         </div>

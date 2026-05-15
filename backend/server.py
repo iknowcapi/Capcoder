@@ -6,6 +6,7 @@ into subsequent generator prompts.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -136,9 +137,15 @@ async def _call_chat(model: str, messages: list[dict]) -> str:
     return resp.choices[0].message.content or ""
 
 
+def _seed(salt: str, prompt: str) -> int:
+    """Deterministic seed stable across process restarts."""
+    h = hashlib.md5(f"{salt}::{prompt}".encode()).hexdigest()
+    return int(h[:8], 16)
+
+
 def _stub_generate(prompt: str, exemplars: list[dict]) -> dict:
     """Deterministic-ish fake generator that produces a believable spec."""
-    seed = abs(hash(prompt)) % 10_000
+    seed = _seed("gen", prompt)
     rng = random.Random(seed)
     primitives_pool = [
         "schema-forge", "route-weaver", "ui-composer", "auth-spine", "stripe-rail",
@@ -201,7 +208,7 @@ def _stub_generate(prompt: str, exemplars: list[dict]) -> dict:
 
 
 def _stub_critique(prompt: str, spec: dict) -> str:
-    rng = random.Random(abs(hash(prompt + "critic")) % 10_000)
+    rng = random.Random(_seed("critic", prompt))
     notes = [
         f"meta_builder.primitives are reasonable but could absorb '{rng.choice(['cache-grid','obs-mesh','perm-tree'])}'.",
         f"app_spec covers {len(spec.get('app_spec', {}).get('apis', []))} endpoints; consider adding a /health probe.",
@@ -212,7 +219,7 @@ def _stub_critique(prompt: str, spec: dict) -> str:
 
 
 def _stub_reward(prompt: str, spec: dict) -> RewardScores:
-    rng = random.Random(abs(hash(prompt + "reward")) % 10_000)
+    rng = random.Random(_seed("reward", prompt))
     return RewardScores(
         helpfulness=round(rng.uniform(1.5, 3.5), 2),
         correctness=round(rng.uniform(1.0, 3.5), 2),
@@ -369,7 +376,8 @@ async def create_build(req: BuildRequest):
         parent = await db.builds.find_one({"id": req.parent_id}, {"_id": 0})
         generation = (parent.get("generation", 1) + 1) if parent else 1
     else:
-        generation = (await db.builds.count_documents({})) % 999 + 1
+        last = await db.builds.find_one({}, {"_id": 0, "generation": 1}, sort=[("generation", -1)])
+        generation = ((last or {}).get("generation", 0) or 0) + 1
 
     build = Build(
         generation=generation,
