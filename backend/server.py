@@ -1,27 +1,31 @@
 """
-RECURSIVE.BBS — backend for the self-improving 'app-builder that builds app-builders'.
-Pipeline: user prompt -> GLM-5.1 (generator) -> MiniMax-M2.7 (critic) -> Nemotron-70B-Reward (rater)
-Self-improvement: top-rated builds are fetched and injected as few-shot examples
-into subsequent generator prompts.
+RECURSIVE.BBS — a code-builder app whose bots emit real, runnable code projects.
+
+Pipeline (per build):
+  1. Generator bot   :: detect domain → emit a folder of real working files
+  2. Critic          :: review those files (line count, endpoint coverage, etc.)
+  3. Rater           :: score across 5 dimensions
+  4. User            :: download the .zip, vote thumbs up/down (feeds future builds)
 """
 from __future__ import annotations
 
-import hashlib
-import json
+import io
 import logging
 import os
-import random
-import re
 import uuid
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import List, Optional
 
 from dotenv import load_dotenv
 from fastapi import APIRouter, FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.cors import CORSMiddleware
+
+from blueprints import build_project, critique_files, rate_files
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -38,31 +42,7 @@ mongo_client = AsyncIOMotorClient(mongo_url)
 db = mongo_client[db_name]
 
 # --------------------------------------------------------------------------------------
-# NIM client (graceful stub mode if NVIDIA_API_KEY is missing)
-# --------------------------------------------------------------------------------------
-NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "").strip()
-NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
-GLM_MODEL = "z-ai/glm-5.1"
-MINIMAX_MODEL = "minimaxai/minimax-m2.7"
-REWARD_MODEL = "nvidia/llama-3.1-nemotron-70b-reward"
-
-_nim_client = None
-STUB_MODE = True
-if NVIDIA_API_KEY:
-    try:
-        from openai import AsyncOpenAI
-
-        _nim_client = AsyncOpenAI(api_key=NVIDIA_API_KEY, base_url=NIM_BASE_URL)
-        STUB_MODE = False
-        logger.info("NIM client initialized — live mode.")
-    except Exception as exc:  # pragma: no cover
-        logger.warning("Failed to init NIM client (%s); falling back to stub mode.", exc)
-        STUB_MODE = True
-else:
-    logger.warning("NVIDIA_API_KEY missing — running in STUB MODE.")
-
-# --------------------------------------------------------------------------------------
-# Schemas
+# Models
 # --------------------------------------------------------------------------------------
 class RewardScores(BaseModel):
     helpfulness: float = 0.0
@@ -83,6 +63,11 @@ class RewardScores(BaseModel):
         )
 
 
+class BuildFile(BaseModel):
+    path: str
+    content: str
+
+
 class Build(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -90,13 +75,13 @@ class Build(BaseModel):
     generation: int = 1
     parent_id: Optional[str] = None
     user_prompt: str
-    meta_builder_spec: dict = Field(default_factory=dict)
-    app_spec: dict = Field(default_factory=dict)
+    bot: dict = Field(default_factory=dict)         # describes the code-building bot
+    app: dict = Field(default_factory=dict)         # describes the produced app
+    files: list[BuildFile] = Field(default_factory=list)
     critic_notes: str = ""
     reward: RewardScores = Field(default_factory=RewardScores)
     composite_score: float = 0.0
-    user_vote: int = 0  # -1, 0, 1
-    stub: bool = True
+    user_vote: int = 0
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -106,163 +91,27 @@ class BuildRequest(BaseModel):
 
 
 class FeedbackRequest(BaseModel):
-    vote: int  # -1 or 1
+    vote: int
 
 
 # --------------------------------------------------------------------------------------
-# LLM helpers
+# Helpers
 # --------------------------------------------------------------------------------------
-GENERATOR_SYSTEM = (
-    "You are RECURSIVE.BBS — a meta app-builder generator. Given a user description, "
-    "you output a strict JSON object with two keys: 'meta_builder' and 'app_spec'. "
-    "'meta_builder' describes the *builder that builds this kind of app* (its modules, "
-    "primitives, code-gen recipes). 'app_spec' is the concrete app description produced "
-    "by that builder. Schemas:\n"
-    "{\n"
-    '  "meta_builder": {"name": str, "domain": str, "primitives": [str], '
-    '"code_gen_recipes": [str], "dna_signature": str},\n'
-    '  "app_spec": {"name": str, "tagline": str, "entities": [str], "screens": [str], '
-    '"apis": [{"method": str, "path": str, "purpose": str}], "stack": [str]}\n'
-    "}\n"
-    "Return ONLY the JSON. No prose."
-)
+def _slugify(s: str) -> str:
+    import re
+
+    s = re.sub(r"[^a-zA-Z0-9._-]+", "-", s).strip("-")
+    return s or "build"
 
 
-async def _call_chat(model: str, messages: list[dict]) -> str:
-    if STUB_MODE or _nim_client is None:
-        return ""
-    resp = await _nim_client.chat.completions.create(
-        model=model, messages=messages, temperature=0.7, max_tokens=2048
+async def _exemplars() -> list[dict]:
+    docs = (
+        await db.builds.find({}, {"_id": 0})
+        .sort("composite_score", -1)
+        .limit(3)
+        .to_list(3)
     )
-    return resp.choices[0].message.content or ""
-
-
-def _seed(salt: str, prompt: str) -> int:
-    """Deterministic seed stable across process restarts."""
-    h = hashlib.md5(f"{salt}::{prompt}".encode()).hexdigest()
-    return int(h[:8], 16)
-
-
-def _stub_generate(prompt: str, exemplars: list[dict]) -> dict:
-    """Deterministic-ish fake generator that produces a believable spec."""
-    seed = _seed("gen", prompt)
-    rng = random.Random(seed)
-    primitives_pool = [
-        "schema-forge", "route-weaver", "ui-composer", "auth-spine", "stripe-rail",
-        "vector-index", "queue-spool", "websocket-loom", "cron-orbit", "rbac-mesh",
-        "file-vault", "i18n-prism", "rate-limiter", "audit-trail", "feature-flag",
-    ]
-    recipes_pool = [
-        "scaffold(react+fastapi+mongo)", "emit(crud-endpoints)", "synth(zod-schemas)",
-        "compose(shadcn-pages)", "wire(jwt-auth)", "graft(payments)", "seed(demo-data)",
-    ]
-    stacks_pool = ["React 19", "FastAPI", "MongoDB", "Tailwind", "shadcn/ui", "Motor", "Pydantic"]
-
-    name_tokens = re.findall(r"[A-Za-z]+", prompt)[:3] or ["app"]
-    base = "".join(t.capitalize() for t in name_tokens)
-    domain_words = ["social", "fintech", "wellness", "edtech", "ops", "creator", "iot"]
-    domain = rng.choice(domain_words)
-
-    meta = {
-        "name": f"{base}.builder.v{rng.randint(1, 9)}",
-        "domain": domain,
-        "primitives": rng.sample(primitives_pool, k=rng.randint(4, 7)),
-        "code_gen_recipes": rng.sample(recipes_pool, k=rng.randint(3, 5)),
-        "dna_signature": f"0x{rng.getrandbits(32):08x}",
-    }
-
-    entities_pool = ["User", "Session", "Item", "Order", "Message", "Event", "Workspace", "Token"]
-    apis_pool = [
-        ("POST", "/api/auth/login", "issue session token"),
-        ("GET", "/api/items", "list items"),
-        ("POST", "/api/items", "create item"),
-        ("PATCH", "/api/items/{id}", "update item"),
-        ("DELETE", "/api/items/{id}", "remove item"),
-        ("GET", "/api/me", "current user"),
-        ("POST", "/api/events", "track event"),
-    ]
-    chosen_apis = rng.sample(apis_pool, k=rng.randint(3, 5))
-    app = {
-        "name": base,
-        "tagline": f"a {domain} app forged by {meta['name']}",
-        "entities": rng.sample(entities_pool, k=rng.randint(3, 5)),
-        "screens": rng.sample(
-            ["Dashboard", "Auth", "Settings", "Detail", "Feed", "Inbox", "Billing"],
-            k=rng.randint(3, 5),
-        ),
-        "apis": [{"method": m, "path": p, "purpose": pu} for m, p, pu in chosen_apis],
-        "stack": rng.sample(stacks_pool, k=rng.randint(4, 6)),
-    }
-
-    if exemplars:
-        # 'self-improvement': inherit one primitive from a top-rated ancestor
-        top = exemplars[0]
-        ancestor_prims = top.get("meta_builder_spec", {}).get("primitives", [])
-        if ancestor_prims:
-            inherited = rng.choice(ancestor_prims)
-            if inherited not in meta["primitives"]:
-                meta["primitives"].append(inherited)
-            meta["inherited_from"] = top.get("id")
-
-    return {"meta_builder": meta, "app_spec": app}
-
-
-def _stub_critique(prompt: str, spec: dict) -> str:
-    rng = random.Random(_seed("critic", prompt))
-    notes = [
-        f"meta_builder.primitives are reasonable but could absorb '{rng.choice(['cache-grid','obs-mesh','perm-tree'])}'.",
-        f"app_spec covers {len(spec.get('app_spec', {}).get('apis', []))} endpoints; consider adding a /health probe.",
-        "tagline reads like marketing — tighten to a single technical claim.",
-        f"dna_signature {spec.get('meta_builder', {}).get('dna_signature','?')} should be persisted for lineage diffing.",
-    ]
-    return " // ".join(rng.sample(notes, k=3))
-
-
-def _stub_reward(prompt: str, spec: dict) -> RewardScores:
-    rng = random.Random(_seed("reward", prompt))
-    return RewardScores(
-        helpfulness=round(rng.uniform(1.5, 3.5), 2),
-        correctness=round(rng.uniform(1.0, 3.5), 2),
-        coherence=round(rng.uniform(2.0, 4.0), 2),
-        complexity=round(rng.uniform(0.5, 2.5), 2),
-        verbosity=round(rng.uniform(0.5, 2.5), 2),
-    )
-
-
-def _parse_reward(raw: str) -> RewardScores:
-    scores: dict[str, float] = {}
-    for pair in (p.strip() for p in raw.split(",") if ":" in p):
-        k, v = pair.split(":", 1)
-        try:
-            scores[k.strip().lower()] = float(v.strip())
-        except ValueError:
-            continue
-    return RewardScores(**{k: scores.get(k, 0.0) for k in RewardScores.model_fields})
-
-
-def _extract_json(text: str) -> dict:
-    """Pull first {...} block out of an LLM response."""
-    text = text.strip()
-    # try direct
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-    # try fenced
-    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except Exception:
-            pass
-    # brace match
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except Exception:
-            pass
-    return {}
+    return docs
 
 
 # --------------------------------------------------------------------------------------
@@ -274,17 +123,13 @@ api = APIRouter(prefix="/api")
 
 @api.get("/")
 async def root():
-    return {
-        "system": "RECURSIVE.BBS",
-        "stub_mode": STUB_MODE,
-        "models": {"generator": GLM_MODEL, "critic": MINIMAX_MODEL, "rater": REWARD_MODEL},
-    }
+    return {"system": "RECURSIVE.BBS", "version": "0.2.0"}
 
 
 @api.get("/status")
 async def status():
     total = await db.builds.count_documents({})
-    return {"stub_mode": STUB_MODE, "total_builds": total}
+    return {"total_builds": total}
 
 
 @api.post("/builds", response_model=Build)
@@ -292,103 +137,39 @@ async def create_build(req: BuildRequest):
     if not req.prompt.strip():
         raise HTTPException(400, "prompt is required")
 
-    # ---- self-improvement: pull top-rated exemplars -----------------------------------
-    top_docs = (
-        await db.builds.find({}, {"_id": 0})
-        .sort("composite_score", -1)
-        .limit(3)
-        .to_list(3)
-    )
-    exemplar_payload = [
-        {
-            "id": d["id"],
-            "meta_builder_spec": d.get("meta_builder_spec", {}),
-            "composite_score": d.get("composite_score", 0),
-        }
-        for d in top_docs
-    ]
+    # ---- self-improvement: pull top-rated prior builds as exemplars ------------------
+    exemplars = await _exemplars()
 
-    # ---- generation -------------------------------------------------------------------
-    parsed: dict = {}
-    if not STUB_MODE:
-        gen_messages: list[dict[str, Any]] = [{"role": "system", "content": GENERATOR_SYSTEM}]
-        if exemplar_payload:
-            gen_messages.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "TOP-RATED PRIOR BUILDS (use their patterns as inspiration):\n"
-                        + json.dumps(exemplar_payload, indent=2)
-                    ),
-                }
-            )
-        gen_messages.append({"role": "user", "content": req.prompt})
-        try:
-            raw = await _call_chat(GLM_MODEL, gen_messages)
-            parsed = _extract_json(raw)
-        except Exception as exc:
-            logger.error("generator call failed: %s", exc)
-            parsed = {}
-    if not parsed:
-        parsed = _stub_generate(req.prompt, exemplar_payload)
+    # ---- the bot generates a real folder of code --------------------------------------
+    proj = build_project(req.prompt, exemplars=exemplars)
 
-    meta_spec = parsed.get("meta_builder", {})
-    app_spec = parsed.get("app_spec", {})
+    # ---- critic reviews the produced files --------------------------------------------
+    critic_text = critique_files(proj)
 
-    # ---- critic -----------------------------------------------------------------------
-    critic_text = ""
-    if not STUB_MODE:
-        try:
-            critic_messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are the CRITIC. In <=3 short clauses separated by ' // ', "
-                        "point out weaknesses in the meta-builder + app-spec JSON below. "
-                        "No prose, no preamble."
-                    ),
-                },
-                {"role": "user", "content": json.dumps(parsed)},
-            ]
-            critic_text = (await _call_chat(MINIMAX_MODEL, critic_messages)).strip()
-        except Exception as exc:
-            logger.error("critic call failed: %s", exc)
-    if not critic_text:
-        critic_text = _stub_critique(req.prompt, parsed)
+    # ---- rater scores the produced files ----------------------------------------------
+    scores = rate_files(proj)
+    reward = RewardScores(**scores)
 
-    # ---- rater ------------------------------------------------------------------------
-    reward = RewardScores()
-    if not STUB_MODE:
-        try:
-            reward_messages = [
-                {"role": "user", "content": req.prompt},
-                {"role": "assistant", "content": json.dumps(parsed)},
-            ]
-            raw = await _call_chat(REWARD_MODEL, reward_messages)
-            reward = _parse_reward(raw)
-        except Exception as exc:
-            logger.error("rater call failed: %s", exc)
-    if reward.helpfulness == 0 and reward.correctness == 0:
-        reward = _stub_reward(req.prompt, parsed)
-
-    # ---- generation number ------------------------------------------------------------
+    # ---- lineage / generation ---------------------------------------------------------
     if req.parent_id:
         parent = await db.builds.find_one({"id": req.parent_id}, {"_id": 0})
         generation = (parent.get("generation", 1) + 1) if parent else 1
     else:
-        last = await db.builds.find_one({}, {"_id": 0, "generation": 1}, sort=[("generation", -1)])
+        last = await db.builds.find_one(
+            {}, {"_id": 0, "generation": 1}, sort=[("generation", -1)]
+        )
         generation = ((last or {}).get("generation", 0) or 0) + 1
 
     build = Build(
         generation=generation,
         parent_id=req.parent_id,
         user_prompt=req.prompt,
-        meta_builder_spec=meta_spec,
-        app_spec=app_spec,
+        bot=proj.get("bot", {}),
+        app=proj.get("app", {}),
+        files=[BuildFile(**f) for f in proj.get("files", [])],
         critic_notes=critic_text,
         reward=reward,
         composite_score=reward.composite,
-        stub=STUB_MODE,
     )
     doc = build.model_dump()
     doc["created_at"] = doc["created_at"].isoformat()
@@ -399,7 +180,7 @@ async def create_build(req: BuildRequest):
 @api.get("/builds", response_model=List[Build])
 async def list_builds(limit: int = 50):
     docs = (
-        await db.builds.find({}, {"_id": 0})
+        await db.builds.find({}, {"_id": 0, "files": 0})  # skip heavy files in list
         .sort("created_at", -1)
         .limit(limit)
         .to_list(limit)
@@ -407,6 +188,7 @@ async def list_builds(limit: int = 50):
     for d in docs:
         if isinstance(d.get("created_at"), str):
             d["created_at"] = datetime.fromisoformat(d["created_at"])
+        d.setdefault("files", [])
     return docs
 
 
@@ -418,6 +200,43 @@ async def get_build(build_id: str):
     if isinstance(doc.get("created_at"), str):
         doc["created_at"] = datetime.fromisoformat(doc["created_at"])
     return doc
+
+
+@api.get("/builds/{build_id}/download")
+async def download_build(build_id: str):
+    doc = await db.builds.find_one({"id": build_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "build not found")
+    files = doc.get("files", [])
+    if not files:
+        raise HTTPException(404, "no files in this build")
+
+    folder = _slugify(doc.get("app", {}).get("name") or doc.get("bot", {}).get("name") or "build")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in files:
+            zf.writestr(f"{folder}/{f['path']}", f["content"])
+        # bonus: bundle a build manifest
+        manifest = {
+            "id": doc.get("id"),
+            "generation": doc.get("generation"),
+            "user_prompt": doc.get("user_prompt"),
+            "bot": doc.get("bot"),
+            "app": doc.get("app"),
+            "reward": doc.get("reward"),
+            "composite_score": doc.get("composite_score"),
+            "critic_notes": doc.get("critic_notes"),
+            "created_at": doc.get("created_at"),
+        }
+        import json as _json
+        zf.writestr(f"{folder}/.recursive-bbs.json", _json.dumps(manifest, indent=2))
+    buf.seek(0)
+
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{folder}.zip"'},
+    )
 
 
 @api.post("/builds/{build_id}/feedback", response_model=Build)
@@ -441,7 +260,7 @@ async def feedback(build_id: str, req: FeedbackRequest):
 @api.get("/leaderboard", response_model=List[Build])
 async def leaderboard(limit: int = 10):
     docs = (
-        await db.builds.find({}, {"_id": 0})
+        await db.builds.find({}, {"_id": 0, "files": 0})
         .sort("composite_score", -1)
         .limit(limit)
         .to_list(limit)
@@ -449,15 +268,21 @@ async def leaderboard(limit: int = 10):
     for d in docs:
         if isinstance(d.get("created_at"), str):
             d["created_at"] = datetime.fromisoformat(d["created_at"])
+        d.setdefault("files", [])
     return docs
 
 
 @api.get("/lineage")
 async def lineage():
-    docs = await db.builds.find(
-        {}, {"_id": 0, "id": 1, "parent_id": 1, "generation": 1, "composite_score": 1,
-             "meta_builder_spec.name": 1}
-    ).sort("created_at", 1).to_list(500)
+    docs = (
+        await db.builds.find(
+            {},
+            {"_id": 0, "id": 1, "parent_id": 1, "generation": 1,
+             "composite_score": 1, "bot.name": 1, "app.name": 1},
+        )
+        .sort("created_at", 1)
+        .to_list(500)
+    )
     return {"nodes": docs}
 
 

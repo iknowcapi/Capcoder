@@ -1,5 +1,6 @@
-import React from "react";
-import { ThumbsUp, ThumbsDown, GitBranch, FileJson } from "lucide-react";
+import React, { useMemo, useState } from "react";
+import { ThumbsUp, ThumbsDown, GitBranch, Download, FileCode, Folder } from "lucide-react";
+import { API } from "@/lib/api";
 
 const Bar = ({ label, value, max = 4, color = "phosphor" }) => {
   const pct = Math.max(0, Math.min(1, value / max));
@@ -24,30 +25,82 @@ const Bar = ({ label, value, max = 4, color = "phosphor" }) => {
   );
 };
 
-const JsonView = ({ obj }) => (
-  <pre className="ascii bg-black border-l-2 border-neon_magenta p-3 sm:p-4 text-[11px] sm:text-xs font-mono overflow-x-auto max-h-72 overflow-y-auto">
-    <code className="text-phosphor">
-      {JSON.stringify(obj || {}, null, 2)
-        .split("\n")
-        .map((line, i) => {
-          const m = line.match(/^(\s*)(".*?")(\s*:\s*)(.*)$/);
-          if (m) {
-            return (
-              <div key={i}>
-                {m[1]}
-                <span className="text-neon_cyan">{m[2]}</span>
-                <span className="text-phosphor3">{m[3]}</span>
-                <span className="text-amber_warn">{m[4]}</span>
-              </div>
-            );
-          }
-          return <div key={i}>{line}</div>;
-        })}
-    </code>
-  </pre>
-);
+const FileTree = ({ files, selected, onSelect }) => {
+  // group by top-level directory
+  const groups = useMemo(() => {
+    const out = {};
+    for (const f of files || []) {
+      const parts = f.path.split("/");
+      const top = parts.length > 1 ? parts[0] : "/";
+      out[top] = out[top] || [];
+      out[top].push(f);
+    }
+    return out;
+  }, [files]);
+
+  return (
+    <div
+      data-testid="file-tree"
+      className="bg-black border border-phosphor/30 p-2 font-mono text-xs max-h-72 overflow-y-auto"
+    >
+      {Object.entries(groups).map(([dir, items]) => (
+        <div key={dir} className="mb-2">
+          <div className="flex items-center gap-1 text-neon_cyan neon-cyan label-xs mb-1">
+            <Folder size={10} /> {dir}
+          </div>
+          <ul>
+            {items.map((f) => {
+              const tail = f.path.split("/").slice(1).join("/") || f.path;
+              const active = selected === f.path;
+              return (
+                <li key={f.path}>
+                  <button
+                    data-testid={`file-${f.path}`}
+                    onClick={() => onSelect(f.path)}
+                    className={`flex items-center gap-1 w-full text-left px-2 py-1 hover:bg-phosphor/10 ${
+                      active ? "bg-phosphor/15 text-phosphor neon-text" : "text-phosphor2"
+                    }`}
+                  >
+                    <FileCode size={10} />
+                    <span className="truncate">{tail}</span>
+                    <span className="ml-auto text-phosphor3 text-[10px]">
+                      {f.content.split("\n").length}L
+                    </span>
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      ))}
+    </div>
+  );
+};
+
+const CodePane = ({ file }) => {
+  if (!file) {
+    return (
+      <div className="bg-black border border-phosphor/30 p-4 font-mono text-xs text-phosphor3 max-h-72 flex items-center justify-center">
+        select a file from the tree →
+      </div>
+    );
+  }
+  return (
+    <pre
+      data-testid="code-pane"
+      className="ascii bg-black border border-phosphor/30 p-3 text-[11px] sm:text-xs font-mono overflow-auto max-h-72 text-phosphor leading-relaxed"
+    >
+      <div className="label-xs text-neon_cyan neon-cyan mb-2 sticky top-0 bg-black pb-1 border-b border-phosphor/20">
+        {file.path}
+      </div>
+      <code>{file.content}</code>
+    </pre>
+  );
+};
 
 export const BuildDetail = ({ build, onFeedback, onFork }) => {
+  const [selectedPath, setSelectedPath] = useState(null);
+
   if (!build) {
     return (
       <section
@@ -58,13 +111,19 @@ export const BuildDetail = ({ build, onFeedback, onFork }) => {
           ░░ awaiting transmission ░░
         </div>
         <div className="text-sm">
-          submit a prompt above to forge a new app-builder.
+          submit a prompt above to forge a new code-builder bot.
         </div>
       </section>
     );
   }
 
   const r = build.reward || {};
+  const files = build.files || [];
+  const selectedFile = files.find((f) => f.path === selectedPath) || files[0];
+  const downloadHref = `${API}/builds/${build.id}/download`;
+  const bot = build.bot || {};
+  const appInfo = build.app || {};
+
   return (
     <section className="panel p-4 sm:p-6 space-y-5" data-testid="build-detail">
       {/* header */}
@@ -74,17 +133,25 @@ export const BuildDetail = ({ build, onFeedback, onFork }) => {
             [ BUILD :: {build.id.slice(0, 12)} // GEN-{String(build.generation).padStart(3, "0")} ]
           </div>
           <div className="font-bbs text-3xl sm:text-4xl text-phosphor neon-text uppercase tracking-widest leading-none mt-1">
-            {build.meta_builder_spec?.name || "untitled.builder"}
+            {appInfo.name || "untitled.app"}
           </div>
           <div className="text-xs sm:text-sm text-phosphor2 mt-1">
-            domain :: <span className="text-neon_magenta neon-magenta">{build.meta_builder_spec?.domain || "—"}</span>
-            {" "}// dna :: <span className="text-amber_warn">{build.meta_builder_spec?.dna_signature || "—"}</span>
-            {build.meta_builder_spec?.inherited_from && (
-              <> // inherits :: <span className="text-neon_cyan">{String(build.meta_builder_spec.inherited_from).slice(0,8)}</span></>
+            bot :: <span className="text-neon_magenta neon-magenta">{bot.name || "—"}</span>
+            {" "}// domain :: <span className="text-neon_cyan neon-cyan">{bot.domain || "—"}</span>
+            {" "}// dna :: <span className="text-amber_warn">{bot.dna_signature || "—"}</span>
+            {bot.inherited_from && (
+              <> // inherits :: <span className="text-neon_cyan">{String(bot.inherited_from).slice(0, 8)}</span></>
             )}
           </div>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          <a
+            data-testid="download-zip"
+            href={downloadHref}
+            className="flex items-center gap-2 border border-phosphor bg-phosphor/10 text-phosphor px-3 py-2 hover:bg-phosphor hover:text-black transition-colors label-xs neon-text"
+          >
+            <Download size={14} /> DOWNLOAD .ZIP
+          </a>
           <button
             data-testid="feedback-up"
             onClick={() => onFeedback?.(build.id, 1)}
@@ -125,10 +192,42 @@ export const BuildDetail = ({ build, onFeedback, onFork }) => {
         <span className="text-phosphor">{build.user_prompt}</span>
       </div>
 
+      {/* tagline + endpoint summary */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <div className="bg-black border-l-2 border-neon_cyan p-3 font-mono text-xs sm:text-sm">
+          <div className="label-xs text-neon_cyan neon-cyan mb-1">[ TAGLINE ]</div>
+          <div className="text-phosphor">{appInfo.tagline || "—"}</div>
+          <div className="label-xs text-neon_cyan neon-cyan mt-3 mb-1">[ STACK ]</div>
+          <div className="text-phosphor2">{(appInfo.stack || []).join(" + ")}</div>
+        </div>
+        <div className="bg-black border-l-2 border-amber_warn p-3 font-mono text-xs sm:text-sm">
+          <div className="label-xs text-amber_warn mb-1">[ ENDPOINTS ]</div>
+          <div className="space-y-0.5 max-h-32 overflow-y-auto">
+            {(appInfo.endpoints || []).map((ep, i) => (
+              <div key={i} className="flex gap-2">
+                <span className="text-neon_magenta neon-magenta w-14 shrink-0">{ep.method}</span>
+                <span className="text-phosphor truncate">{ep.path}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* files: tree + code */}
+      <div>
+        <div className="label-xs text-neon_yellow mb-2">
+          === [ GENERATED CODE :: {files.length} files ] ===
+        </div>
+        <div className="grid grid-cols-1 lg:grid-cols-[260px_1fr] gap-3">
+          <FileTree files={files} selected={selectedFile?.path} onSelect={setSelectedPath} />
+          <CodePane file={selectedFile} />
+        </div>
+      </div>
+
       {/* rater scorecard */}
       <div data-testid="rater-scorecard">
         <div className="label-xs text-neon_yellow mb-2">
-          === [ NEMOTRON RATER // SCORECARD ] ===
+          === [ RATER :: SCORECARD ] ===
         </div>
         <Bar label="HELPFULNESS" value={r.helpfulness || 0} color="phosphor" />
         <Bar label="CORRECTNESS" value={r.correctness || 0} color="cyan" />
@@ -149,26 +248,10 @@ export const BuildDetail = ({ build, onFeedback, onFork }) => {
       {/* critic */}
       <div>
         <div className="label-xs text-neon_magenta neon-magenta mb-2">
-          === [ MINIMAX CRITIC // NOTES ] ===
+          === [ CRITIC :: NOTES ] ===
         </div>
         <div className="bg-black border-l-2 border-neon_magenta p-3 font-mono text-xs sm:text-sm text-phosphor2 leading-relaxed">
           {build.critic_notes}
-        </div>
-      </div>
-
-      {/* artifacts */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <div>
-          <div className="label-xs text-neon_cyan neon-cyan mb-2 flex items-center gap-2">
-            <FileJson size={12} /> [ META.BUILDER.SPEC ]
-          </div>
-          <JsonView obj={build.meta_builder_spec} />
-        </div>
-        <div>
-          <div className="label-xs text-amber_warn mb-2 flex items-center gap-2">
-            <FileJson size={12} /> [ APP.SPEC ]
-          </div>
-          <JsonView obj={build.app_spec} />
         </div>
       </div>
     </section>

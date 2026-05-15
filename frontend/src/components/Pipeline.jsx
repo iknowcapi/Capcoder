@@ -2,9 +2,9 @@ import React from "react";
 import { Cpu, Brain, Gauge, ArrowRight } from "lucide-react";
 
 const STAGES = [
-  { key: "gen", title: "GENERATOR", model: "z-ai/glm-5.1", icon: Cpu, color: "phosphor" },
-  { key: "crit", title: "CRITIC", model: "minimaxai/minimax-m2.7", icon: Brain, color: "neon_magenta" },
-  { key: "rate", title: "RATER", model: "nvidia/nemotron-70b-reward", icon: Gauge, color: "neon_yellow" },
+  { key: "gen", title: "BOT", model: "code-generator", icon: Cpu, color: "phosphor" },
+  { key: "crit", title: "CRITIC", model: "file-review", icon: Brain, color: "neon_magenta" },
+  { key: "rate", title: "RATER", model: "5-dim scorer", icon: Gauge, color: "neon_yellow" },
 ];
 
 const colorMap = {
@@ -46,8 +46,8 @@ export const Pipeline = ({ activeStage, busy }) => {
                   {s.model}
                 </div>
                 <div className="mt-3 text-[10px] label-xs text-phosphor3">
-                  {s.key === "gen" && "emits → meta_builder + app_spec JSON"}
-                  {s.key === "crit" && "emits → critique // 3 clauses"}
+                  {s.key === "gen" && "emits → real folder of runnable files"}
+                  {s.key === "crit" && "emits → review // weakness clauses"}
                   {s.key === "rate" && "emits → 5-dim score vector"}
                 </div>
               </div>

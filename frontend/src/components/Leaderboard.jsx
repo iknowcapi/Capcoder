@@ -29,7 +29,7 @@ export const Leaderboard = ({ items, onSelect, selectedId }) => {
             >
               <span className="text-neon_yellow w-6 tabular-nums">#{i + 1}</span>
               <span className="text-phosphor flex-1 truncate">
-                {b.meta_builder_spec?.name || b.id.slice(0, 12)}
+                {b.app?.name || b.bot?.name || b.id.slice(0, 12)}
               </span>
               <span className="text-phosphor3 hidden sm:inline">
                 GEN-{String(b.generation).padStart(3, "0")}

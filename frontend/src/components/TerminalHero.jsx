@@ -29,12 +29,8 @@ export const TerminalHero = ({ status }) => {
           <span className="hidden sm:inline">[ LOCAL://{date} UTC ]</span>
           <span>
             STATUS:{" "}
-            <span
-              className={
-                !status ? "text-phosphor3" : status.stub_mode ? "text-amber_warn" : "text-phosphor"
-              }
-            >
-              {!status ? "BOOTING" : status.stub_mode ? "STUB-LOOP" : "LIVE-NIM"}
+            <span className={!status ? "text-phosphor3" : "text-phosphor"}>
+              {!status ? "BOOTING" : "ONLINE"}
             </span>
             <span className="animate-blink ml-1">_</span>
           </span>
@@ -55,10 +51,11 @@ export const TerminalHero = ({ status }) => {
         </div>
 
         <div className="font-mono text-sm sm:text-base text-phosphor2 max-w-3xl mt-2">
-          PIPELINE :: <span className="text-neon_cyan">GLM-5.1</span> generates a meta-builder spec →{" "}
-          <span className="text-neon_magenta">MiniMax-M2.7</span> critiques it →{" "}
-          <span className="text-neon_yellow">Nemotron-70B-Reward</span> scores it. Top-rated DNA is
-          fed back into the next generation.
+          you describe an app. a <span className="text-neon_cyan">bot</span> writes the code →{" "}
+          <span className="text-neon_magenta">critic</span> reviews →{" "}
+          <span className="text-neon_yellow">rater</span> scores →{" "}
+          <span className="text-phosphor neon-text">you download the .zip</span>. top-rated
+          builds feed the next generation's gene pool.
         </div>
 
         <div className="flex flex-wrap gap-2 sm:gap-4 text-[10px] sm:text-xs label-xs mt-2">
@@ -66,7 +63,7 @@ export const TerminalHero = ({ status }) => {
             BUILDS :: {status?.total_builds ?? "—"}
           </span>
           <span className="border border-neon_cyan/40 px-2 py-1 text-neon_cyan neon-cyan">
-            MODE :: {!status ? "BOOTING…" : status.stub_mode ? "OFFLINE/STUB" : "ONLINE/NVIDIA-NIM"}
+            OUTPUT :: REAL RUNNABLE CODE
           </span>
           <span className="border border-neon_magenta/40 px-2 py-1 text-neon_magenta neon-magenta">
             EVOLUTION :: ENABLED

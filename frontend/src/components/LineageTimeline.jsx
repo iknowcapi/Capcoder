@@ -37,11 +37,11 @@ export const LineageTimeline = ({ nodes, onSelect, selectedId }) => {
                     ? "none"
                     : `0 0 ${intensity * 12}px rgba(0,255,255,${intensity * 0.5})`,
               }}
-              title={n.meta_builder_spec?.name || n.id}
+              title={n.app?.name || n.bot?.name || n.id}
             >
               <div className="label-xs">[GEN-{String(n.generation).padStart(3, "0")}]</div>
               <div className="text-[10px] mt-1 max-w-[120px] truncate">
-                {n.meta_builder_spec?.name || n.id.slice(0, 8)}
+                {n.app?.name || n.bot?.name || n.id.slice(0, 8)}
               </div>
               <div className="text-[10px] mt-1 tabular-nums">
                 ★ {score.toFixed(2)}

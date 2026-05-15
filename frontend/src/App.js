@@ -175,7 +175,7 @@ const RecentBuilds = ({ items, onSelect, selectedId }) => (
           >
             <div className="flex justify-between">
               <span className="text-phosphor truncate flex-1 pr-2">
-                {b.meta_builder_spec?.name || b.id.slice(0, 12)}
+                {b.app?.name || b.bot?.name || b.id.slice(0, 12)}
               </span>
               <span className="text-amber_warn tabular-nums">
                 {Number(b.composite_score || 0).toFixed(2)}

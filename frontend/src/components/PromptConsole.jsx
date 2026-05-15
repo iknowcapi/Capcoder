@@ -2,11 +2,11 @@ import React, { useState } from "react";
 import { Terminal, Zap } from "lucide-react";
 
 const SAMPLES = [
-  "a journaling app that auto-summarizes my week with charts",
-  "a marketplace where indie devs auction unfinished side projects",
-  "a wellness coach that books sessions and accepts crypto",
-  "a livestream tipping platform with on-chain receipts",
-  "a study group scheduler for STEM students with AI flashcards",
+  "a kanban board with drag-and-drop cards",
+  "a notes app with tags",
+  "a habit tracker with streaks",
+  "a chat app with rooms",
+  "a todo list",
 ];
 
 export const PromptConsole = ({ onSubmit, busy, parentId, onClearParent }) => {
