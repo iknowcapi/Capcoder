@@ -1,33 +1,36 @@
 # RECURSIVE.BBS — PRD
 
 ## Problem
-A code-builder app that creates code-building bots. The bots emit real, runnable code projects that are one-click downloadable. Review (critic) and ranking (rater) are part of every build.
+A code-builder app that creates code-building bots. Bots emit real, runnable, downloadable code projects. Review (critic) and ranking (rater) are part of every build.
 
-## Architecture
-- **Backend** (`/app/backend/`):
-  - `blueprints.py` — domain-aware bots that emit real files. Domains: kanban, notes, habit-tracker, chat, generic-crud (fallback). Each blueprint outputs `{bot, app, files:[{path,content}]}`.
-  - `server.py` — FastAPI orchestration. Critic = file/endpoint heuristics. Rater = 5-dimension scoring from file metrics. Mongo persists every build + its files.
-- **Pipeline**: prompt → blueprint (writes ~5 files) → critic reviews real files → rater scores them → user downloads `.zip` containing a runnable folder + `.recursive-bbs.json` manifest. Top-rated builds feed exemplars to future generations.
-- **Frontend**: BBS / neon-punk dashboard. `BuildDetail` shows file tree + code preview + big DOWNLOAD .ZIP button.
+## Pipeline (v0.3.0)
+1. **Deterministic blueprint bot** (`blueprints.py`) writes a runnable folder for the detected domain (kanban, notes, habit-tracker, chat, generic-crud).
+2. **NVIDIA NIM augmentation** (`nim_augment.py`) runs in parallel:
+   - **GLM-5.1** writes a real `DESIGN.md` and is the included LLM-judge for scoring (`glm-5.1-judge`)
+   - **MiniMax-M2.7** (reasoning model) writes a real prose code review — catches missing tests, unused fields, missing CORS, unsafe patterns
+   - GLM-5.1 LLM-judge returns strict-JSON 5-attribute scores (0-4 each)
+   - Nemotron-70B-Reward endpoint is gated behind a separate API permission tier (returns 404 on standard keys) — replaced with GLM-judge with explicit rubric. Heuristic fallback retained on any LLM failure.
+3. User downloads `.zip` containing the full folder + manifest.
 
-## Implemented (2026-05-15 → updated v0.2.0)
-- 5 working blueprints emit real FastAPI+HTML projects (~12KB each, ~250 LOC). Verified: generated kanban server parses cleanly and exposes all 8 routes including `PATCH /api/cards/{id}/move`.
-- Endpoints: `/api/builds` POST+GET, `/api/builds/{id}` GET, `/api/builds/{id}/download` (zip stream), `/api/builds/{id}/feedback`, `/api/leaderboard`, `/api/lineage`.
-- Fork (parent_id), feedback ±0.25, lineage glow-by-score.
-- 15/15 backend pytest, 12/12 frontend playwright pass.
+## Implemented (2026-05-15)
+- 5 working blueprints; generated projects pass `python3 -c "import server"` cleanly
+- Real NVIDIA NIM augmentation wired (NVIDIA_API_KEY in `/app/backend/.env`)
+- Hero badge shows `NVIDIA NIM :: LIVE` when key present
+- 15/15 backend pytest + 12/12 frontend playwright tests pass (v0.2.0 baseline; v0.3.0 additions verified via curl)
+
+## Performance note
+Full augmented build = ~60-70s end-to-end (3 LLM calls in parallel + deterministic generation). Public preview gateway has ~90s soft timeout. Heuristic fallback ensures the build never blocks if NIM is slow.
 
 ## Backlog (P1)
-- Add blueprints: marketplace, booking/scheduler, social-feed, auth-walled SaaS
-- Live preview pane (run the generated app in an iframe sandbox)
-- Diff view between parent and child generated code
-- Optional NVIDIA NIM (GLM/MiniMax/Nemotron) augmentation: route the generated skeleton through GLM for elaboration, MiniMax for refactor suggestions, Nemotron for quality scoring
+- Background augmentation: return build immediately with heuristic outputs, stream NIM results back via polling/SSE
+- Live in-browser preview (iframe sandbox)
+- Parent↔child diff viewer
+- Add blueprints: marketplace, booking, social-feed
 
 ## Backlog (P2)
 - Multi-user accounts + per-user gene pool
-- "Auto-evolve N generations" unattended loop
-- Public shareable URLs for top-rated builds
+- "Auto-evolve N generations" loop
+- Shareable public preview URLs for top-rated builds
 
-## Files of note
-- `/app/backend/blueprints.py` (1035 lines — split per-domain if more added)
-- `/app/backend/server.py` (orchestration)
-- `/app/frontend/src/components/BuildDetail.jsx` (file tree + code pane + download)
+## Credentials in env
+- `NVIDIA_API_KEY` (set, working) — used for GLM-5.1 (design + judge) and MiniMax-M2.7 (critique)

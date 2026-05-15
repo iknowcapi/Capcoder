@@ -63,7 +63,7 @@ export const TerminalHero = ({ status }) => {
             BUILDS :: {status?.total_builds ?? "—"}
           </span>
           <span className="border border-neon_cyan/40 px-2 py-1 text-neon_cyan neon-cyan">
-            OUTPUT :: REAL RUNNABLE CODE
+            {status?.nim_enabled ? "NVIDIA NIM :: LIVE" : "OUTPUT :: REAL RUNNABLE CODE"}
           </span>
           <span className="border border-neon_magenta/40 px-2 py-1 text-neon_magenta neon-magenta">
             EVOLUTION :: ENABLED

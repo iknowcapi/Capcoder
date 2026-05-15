@@ -26,6 +26,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.cors import CORSMiddleware
 
 from blueprints import build_project, critique_files, rate_files
+import nim_augment
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -123,13 +124,17 @@ api = APIRouter(prefix="/api")
 
 @api.get("/")
 async def root():
-    return {"system": "RECURSIVE.BBS", "version": "0.2.0"}
+    return {
+        "system": "RECURSIVE.BBS",
+        "version": "0.3.0",
+        "nim_enabled": nim_augment.ENABLED,
+    }
 
 
 @api.get("/status")
 async def status():
     total = await db.builds.count_documents({})
-    return {"total_builds": total}
+    return {"total_builds": total, "nim_enabled": nim_augment.ENABLED}
 
 
 @api.post("/builds", response_model=Build)
@@ -143,12 +148,31 @@ async def create_build(req: BuildRequest):
     # ---- the bot generates a real folder of code --------------------------------------
     proj = build_project(req.prompt, exemplars=exemplars)
 
-    # ---- critic reviews the produced files --------------------------------------------
-    critic_text = critique_files(proj)
+    # ---- NVIDIA NIM augmentation (parallel; gracefully falls back on any failure) -----
+    aug = await nim_augment.augment(req.prompt, proj)
 
-    # ---- rater scores the produced files ----------------------------------------------
-    scores = rate_files(proj)
+    # If GLM produced a DESIGN.md, attach it as an extra file in the project
+    nim_used = []
+    if aug.get("design"):
+        proj.setdefault("files", []).append({"path": "DESIGN.md", "content": aug["design"]})
+        nim_used.append("glm-5.1")
+    proj.setdefault("bot", {})["nim_models"] = nim_used  # mutated below as more succeed
+
+    # ---- critic: real LLM prose if available, else heuristic --------------------------
+    if aug.get("critique"):
+        critic_text = aug["critique"]
+        nim_used.append("minimax-m2.7")
+    else:
+        critic_text = critique_files(proj)
+
+    # ---- rater: real reward model if available, else heuristic ------------------------
+    if aug.get("scores"):
+        scores = aug["scores"]
+        nim_used.append("glm-5.1-judge")
+    else:
+        scores = rate_files(proj)
     reward = RewardScores(**scores)
+    proj["bot"]["nim_models"] = nim_used
 
     # ---- lineage / generation ---------------------------------------------------------
     if req.parent_id:
