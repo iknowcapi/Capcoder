@@ -168,7 +168,7 @@ async def create_build(req: BuildRequest):
     # ---- rater: real reward model if available, else heuristic ------------------------
     if aug.get("scores"):
         scores = aug["scores"]
-        nim_used.append("glm-5.1-judge")
+        nim_used.append("nemotron-super-49b")
     else:
         scores = rate_files(proj)
     reward = RewardScores(**scores)

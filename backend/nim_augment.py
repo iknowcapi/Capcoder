@@ -25,7 +25,11 @@ NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "").strip()
 NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
 GLM_MODEL = "z-ai/glm-5.1"
 MINIMAX_MODEL = "minimaxai/minimax-m2.7"
-REWARD_MODEL = "nvidia/llama-3.1-nemotron-70b-reward"
+# NOTE: nvidia/llama-3.1-nemotron-70b-reward was retired from the public catalog;
+# nemotron-4-340b-reward is gated behind a paid account tier.
+# We use Nemotron-Super-49B v1.5 as a reasoning-based reward judge — same lineage,
+# returns clean JSON when prompted with a strict rubric.
+REWARD_MODEL = "nvidia/llama-3.3-nemotron-super-49b-v1.5"
 
 _client = None
 ENABLED = False
@@ -133,38 +137,39 @@ async def critique(prompt: str, proj: dict) -> Optional[str]:
 
 
 async def reward_score(prompt: str, proj: dict) -> Optional[dict]:
-    """GLM-5.1 acts as an LLM-judge and returns 5-attribute scores in JSON.
+    """Nemotron-Super-49B v1.5 acts as a reasoning-based reward model and returns
+    5-attribute scores in strict JSON.
 
-    (NVIDIA's Nemotron-70B-Reward endpoint is gated behind a separate API permission
-    and returns 404 on standard keys, so we use GLM as a judge with explicit rubric.)
+    (The original Nemotron-70B-Reward endpoint was retired from the public catalog;
+    Nemotron-Super-49B is the actively-hosted reasoning variant in the same family.)
     """
     brief = _project_brief(proj, max_files=3, max_lines=25)
     rubric = (
-        "Score the generated app on 5 dimensions, each on a 0.0-4.0 scale.\n"
+        "You are a strict JSON-only reward scorer. Score the generated app on 5 "
+        "dimensions, each 0.0-4.0:\n"
         "  - helpfulness: does it solve the user's stated request?\n"
-        "  - correctness: are the endpoints/entities well-typed and consistent?\n"
+        "  - correctness: are endpoints/entities well-typed and consistent?\n"
         "  - coherence: do backend, frontend, and data model agree?\n"
-        "  - complexity: appropriate depth for the prompt (not too simple, not bloated)\n"
-        "  - verbosity: target around 2.0 (≈250 LOC); penalize both sparse and bloated\n"
-        "Return STRICT JSON only, no prose, no code fences:\n"
+        "  - complexity: appropriate depth (not too simple, not bloated)\n"
+        "  - verbosity: target ~2.0 (≈250 LOC); penalize both sparse and bloated\n"
+        "Output ONLY this JSON, no prose, no code fences:\n"
         '{"helpfulness":0.0,"correctness":0.0,"coherence":0.0,"complexity":0.0,"verbosity":0.0}'
     )
     messages = [
         {"role": "system", "content": rubric},
         {"role": "user", "content": f"Prompt: {prompt!r}\n\n{brief}"},
     ]
-    raw = await _chat(GLM_MODEL, messages, temperature=0.2, max_tokens=400)
+    raw = await _chat(REWARD_MODEL, messages, temperature=0.1, max_tokens=4000)
     if not raw:
         return None
-    # extract first JSON block
     m = re.search(r"\{[^{}]*\}", raw, re.DOTALL)
     if not m:
-        logger.warning("LLM-judge returned no JSON: %r", raw[:200])
+        logger.warning("Nemotron judge returned no JSON: %r", raw[:200])
         return None
     try:
         data = json.loads(m.group(0))
     except Exception as exc:
-        logger.warning("LLM-judge JSON parse failed: %s — %r", exc, m.group(0)[:200])
+        logger.warning("Nemotron judge JSON parse failed: %s — %r", exc, m.group(0)[:200])
         return None
     keys = ("helpfulness", "correctness", "coherence", "complexity", "verbosity")
     return {k: float(data.get(k, 0.0)) for k in keys}
