@@ -1,32 +1,30 @@
 """
-RECURSIVE.BBS — a code-builder app whose bots emit real, runnable code projects.
+RECURSIVE.BBS — an application that builds bot-builders.
 
-Pipeline (per build):
-  1. Generator bot   :: detect domain → emit a folder of real working files
-  2. Critic          :: review those files (line count, endpoint coverage, etc.)
-  3. Rater           :: score across 5 dimensions
-  4. User            :: download the .zip, vote thumbs up/down (feeds future builds)
+You push ONE button. The AI (NVIDIA NIM) hands off generation-to-generation
+autonomously and emits a chain of complete, runnable code-builder applications.
+You download the whole chain as a single .zip.
 """
 from __future__ import annotations
 
 import io
+import json
 import logging
 import os
-import uuid
+import re
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
 from dotenv import load_dotenv
-from fastapi import APIRouter, FastAPI, HTTPException
+from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.cors import CORSMiddleware
 
-from blueprints import build_project, critique_files, rate_files
-import nim_augment
+import chain_generator
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -34,90 +32,164 @@ load_dotenv(ROOT_DIR / ".env")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("recursive-bbs")
 
-# --------------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Mongo
-# --------------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 mongo_url = os.environ["MONGO_URL"]
 db_name = os.environ["DB_NAME"]
 mongo_client = AsyncIOMotorClient(mongo_url)
 db = mongo_client[db_name]
 
-# --------------------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # Models
-# --------------------------------------------------------------------------------------
-class RewardScores(BaseModel):
+# ---------------------------------------------------------------------------
+class Reward(BaseModel):
     helpfulness: float = 0.0
     correctness: float = 0.0
     coherence: float = 0.0
     complexity: float = 0.0
     verbosity: float = 0.0
 
-    @property
-    def composite(self) -> float:
-        return round(
-            0.35 * self.helpfulness
-            + 0.30 * self.correctness
-            + 0.20 * self.coherence
-            + 0.10 * self.complexity
-            - 0.05 * abs(self.verbosity - 2.0),
-            3,
-        )
 
-
-class BuildFile(BaseModel):
+class GenFile(BaseModel):
     path: str
     content: str
 
 
-class Build(BaseModel):
+class Generation(BaseModel):
     model_config = ConfigDict(extra="ignore")
-
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    generation: int = 1
-    parent_id: Optional[str] = None
-    user_prompt: str
-    bot: dict = Field(default_factory=dict)         # describes the code-building bot
-    app: dict = Field(default_factory=dict)         # describes the produced app
-    files: list[BuildFile] = Field(default_factory=list)
+    gen: int
+    name: str = ""
+    tagline: str = ""
+    philosophy: str = ""
+    input_style: str = ""
+    output_style: str = ""
+    files: list[GenFile] = Field(default_factory=list)
     critic_notes: str = ""
-    reward: RewardScores = Field(default_factory=RewardScores)
+    reward: Reward = Field(default_factory=Reward)
     composite_score: float = 0.0
-    user_vote: int = 0
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
-class BuildRequest(BaseModel):
-    prompt: str
-    parent_id: Optional[str] = None
+class Chain(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str
+    depth: int
+    status: str = "running"  # running | complete | failed
+    fallback_used: bool = False
+    generations: list[Generation] = Field(default_factory=list)
+    created_at: datetime
+    completed_at: Optional[datetime] = None
 
 
-class FeedbackRequest(BaseModel):
-    vote: int
+class EvolveRequest(BaseModel):
+    depth: int = 3
 
 
-# --------------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Helpers
-# --------------------------------------------------------------------------------------
-def _slugify(s: str) -> str:
-    import re
-
-    s = re.sub(r"[^a-zA-Z0-9._-]+", "-", s).strip("-")
-    return s or "build"
+# ---------------------------------------------------------------------------
+def _slug(s: str, fallback: str = "chain") -> str:
+    s = re.sub(r"[^a-zA-Z0-9._-]+", "-", s or "").strip("-")
+    return s or fallback
 
 
-async def _exemplars() -> list[dict]:
-    docs = (
-        await db.builds.find({}, {"_id": 0})
-        .sort("composite_score", -1)
-        .limit(3)
-        .to_list(3)
-    )
-    return docs
+def _build_zip(chain_doc: dict, single_gen: Optional[int] = None) -> tuple[io.BytesIO, str]:
+    """Build a zip containing the chain (or one specific gen)."""
+    gens = chain_doc.get("generations", [])
+    chain_slug = f"chain-{chain_doc['id'][:8]}"
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        if single_gen is not None:
+            gen = next((g for g in gens if g.get("gen") == single_gen), None)
+            if not gen:
+                raise HTTPException(404, f"gen {single_gen} not in chain")
+            folder = _slug(gen.get("name") or f"gen-{single_gen}", "gen")
+            for f in gen.get("files", []):
+                zf.writestr(f"{folder}/{f['path']}", f["content"])
+            zf.writestr(f"{folder}/.recursive-bbs.json", json.dumps(_gen_manifest(gen), indent=2))
+            return buf, f"{folder}.zip"
+
+        # whole chain
+        for g in gens:
+            sub = f"gen-{g['gen']:02d}-{_slug(g.get('name','gen'), 'gen')}"
+            for f in g.get("files", []):
+                zf.writestr(f"{chain_slug}/{sub}/{f['path']}", f["content"])
+            zf.writestr(
+                f"{chain_slug}/{sub}/.recursive-bbs.json",
+                json.dumps(_gen_manifest(g), indent=2),
+            )
+        # top-level chain manifest
+        zf.writestr(f"{chain_slug}/CHAIN.md", _chain_markdown(chain_doc))
+        zf.writestr(
+            f"{chain_slug}/chain.json",
+            json.dumps(
+                {
+                    "id": chain_doc["id"],
+                    "depth": chain_doc["depth"],
+                    "created_at": chain_doc.get("created_at"),
+                    "generations": [_gen_manifest(g) for g in gens],
+                },
+                indent=2,
+            ),
+        )
+    buf.seek(0)
+    return buf, f"{chain_slug}.zip"
 
 
-# --------------------------------------------------------------------------------------
+def _gen_manifest(g: dict) -> dict:
+    return {
+        "gen": g.get("gen"),
+        "name": g.get("name"),
+        "tagline": g.get("tagline"),
+        "philosophy": g.get("philosophy"),
+        "input_style": g.get("input_style"),
+        "output_style": g.get("output_style"),
+        "reward": g.get("reward"),
+        "composite_score": g.get("composite_score"),
+        "critic_notes": g.get("critic_notes"),
+    }
+
+
+def _chain_markdown(chain_doc: dict) -> str:
+    lines = [
+        f"# Chain {chain_doc['id']}",
+        "",
+        f"- depth: {chain_doc['depth']}",
+        f"- created: {chain_doc.get('created_at')}",
+        "- evolved by: NVIDIA NIM (GLM-5.1 generator, MiniMax-M2.7 critic, Nemotron-Super-49B rater)",
+        "",
+        "Every generation is itself a code-builder application: a FastAPI + HTML app that calls "
+        "an LLM and produces source code from input. Run any of them with `bash run.sh`.",
+        "",
+        "## Generations",
+        "",
+    ]
+    for g in chain_doc.get("generations", []):
+        lines += [
+            f"### Gen {g['gen']} — {g.get('name','?')}",
+            f"*{g.get('tagline','')}*",
+            "",
+            f"- input style: `{g.get('input_style','?')}`",
+            f"- output style: `{g.get('output_style','?')}`",
+            f"- composite score: **{g.get('composite_score',0):.2f}**",
+            "",
+            f"**Philosophy:** {g.get('philosophy','')}",
+            "",
+            f"**Critic:** {g.get('critic_notes','')}",
+            "",
+            f"**Reward:** {json.dumps(g.get('reward',{}), separators=(', ', ':'))}",
+            "",
+            "---",
+            "",
+        ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # FastAPI
-# --------------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 app = FastAPI(title="RECURSIVE.BBS")
 api = APIRouter(prefix="/api")
 
@@ -126,85 +198,89 @@ api = APIRouter(prefix="/api")
 async def root():
     return {
         "system": "RECURSIVE.BBS",
-        "version": "0.3.0",
-        "nim_enabled": nim_augment.ENABLED,
+        "version": "1.0.0",
+        "nim_enabled": chain_generator.ENABLED,
+        "models": {
+            "generator": chain_generator.GEN_MODEL,
+            "critic": chain_generator.CRITIC_MODEL,
+            "rater": chain_generator.RATER_MODEL,
+        },
     }
 
 
 @api.get("/status")
 async def status():
-    total = await db.builds.count_documents({})
-    return {"total_builds": total, "nim_enabled": nim_augment.ENABLED}
+    total = await db.chains.count_documents({})
+    return {"total_chains": total, "nim_enabled": chain_generator.ENABLED}
 
 
-@api.post("/builds", response_model=Build)
-async def create_build(req: BuildRequest):
-    if not req.prompt.strip():
-        raise HTTPException(400, "prompt is required")
+@api.post("/evolve", response_model=Chain)
+async def evolve(req: EvolveRequest, background_tasks: BackgroundTasks):
+    """One button. Kicks off chain evolution as a background task; returns the
+    chain stub immediately. Poll GET /api/chains/{id} until status == 'complete'."""
+    if not chain_generator.ENABLED:
+        raise HTTPException(503, "NVIDIA_API_KEY not configured — cannot evolve a chain.")
 
-    # ---- self-improvement: pull top-rated prior builds as exemplars ------------------
-    exemplars = await _exemplars()
+    import uuid as _uuid
 
-    # ---- the bot generates a real folder of code --------------------------------------
-    proj = build_project(req.prompt, exemplars=exemplars)
+    chain_id = str(_uuid.uuid4())
+    stub = {
+        "id": chain_id,
+        "depth": req.depth,
+        "status": "running",
+        "fallback_used": False,
+        "generations": [],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "completed_at": None,
+    }
+    await db.chains.insert_one({**stub})
 
-    # ---- NVIDIA NIM augmentation (parallel; gracefully falls back on any failure) -----
-    aug = await nim_augment.augment(req.prompt, proj)
-
-    # If GLM produced a DESIGN.md, attach it as an extra file in the project
-    nim_used = []
-    if aug.get("design"):
-        proj.setdefault("files", []).append({"path": "DESIGN.md", "content": aug["design"]})
-        nim_used.append("glm-5.1")
-    proj.setdefault("bot", {})["nim_models"] = nim_used  # mutated below as more succeed
-
-    # ---- critic: real LLM prose if available, else heuristic --------------------------
-    if aug.get("critique"):
-        critic_text = aug["critique"]
-        nim_used.append("minimax-m2.7")
-    else:
-        critic_text = critique_files(proj)
-
-    # ---- rater: real reward model if available, else heuristic ------------------------
-    if aug.get("scores"):
-        scores = aug["scores"]
-        nim_used.append("nemotron-super-49b")
-    else:
-        scores = rate_files(proj)
-    reward = RewardScores(**scores)
-    proj["bot"]["nim_models"] = nim_used
-
-    # ---- lineage / generation ---------------------------------------------------------
-    if req.parent_id:
-        parent = await db.builds.find_one({"id": req.parent_id}, {"_id": 0})
-        generation = (parent.get("generation", 1) + 1) if parent else 1
-    else:
-        last = await db.builds.find_one(
-            {}, {"_id": 0, "generation": 1}, sort=[("generation", -1)]
+    async def on_gen(cid: str, gen: dict, fallback: bool):
+        await db.chains.update_one(
+            {"id": cid},
+            {"$push": {"generations": gen}, "$set": {"fallback_used": fallback}},
         )
-        generation = ((last or {}).get("generation", 0) or 0) + 1
 
-    build = Build(
-        generation=generation,
-        parent_id=req.parent_id,
-        user_prompt=req.prompt,
-        bot=proj.get("bot", {}),
-        app=proj.get("app", {}),
-        files=[BuildFile(**f) for f in proj.get("files", [])],
-        critic_notes=critic_text,
-        reward=reward,
-        composite_score=reward.composite,
-    )
-    doc = build.model_dump()
-    doc["created_at"] = doc["created_at"].isoformat()
-    await db.builds.insert_one(doc)
-    return build
+    async def on_done(cid: str, final: dict):
+        await db.chains.update_one(
+            {"id": cid},
+            {"$set": {
+                "status": "complete",
+                "fallback_used": final["fallback_used"],
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            }},
+        )
+
+    async def _runner():
+        try:
+            await chain_generator.evolve_chain_with_callback(
+                chain_id, req.depth, on_gen, on_done
+            )
+        except Exception as exc:
+            logger.exception("chain %s failed: %s", chain_id, exc)
+            await db.chains.update_one(
+                {"id": chain_id},
+                {"$set": {"status": "failed", "error": str(exc)}},
+            )
+
+    background_tasks.add_task(_runner)
+    # return the stub immediately
+    stub_out = {**stub}
+    stub_out["created_at"] = datetime.fromisoformat(stub_out["created_at"])
+    return stub_out
 
 
-@api.get("/builds", response_model=List[Build])
-async def list_builds(limit: int = 50):
+@api.get("/chains", response_model=List[Chain])
+async def list_chains(limit: int = 30):
+    # exclude heavy file payloads in list view
     docs = (
-        await db.builds.find({}, {"_id": 0, "files": 0})  # skip heavy files in list
+        await db.chains.find(
+            {},
+            {
+                "_id": 0,
+                "generations.files": 0,
+            },
+        )
         .sort("created_at", -1)
         .limit(limit)
         .to_list(limit)
@@ -212,102 +288,50 @@ async def list_builds(limit: int = 50):
     for d in docs:
         if isinstance(d.get("created_at"), str):
             d["created_at"] = datetime.fromisoformat(d["created_at"])
-        d.setdefault("files", [])
+        if isinstance(d.get("completed_at"), str):
+            d["completed_at"] = datetime.fromisoformat(d["completed_at"])
+        for g in d.get("generations", []):
+            g.setdefault("files", [])
     return docs
 
 
-@api.get("/builds/{build_id}", response_model=Build)
-async def get_build(build_id: str):
-    doc = await db.builds.find_one({"id": build_id}, {"_id": 0})
+@api.get("/chains/{chain_id}", response_model=Chain)
+async def get_chain(chain_id: str):
+    doc = await db.chains.find_one({"id": chain_id}, {"_id": 0})
     if not doc:
-        raise HTTPException(404, "build not found")
-    if isinstance(doc.get("created_at"), str):
-        doc["created_at"] = datetime.fromisoformat(doc["created_at"])
+        raise HTTPException(404, "chain not found")
+    for field in ("created_at", "completed_at"):
+        if isinstance(doc.get(field), str):
+            doc[field] = datetime.fromisoformat(doc[field])
     return doc
 
 
-@api.get("/builds/{build_id}/download")
-async def download_build(build_id: str):
-    doc = await db.builds.find_one({"id": build_id}, {"_id": 0})
+@api.get("/chains/{chain_id}/download")
+async def download_chain(chain_id: str):
+    doc = await db.chains.find_one({"id": chain_id}, {"_id": 0})
     if not doc:
-        raise HTTPException(404, "build not found")
-    files = doc.get("files", [])
-    if not files:
-        raise HTTPException(404, "no files in this build")
-
-    folder = _slugify(doc.get("app", {}).get("name") or doc.get("bot", {}).get("name") or "build")
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for f in files:
-            zf.writestr(f"{folder}/{f['path']}", f["content"])
-        # bonus: bundle a build manifest
-        manifest = {
-            "id": doc.get("id"),
-            "generation": doc.get("generation"),
-            "user_prompt": doc.get("user_prompt"),
-            "bot": doc.get("bot"),
-            "app": doc.get("app"),
-            "reward": doc.get("reward"),
-            "composite_score": doc.get("composite_score"),
-            "critic_notes": doc.get("critic_notes"),
-            "created_at": doc.get("created_at"),
-        }
-        import json as _json
-        zf.writestr(f"{folder}/.recursive-bbs.json", _json.dumps(manifest, indent=2))
-    buf.seek(0)
-
+        raise HTTPException(404, "chain not found")
+    if doc.get("status") != "complete":
+        raise HTTPException(409, f"chain status is {doc.get('status')} — not ready to download")
+    buf, fname = _build_zip(doc)
     return StreamingResponse(
         buf,
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{folder}.zip"'},
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
     )
 
 
-@api.post("/builds/{build_id}/feedback", response_model=Build)
-async def feedback(build_id: str, req: FeedbackRequest):
-    vote = 1 if req.vote > 0 else -1 if req.vote < 0 else 0
-    doc = await db.builds.find_one({"id": build_id}, {"_id": 0})
+@api.get("/chains/{chain_id}/download/{gen}")
+async def download_gen(chain_id: str, gen: int):
+    doc = await db.chains.find_one({"id": chain_id}, {"_id": 0})
     if not doc:
-        raise HTTPException(404, "build not found")
-    new_composite = round(doc.get("composite_score", 0) + 0.25 * vote, 3)
-    await db.builds.update_one(
-        {"id": build_id},
-        {"$set": {"user_vote": vote, "composite_score": new_composite}},
+        raise HTTPException(404, "chain not found")
+    buf, fname = _build_zip(doc, single_gen=gen)
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
     )
-    doc["user_vote"] = vote
-    doc["composite_score"] = new_composite
-    if isinstance(doc.get("created_at"), str):
-        doc["created_at"] = datetime.fromisoformat(doc["created_at"])
-    return doc
-
-
-@api.get("/leaderboard", response_model=List[Build])
-async def leaderboard(limit: int = 10):
-    docs = (
-        await db.builds.find({}, {"_id": 0, "files": 0})
-        .sort("composite_score", -1)
-        .limit(limit)
-        .to_list(limit)
-    )
-    for d in docs:
-        if isinstance(d.get("created_at"), str):
-            d["created_at"] = datetime.fromisoformat(d["created_at"])
-        d.setdefault("files", [])
-    return docs
-
-
-@api.get("/lineage")
-async def lineage():
-    docs = (
-        await db.builds.find(
-            {},
-            {"_id": 0, "id": 1, "parent_id": 1, "generation": 1,
-             "composite_score": 1, "bot.name": 1, "app.name": 1},
-        )
-        .sort("created_at", 1)
-        .to_list(500)
-    )
-    return {"nodes": docs}
 
 
 app.include_router(api)

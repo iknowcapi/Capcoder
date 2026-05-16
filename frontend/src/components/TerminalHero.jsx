@@ -51,22 +51,21 @@ export const TerminalHero = ({ status }) => {
         </div>
 
         <div className="font-mono text-sm sm:text-base text-phosphor2 max-w-3xl mt-2">
-          you describe an app. a <span className="text-neon_cyan">bot</span> writes the code →{" "}
-          <span className="text-neon_magenta">critic</span> reviews →{" "}
-          <span className="text-neon_yellow">rater</span> scores →{" "}
-          <span className="text-phosphor neon-text">you download the .zip</span>. top-rated
-          builds feed the next generation's gene pool.
+          an application that builds bot-builders. push <span className="text-neon_cyan">one
+          button</span> — <span className="text-phosphor neon-text">no prompt, no input from
+          you</span>. AI hands off generation to generation autonomously. you get the whole
+          chain's working code in one folder.
         </div>
 
         <div className="flex flex-wrap gap-2 sm:gap-4 text-[10px] sm:text-xs label-xs mt-2">
           <span className="border border-phosphor/40 px-2 py-1 text-phosphor">
-            BUILDS :: {status?.total_builds ?? "—"}
+            CHAINS :: {status?.total_chains ?? "—"}
           </span>
           <span className="border border-neon_cyan/40 px-2 py-1 text-neon_cyan neon-cyan">
-            {status?.nim_enabled ? "NVIDIA NIM :: LIVE" : "OUTPUT :: REAL RUNNABLE CODE"}
+            {status?.nim_enabled ? "NVIDIA NIM :: LIVE" : "NIM :: OFFLINE"}
           </span>
           <span className="border border-neon_magenta/40 px-2 py-1 text-neon_magenta neon-magenta">
-            EVOLUTION :: ENABLED
+            HANDOFF :: AI → AI
           </span>
         </div>
       </div>
