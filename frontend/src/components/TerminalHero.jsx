@@ -1,11 +1,12 @@
 import React, { useEffect, useState } from "react";
 
 const ASCII = `
-  ____  _____ ____ _   _ ____  ____ ___ _   _ _____   ____  ____ ____  
- |  _ \\| ____/ ___| | | |  _ \\/ ___|_ _| | | | ____| | __ )| __ ) ___| 
- | |_) |  _|| |   | | | | |_) \\___ \\| || | | |  _|   |  _ \\|  _ \\___ \\ 
- |  _ <| |__| |___| |_| |  _ < ___) | || \\_/ | |___ _| |_) | |_) |__) |
- |_| \\_\\_____\\____|\\___/|_| \\_\\____/___|\\___/|_____(_)____/|____/____/ 
+   ____                _____          _      
+  / ___|__ _ _ __     / ____|___   __| | ___ 
+ | |   / _\` | '_ \\   | |    / _ \\ / _\` |/ _ \\
+ | |__| (_| | |_) |  | |___| (_) | (_| |  __/
+  \\____\\__,_| .__(_)  \\_____\\___/ \\__,_|\\___|
+            |_|                              
 `;
 
 export const TerminalHero = ({ status }) => {
@@ -25,7 +26,7 @@ export const TerminalHero = ({ status }) => {
     >
       <div className="flex flex-col gap-4">
         <div className="flex items-center justify-between text-[10px] sm:text-xs label-xs text-neon_cyan neon-cyan">
-          <span data-testid="hero-system-tag">[ SYS:RECURSIVE.BBS // NODE-{(tick % 9) + 1} ]</span>
+          <span data-testid="hero-system-tag">[ SYS:CAPCODE // NODE-{(tick % 9) + 1} ]</span>
           <span className="hidden sm:inline">[ LOCAL://{date} UTC ]</span>
           <span>
             STATUS:{" "}
@@ -51,10 +52,10 @@ export const TerminalHero = ({ status }) => {
         </div>
 
         <div className="font-mono text-sm sm:text-base text-phosphor2 max-w-3xl mt-2">
-          an application that builds bot-builders. push <span className="text-neon_cyan">one
-          button</span> — <span className="text-phosphor neon-text">no prompt, no input from
-          you</span>. AI hands off generation to generation autonomously. you get the whole
-          chain's working code in one folder.
+          <span className="text-phosphor neon-text">capcode</span> — an application that
+          builds no-code code-builders. push <span className="text-neon_cyan">one button</span>{" "}
+          — no prompt, no input from you. NVIDIA / OpenRouter / Venice hand off gen to gen.
+          you download the whole chain&apos;s working code in one folder.
         </div>
 
         <div className="flex flex-wrap gap-2 sm:gap-4 text-[10px] sm:text-xs label-xs mt-2">
@@ -62,7 +63,9 @@ export const TerminalHero = ({ status }) => {
             CHAINS :: {status?.total_chains ?? "—"}
           </span>
           <span className="border border-neon_cyan/40 px-2 py-1 text-neon_cyan neon-cyan">
-            {status?.nim_enabled ? "NVIDIA NIM :: LIVE" : "NIM :: OFFLINE"}
+            {status?.providers?.openrouter ? "OPENROUTER" : "openrouter off"} ::{" "}
+            {status?.providers?.nvidia ? "NVIDIA" : "nvidia off"} ::{" "}
+            {status?.providers?.venice ? "VENICE" : "venice off"}
           </span>
           <span className="border border-neon_magenta/40 px-2 py-1 text-neon_magenta neon-magenta">
             HANDOFF :: AI → AI

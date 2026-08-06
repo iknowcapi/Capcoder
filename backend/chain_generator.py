@@ -34,28 +34,42 @@ GEN_MODEL = "z-ai/glm-5.1"
 CRITIC_MODEL = "minimaxai/minimax-m2.7"
 RATER_MODEL = "nvidia/llama-3.3-nemotron-super-49b-v1.5"
 
-_client = None
-ENABLED = False
-if NVIDIA_API_KEY:
-    try:
-        from openai import AsyncOpenAI
+import providers as _providers
 
-        _client = AsyncOpenAI(
-            api_key=NVIDIA_API_KEY, base_url=NIM_BASE_URL, timeout=90.0, max_retries=0
-        )
-        ENABLED = True
-    except Exception as exc:  # pragma: no cover
-        logger.warning("chain init failed: %s", exc)
+# Any provider having a key means we can evolve.
+ENABLED = any(
+    _providers.provider_available(p) for p in ("openrouter", "nvidia", "venice")
+)
 
 
 # ---------------------------------------------------------------------------
-# LLM helper (handles reasoning_content fallback for thinking models)
+# LLM helper — dispatches to the correct provider per (provider, model) pair
 # ---------------------------------------------------------------------------
-async def _chat(model: str, messages: list[dict], **kwargs) -> Optional[str]:
-    if not ENABLED or _client is None:
+_client_cache: dict[str, object] = {}
+
+
+def _get_client(provider: str):
+    if provider not in _client_cache:
+        _client_cache[provider] = _providers.openai_client_for(provider)
+    return _client_cache[provider]
+
+
+async def _chat(
+    model: str,
+    messages: list[dict],
+    provider: str = "nvidia",
+    fallback: Optional[tuple[str, str]] = None,
+    **kwargs,
+) -> Optional[str]:
+    """Call the given (provider, model). Falls back to `fallback=(provider,model)` on failure."""
+    client = _get_client(provider)
+    if client is None:
+        if fallback:
+            logger.info("provider %s unavailable, falling back to %s", provider, fallback[0])
+            return await _chat(fallback[1], messages, provider=fallback[0], **kwargs)
         return None
     try:
-        r = await _client.chat.completions.create(model=model, messages=messages, **kwargs)
+        r = await client.chat.completions.create(model=model, messages=messages, **kwargs)
         msg = r.choices[0].message
         out = (msg.content or "").strip()
         if not out:
@@ -64,7 +78,10 @@ async def _chat(model: str, messages: list[dict], **kwargs) -> Optional[str]:
             out = paras[-1] if paras else reasoning.strip()
         return out
     except Exception as exc:
-        logger.error("NIM %s call failed: %s", model, exc)
+        logger.error("%s/%s call failed: %s", provider, model, exc)
+        if fallback:
+            logger.info("falling back to %s/%s", *fallback)
+            return await _chat(fallback[1], messages, provider=fallback[0], **kwargs)
         return None
 
 
@@ -151,17 +168,23 @@ def _chain_brief(history: list[dict]) -> str:
     return "\n".join(lines)
 
 
-async def generate_gen(history: list[dict], gen_number: int) -> Optional[dict]:
-    """Ask GLM to design the next gen's MUTATION (tight JSON). File synthesis is deterministic."""
+async def generate_gen(
+    history: list[dict], gen_number: int, assignment: Optional[dict] = None
+) -> Optional[dict]:
+    """Ask the assigned generator model to design the next gen's MUTATION."""
     user_msg = (
         f"Chain so far:\n{_chain_brief(history)}\n\n"
         f"Now design Gen {gen_number}. Its mutation MUST differ meaningfully from every prior "
         f"gen (different accent colors, different scoring emphasis, different improvement note). "
         f"Output strict JSON per the schema."
     )
+    a = assignment or _providers.DEFAULT_ASSIGNMENTS["generator"]
+    fb = _providers.DEFAULT_ASSIGNMENTS["generator_fallback"]
     raw = await _chat(
-        GEN_MODEL,
+        a["model"],
         [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_msg}],
+        provider=a["provider"],
+        fallback=(fb["provider"], fb["model"]),
         temperature=0.9,
         max_tokens=700,
     )
@@ -171,7 +194,6 @@ async def generate_gen(history: list[dict], gen_number: int) -> Optional[dict]:
     if not parsed.get("name"):
         logger.warning("gen %s: no name in parsed output. raw head: %r", gen_number, raw[:200])
         return None
-    # render the COMPLETE replica folder from the mutation spec via the seed template
     parsed["files"] = seed_template.render(parsed)
     return parsed
 
@@ -195,9 +217,11 @@ def _gen_brief(gen: dict, max_files: int = 3, max_lines: int = 25) -> str:
     return "\n".join(lines)
 
 
-async def critique_gen(gen: dict) -> Optional[str]:
+async def critique_gen(gen: dict, assignment: Optional[dict] = None) -> Optional[str]:
+    a = assignment or _providers.DEFAULT_ASSIGNMENTS["critic"]
+    fb = _providers.DEFAULT_ASSIGNMENTS["critic_fallback"]
     raw = await _chat(
-        CRITIC_MODEL,
+        a["model"],
         [
             {
                 "role": "system",
@@ -210,23 +234,29 @@ async def critique_gen(gen: dict) -> Optional[str]:
             },
             {"role": "user", "content": _gen_brief(gen)},
         ],
+        provider=a["provider"],
+        fallback=(fb["provider"], fb["model"]),
         temperature=0.5,
         max_tokens=1200,
     )
     return raw.strip() if raw else None
 
 
-async def score_gen(gen: dict) -> Optional[dict]:
+async def score_gen(gen: dict, assignment: Optional[dict] = None) -> Optional[dict]:
+    a = assignment or _providers.DEFAULT_ASSIGNMENTS["rater"]
+    fb = _providers.DEFAULT_ASSIGNMENTS["rater_fallback"]
     rubric = (
         "Score the generated code-builder app on 5 dimensions, each 0.0-4.0. Output ONLY this "
         'JSON: {"helpfulness":0.0,"correctness":0.0,"coherence":0.0,"complexity":0.0,"verbosity":0.0}'
     )
     raw = await _chat(
-        RATER_MODEL,
+        a["model"],
         [
             {"role": "system", "content": rubric},
             {"role": "user", "content": _gen_brief(gen, max_lines=20)},
         ],
+        provider=a["provider"],
+        fallback=(fb["provider"], fb["model"]),
         temperature=0.1,
         max_tokens=3500,
     )
@@ -254,24 +284,35 @@ def composite(scores: dict) -> float:
 # Orchestrator
 # ---------------------------------------------------------------------------
 async def evolve_chain_with_callback(
-    chain_id: str, depth: int, on_gen, on_done
+    chain_id: str, depth: int, on_gen, on_done, assignments: Optional[dict] = None
 ) -> dict:
     """Run the evolution loop and call `on_gen(gen_dict)` after each generation completes,
-    and `on_done(chain_dict)` when finished. Used by the FastAPI background task."""
+    and `on_done(chain_dict)` when finished. `assignments` is a dict:
+        {"generator": {"provider":"...","model":"..."},
+         "critic":    {"provider":"...","model":"..."},
+         "rater":     {"provider":"...","model":"..."}}
+    Missing keys fall back to DEFAULT_ASSIGNMENTS.
+    """
     depth = max(1, min(5, int(depth)))
+    a = dict(_providers.DEFAULT_ASSIGNMENTS)
+    for role in ("generator", "critic", "rater"):
+        if assignments and assignments.get(role):
+            a[role] = assignments[role]
     history: list[dict] = []
     generations: list[dict] = []
     fallback_used = False
 
     for i in range(depth):
         gen_number = i + 2
-        gen = await generate_gen(history, gen_number)
+        gen = await generate_gen(history, gen_number, assignment=a["generator"])
         if not gen:
             fallback_used = True
             gen = _fallback_gen(gen_number, history)
         gen["gen"] = gen_number
         critic, scores = await asyncio.gather(
-            critique_gen(gen), score_gen(gen), return_exceptions=False
+            critique_gen(gen, assignment=a["critic"]),
+            score_gen(gen, assignment=a["rater"]),
+            return_exceptions=False,
         )
         gen["critic_notes"] = critic or "(critic unavailable for this generation)"
         gen["reward"] = scores or {

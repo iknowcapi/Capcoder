@@ -25,6 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.cors import CORSMiddleware
 
 import chain_generator
+import providers as _providers
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -86,6 +87,7 @@ class Chain(BaseModel):
 
 class EvolveRequest(BaseModel):
     depth: int = 3
+    session_id: Optional[str] = None  # if set, uses saved settings; otherwise defaults
 
 
 # ---------------------------------------------------------------------------
@@ -192,28 +194,68 @@ def _chain_markdown(chain_doc: dict) -> str:
 # ---------------------------------------------------------------------------
 # FastAPI
 # ---------------------------------------------------------------------------
-app = FastAPI(title="RECURSIVE.BBS")
+app = FastAPI(title="CapCode")
 api = APIRouter(prefix="/api")
 
 
 @api.get("/")
 async def root():
     return {
-        "system": "RECURSIVE.BBS",
-        "version": "1.0.0",
-        "nim_enabled": chain_generator.ENABLED,
-        "models": {
-            "generator": chain_generator.GEN_MODEL,
-            "critic": chain_generator.CRITIC_MODEL,
-            "rater": chain_generator.RATER_MODEL,
+        "system": "CapCode",
+        "version": "2.0.0",
+        "providers": {
+            name: _providers.provider_available(name)
+            for name in _providers.PROVIDERS
         },
+        "defaults": _providers.DEFAULT_ASSIGNMENTS,
     }
 
 
 @api.get("/status")
 async def status():
     total = await db.chains.count_documents({})
-    return {"total_chains": total, "nim_enabled": chain_generator.ENABLED}
+    return {
+        "total_chains": total,
+        "providers": {
+            name: _providers.provider_available(name)
+            for name in _providers.PROVIDERS
+        },
+    }
+
+
+@api.get("/providers/models")
+async def catalog(refresh: bool = False):
+    """Aggregated model catalog across all providers."""
+    return {"models": await _providers.get_catalog(force=refresh),
+            "defaults": _providers.DEFAULT_ASSIGNMENTS}
+
+
+class SettingsPayload(BaseModel):
+    generator: Optional[dict] = None
+    critic: Optional[dict] = None
+    rater: Optional[dict] = None
+
+
+@api.get("/settings")
+async def get_settings(session_id: str):
+    doc = await db.settings.find_one({"session_id": session_id}, {"_id": 0}) or {}
+    return {
+        "session_id": session_id,
+        "generator": doc.get("generator") or _providers.DEFAULT_ASSIGNMENTS["generator"],
+        "critic": doc.get("critic") or _providers.DEFAULT_ASSIGNMENTS["critic"],
+        "rater": doc.get("rater") or _providers.DEFAULT_ASSIGNMENTS["rater"],
+    }
+
+
+@api.post("/settings")
+async def save_settings(session_id: str, payload: SettingsPayload):
+    update = {k: v for k, v in payload.model_dump().items() if v is not None}
+    await db.settings.update_one(
+        {"session_id": session_id},
+        {"$set": {"session_id": session_id, **update}},
+        upsert=True,
+    )
+    return await get_settings(session_id)
 
 
 @api.post("/evolve", response_model=Chain)
@@ -221,7 +263,14 @@ async def evolve(req: EvolveRequest, background_tasks: BackgroundTasks):
     """One button. Kicks off chain evolution as a background task; returns the
     chain stub immediately. Poll GET /api/chains/{id} until status == 'complete'."""
     if not chain_generator.ENABLED:
-        raise HTTPException(503, "NVIDIA_API_KEY not configured — cannot evolve a chain.")
+        raise HTTPException(503, "No provider API key configured — cannot evolve a chain.")
+
+    # resolve assignments from saved settings (or defaults)
+    assignments = None
+    if req.session_id:
+        s = await db.settings.find_one({"session_id": req.session_id}, {"_id": 0})
+        if s:
+            assignments = {k: s[k] for k in ("generator", "critic", "rater") if s.get(k)}
 
     import uuid as _uuid
 
@@ -256,7 +305,7 @@ async def evolve(req: EvolveRequest, background_tasks: BackgroundTasks):
     async def _runner():
         try:
             await chain_generator.evolve_chain_with_callback(
-                chain_id, req.depth, on_gen, on_done
+                chain_id, req.depth, on_gen, on_done, assignments=assignments
             )
         except Exception as exc:
             logger.exception("chain %s failed: %s", chain_id, exc)
