@@ -496,7 +496,20 @@ async def artist_step(teacher_spec: dict, exemplar_files: Optional[list[dict]] =
     parsed.setdefault("accent2_hex", teacher_spec.get("accent2_hex", "#ff79c6"))
     parsed.setdefault("weights", {"helpfulness": 0.35, "correctness": 0.30,
                                   "coherence": 0.20, "complexity": 0.10, "verbosity": -0.05})
-    # Sanitize files array — reject entries missing path or content, and drop obvious placeholders.
+    # Sanitize files array — reject entries missing path or content, drop obvious
+    # placeholders, and REJECT any path that tries to escape the workspace via
+    # `..`, absolute paths, or backslashes / null bytes (SEC-002).
+    def _is_safe_relpath(p: str) -> bool:
+        if not p or p.startswith("/") or "\x00" in p or "\\" in p:
+            return False
+        parts = [seg for seg in p.split("/") if seg]
+        if not parts:
+            return False
+        for seg in parts:
+            if seg == ".." or seg == "." or seg.startswith(".."):
+                return False
+        return True
+
     clean_files: list[dict] = []
     for f in parsed.get("files") or []:
         if not isinstance(f, dict):
@@ -504,6 +517,9 @@ async def artist_step(teacher_spec: dict, exemplar_files: Optional[list[dict]] =
         path = (f.get("path") or "").strip().lstrip("/")
         content = f.get("content")
         if not path or not isinstance(content, str) or not content.strip():
+            continue
+        if not _is_safe_relpath(path):
+            logger.warning("rejected unsafe artist file path: %r", path)
             continue
         if "..." in content and content.count("...") > 3 and len(content) < 200:
             continue  # obvious stub
@@ -539,8 +555,15 @@ async def correct_step(spec: dict, stderr: str, assignment: Optional[dict] = Non
     if isinstance(new_files, list) and new_files:
         clean = []
         for f in new_files:
-            if isinstance(f, dict) and f.get("path") and isinstance(f.get("content"), str):
-                clean.append({"path": f["path"].strip().lstrip("/"), "content": f["content"]})
+            if not (isinstance(f, dict) and f.get("path") and isinstance(f.get("content"), str)):
+                continue
+            path = f["path"].strip().lstrip("/")
+            parts = [seg for seg in path.split("/") if seg]
+            if (not path or "\x00" in path or "\\" in path or not parts or
+                    any(seg == ".." or seg == "." or seg.startswith("..") for seg in parts)):
+                logger.warning("rejected unsafe corrector file path: %r", path)
+                continue
+            clean.append({"path": path, "content": f["content"]})
         if clean:
             merged["files"] = clean
     return merged

@@ -24,12 +24,23 @@ def _slug(s: str, fallback: str = "gen") -> str:
 
 
 def materialize(chain_id: str, gen: dict) -> pathlib.Path:
-    """Write the gen's files to /workspaces/{chain}/{name} and return the dir."""
+    """Write the gen's files to /workspaces/{chain}/{name} and return the dir.
+
+    SEC-002: every file path must resolve inside ``root``. Anything else is dropped.
+    """
     slug = _slug(gen.get("name") or f"gen-{gen.get('gen')}", f"gen-{gen.get('gen')}")
-    root = WORKSPACE_ROOT / chain_id[:8] / slug
+    root = (WORKSPACE_ROOT / chain_id[:8] / slug).resolve()
     root.mkdir(parents=True, exist_ok=True)
     for f in gen.get("files", []):
-        p = root / f["path"]
+        rel = (f.get("path") or "").strip().lstrip("/")
+        if not rel or "\x00" in rel:
+            continue
+        p = (root / rel).resolve()
+        try:
+            p.relative_to(root)
+        except ValueError:
+            # path escaped the workspace — skip.
+            continue
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(f["content"])
         if p.suffix == ".sh":
@@ -65,9 +76,15 @@ async def run_workspace(
         return result
 
     result["ran"] = True
-    env = os.environ.copy()
+    # SEC-001: build a scrubbed env for the AI-generated child process. Never
+    # inherit provider keys, the Mongo URL, GitHub PATs, or anything else that
+    # could be exfiltrated by hostile LLM output.
+    ALLOWED = ("PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER",
+               "TMPDIR", "PWD", "SHELL")
+    env = {k: v for k, v in os.environ.items() if k in ALLOWED}
+    env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+    env.setdefault("HOME", "/tmp")
     # Pin the child app to a unique port so we don't clash with the parent (8001).
-    # We keep 8000 in the template; users can override via APP_PORT.
     env["APP_PORT"] = str(port_to_check)
     loop = asyncio.get_running_loop()
     start = loop.time()

@@ -651,8 +651,10 @@ async def push_to_github(chain_id: str, req: GithubPushRequest):
 
     repo_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", req.repo).strip("-.") or f"capcode-{chain_id[:8]}"
 
-    # 1) Create the repo on GitHub (idempotent — if it exists, we reuse).
+    # 1) Create the repo on GitHub. Distinguish freshly-created (201) from
+    # already-exists (422) so we don't --force-push over an existing repo.
     import httpx as _httpx
+    was_created = False
     async with _httpx.AsyncClient(timeout=20) as http:
         r = await http.post(
             "https://api.github.com/user/repos",
@@ -660,7 +662,9 @@ async def push_to_github(chain_id: str, req: GithubPushRequest):
                      "Accept": "application/vnd.github+json"},
             json={"name": repo_name, "private": bool(req.private), "auto_init": False},
         )
-        if r.status_code not in (201, 422):  # 422 = already exists
+        if r.status_code == 201:
+            was_created = True
+        elif r.status_code != 422:  # 422 = already exists
             raise HTTPException(502, f"github repo create failed: {r.status_code} {r.text[:200]}")
 
     # 2) Write files to a temp dir and push with git subprocess.
@@ -671,35 +675,72 @@ async def push_to_github(chain_id: str, req: GithubPushRequest):
 
     import tempfile
     import subprocess
-
-    def _run(cmd, cwd):
-        return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=60)
+    import stat as _stat
 
     with tempfile.TemporaryDirectory(prefix="capcode-push-") as tmp:
         for f in files:
-            p = Path(tmp) / f["path"]
+            rel = (f.get("path") or "").strip().lstrip("/")
+            parts = [seg for seg in rel.split("/") if seg]
+            if (not rel or "\x00" in rel or "\\" in rel or not parts or
+                    any(seg == ".." or seg == "." or seg.startswith("..") for seg in parts)):
+                continue
+            p = Path(tmp) / rel
+            try:
+                p.resolve().relative_to(Path(tmp).resolve())
+            except ValueError:
+                continue
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(f["content"])
         # Include the spec docs too so the repo is self-explanatory.
         Path(tmp, "TEACHER_SPEC.md").write_text(_teacher_md(doc, gen))
         Path(tmp, "ARTIST_NOTES.md").write_text(_artist_md(gen))
 
-        env_str = f"https://{username}:{token}@github.com/{username}/{repo_name}.git"
+        # SEC-004: keep the PAT OUT of argv. Use a GIT_ASKPASS helper script
+        # + `HTTPS_REMOTE=https://github.com/user/repo.git` with credentials
+        # supplied only via env-fed askpass. Also drop `--force` unless we
+        # just created the repo this call.
+        askpass_path = Path(tmp) / ".git_askpass.sh"
+        askpass_path.write_text(
+            '#!/usr/bin/env bash\n'
+            'case "$1" in\n'
+            '  Username*) echo "$GIT_USER" ;;\n'
+            '  Password*) echo "$GIT_TOKEN" ;;\n'
+            'esac\n'
+        )
+        askpass_path.chmod(0o700)
+        remote_url = f"https://github.com/{username}/{repo_name}.git"
+
+        def _run(cmd, cwd, with_creds=False):
+            env = dict(os.environ)
+            # Never let the AI-inherited scrubbing bleed into git — but also
+            # don't leak our provider keys unnecessarily; git doesn't need them.
+            for k in ("OPENROUTER_API_KEY", "NVIDIA_API_KEY", "VENICE_API_KEY"):
+                env.pop(k, None)
+            if with_creds:
+                env["GIT_ASKPASS"] = str(askpass_path)
+                env["GIT_TERMINAL_PROMPT"] = "0"
+                env["GIT_USER"] = username
+                env["GIT_TOKEN"] = token
+            return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
+                                  timeout=60, env=env)
+
+        push_cmd = ["git", "push", "-u", "origin", "main"]
+        if was_created:
+            push_cmd.append("--force")  # brand-new repo; safe to force initial state
+
         steps = [
-            ["git", "init", "-b", "main"],
-            ["git", "config", "user.email", "capcode@emergent.host"],
-            ["git", "config", "user.name", "CapCode"],
-            ["git", "add", "-A"],
-            ["git", "commit", "-m", f"CapCode build: {doc.get('target_prompt','')[:120]}"],
-            ["git", "remote", "add", "origin", env_str],
-            ["git", "push", "-u", "origin", "main", "--force"],
+            (["git", "init", "-b", "main"], False),
+            (["git", "config", "user.email", "capcode@emergent.host"], False),
+            (["git", "config", "user.name", "CapCode"], False),
+            (["git", "add", "-A"], False),
+            (["git", "commit", "-m", f"CapCode build: {doc.get('target_prompt','')[:120]}"], False),
+            (["git", "remote", "add", "origin", remote_url], False),
+            (push_cmd, True),
         ]
-        for cmd in steps:
-            res = _run(cmd, tmp)
+        for cmd, needs_creds in steps:
+            res = _run(cmd, tmp, with_creds=needs_creds)
             if res.returncode != 0:
-                # scrub token from any error output before returning it.
                 err = (res.stderr or res.stdout or "").replace(token, "***")
-                # `remote add origin` might fail if invoked twice; ignore only that one.
                 if cmd[:3] == ["git", "remote", "add"] and "already exists" in err:
                     continue
                 raise HTTPException(502, f"git step {' '.join(cmd[:3])} failed: {err[:300]}")
@@ -709,6 +750,7 @@ async def push_to_github(chain_id: str, req: GithubPushRequest):
         "repo": f"{username}/{repo_name}",
         "url": f"https://github.com/{username}/{repo_name}",
         "private": bool(req.private),
+        "created": was_created,
     }
 
 
