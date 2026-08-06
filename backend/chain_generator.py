@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 
 import seed_template
+import executor as _exec
 
 logger = logging.getLogger("chain")
 
@@ -125,53 +126,65 @@ def _extract_json(raw: str) -> dict:
 # ---------------------------------------------------------------------------
 # Generator prompt
 # ---------------------------------------------------------------------------
-SYSTEM_PLANNER = """You are the PLANNER. Given the chain history, write a tight PLAN describing what the NEXT gen should improve over its parents. Focus on WHAT changes and WHY, not HOW.
+SYSTEM_TEACHER = """You are the TEACHER — Gen-1 in a two-bot chain. Rigid, strict, provider-educated. Your job: given the human's TARGET (what they want built), design a spec for the ARTIST BOT that will actually construct it. You do not design the product yourself — you design the SECOND bot, giving it correct, methodical constraints and a rubric.
 
-Output STRICT JSON only:
+You are shown TOP-VERIFIED PRIOR CHAINS as exemplars (human-marked as "works"). Learn from their patterns. Be conservative, correct, and precise — no flourishes.
+
+Output STRICT JSON:
 {
-  "intent": "one sentence — what capability shift this gen embodies",
-  "capability_focus": "which axis (visual identity | scoring rigor | philosophy | UX interaction | provider handling)",
-  "constraints": "what must be preserved from parents"
-}
-"""
-
-SYSTEM_ARCHITECT = """You are the ARCHITECT. Given the PLAN and chain history, output a concrete mutation SPEC. This spec is fed to a template renderer that writes real code.
-
-Output STRICT JSON only:
-{
-  "name": "PascalCase, 1-2 words",
-  "tagline": "one short line",
-  "philosophy": "2 sentences",
-  "improvement_note": "the concrete mutation applied",
+  "name": "TeacherSpec-<short-name>",
+  "target": "<echo of the human's target>",
+  "artist_brief": "3-5 sentences briefing the Artist on what to build, what stack, what must be correct",
+  "must_have": ["3-5 concrete requirements the product MUST satisfy"],
+  "should_avoid": ["2-3 anti-patterns"],
   "accent_hex": "#rrggbb",
   "accent2_hex": "#rrggbb",
-  "weights": {"helpfulness": 0.30-0.45, "correctness": 0.25-0.40, "coherence": 0.15-0.25, "complexity": 0.05-0.15, "verbosity": -0.10-0.00}
+  "weights": {"helpfulness":0.30-0.45,"correctness":0.30-0.45,"coherence":0.15-0.25,"complexity":0.05-0.15,"verbosity":-0.10-0.00}
 }
 """
 
-SYSTEM_REVIEWER = """You are the REVIEWER. Identify 2-3 concrete weaknesses in the mutation spec (imbalanced weights, unclear improvement, palette clash, weak philosophy). One paragraph, no markdown, no preamble, under 100 words."""
+SYSTEM_ARTIST = """You are the ARTIST — Gen-2 in a two-bot chain. Creative, sharp, novel — your job is to make the end result stand out while satisfying the Teacher's brief. Take the Teacher's spec and design the actual PRODUCT (the thing the human asked for).
 
-SYSTEM_CORRECTOR = """You are the CORRECTOR. Given a spec and the reviewer's notes, output the SAME spec JSON with fixes applied. Preserve fields the reviewer didn't flag. Output STRICT JSON only, same schema as the input spec."""
+Output STRICT JSON:
+{
+  "name": "PascalCase product name",
+  "tagline": "one line",
+  "philosophy": "2 sentences — your creative angle",
+  "improvement_note": "how you satisfied the Teacher's must_have while adding novelty",
+  "accent_hex": "#rrggbb",
+  "accent2_hex": "#rrggbb",
+  "weights": {"helpfulness":0.30-0.45,"correctness":0.25-0.40,"coherence":0.15-0.25,"complexity":0.05-0.15,"verbosity":-0.10-0.00}
+}
+"""
 
-# Legacy prompt retained for backwards-compat callers (unused after refactor).
-SYSTEM_PROMPT = SYSTEM_ARCHITECT
+SYSTEM_REVIEWER = """You are the REVIEWER. If the product actually ran (see EXECUTION RESULT), praise it briefly. If it failed, be specific about WHY based on the stderr. One paragraph, under 100 words."""
+
+SYSTEM_CORRECTOR = """You are the CORRECTOR. Given the product spec and either reviewer notes or a real error log, output the CORRECTED spec JSON (same schema). Focus on the smallest change that makes it LOAD."""
+
+SYSTEM_PROMPT = SYSTEM_ARTIST  # legacy alias
 
 
 def _chain_brief(history: list[dict]) -> str:
-    """Compact chain history for the next-gen prompt."""
+    """Compact chain history for the next-gen prompt — INCLUDES real exec outcomes."""
     if not history:
         return (
             "(no prior descendants yet — you are designing Gen 2. "
-            "The parent is RECURSIVE.BBS itself: dark BBS terminal UI, "
+            "The parent is CapCode itself: dark BBS terminal UI, "
             "accent_hex=#7cffb2, accent2_hex=#ff79c6, standard weights "
             "helpfulness=0.35, correctness=0.30, coherence=0.20, complexity=0.10, verbosity=-0.05.)"
         )
     lines = []
     for g in history:
-        lines.append(
-            f"- Gen {g['gen']}: {g.get('name','?')} — {g.get('improvement_note','')}"
+        started = g.get("exec_started")
+        marker = "✓ RAN" if started else ("✗ FAILED" if started is False else "?")
+        err = g.get("exec_error", "")
+        line = (
+            f"- Gen {g['gen']}: {g.get('name','?')} — {marker} — {g.get('improvement_note','')}"
             f" [accent {g.get('accent_hex','?')}/{g.get('accent2_hex','?')}]"
         )
+        if err:
+            line += f"\n    last error: {err.strip()[:150]}"
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -185,29 +198,43 @@ async def _call_role(role: str, messages: list[dict], assignment: Optional[dict]
     )
 
 
-async def plan_step(history: list[dict], assignment: Optional[dict] = None) -> dict:
+async def teacher_step(target: str, exemplars: list[dict], assignment: Optional[dict] = None) -> dict:
+    """Teacher bot: designs the Artist's brief given the human's target and top-verified exemplars."""
+    exemplar_block = "\n\n".join(
+        f"[verified chain — target: {e.get('target','?')} — final product: {e.get('name','?')}]\n"
+        f"artist_brief was: {e.get('artist_brief','?')}"
+        for e in exemplars[:3]
+    ) or "(no verified exemplars yet — apply first principles)"
     raw = await _call_role(
-        "planner",
-        [{"role": "system", "content": SYSTEM_PLANNER},
-         {"role": "user", "content": f"Chain so far:\n{_chain_brief(history)}\n\nWrite the PLAN as strict JSON."}],
-        assignment, temperature=0.7, max_tokens=400,
+        "planner",  # Teacher uses the "planner" role slot
+        [{"role": "system", "content": SYSTEM_TEACHER},
+         {"role": "user", "content":
+            f"HUMAN TARGET:\n{target}\n\nTOP-VERIFIED PRIOR CHAINS:\n{exemplar_block}\n\n"
+            f"Design the Teacher spec as strict JSON."}],
+        assignment, temperature=0.4, max_tokens=800,
     )
-    return _extract_json(raw or "") or {"intent": "diverge in visual identity", "capability_focus": "visual identity", "constraints": "same core template"}
+    parsed = _extract_json(raw or "") or {}
+    parsed.setdefault("target", target)
+    parsed.setdefault("name", f"Teacher-{target[:20]}")
+    parsed.setdefault("artist_brief", f"Build: {target}. Keep it minimal and runnable.")
+    parsed.setdefault("must_have", ["compiles/starts", "single-command run", "clear README"])
+    parsed.setdefault("accent_hex", "#7cffb2")
+    parsed.setdefault("accent2_hex", "#ff79c6")
+    parsed.setdefault("weights", {"helpfulness":0.35,"correctness":0.40,"coherence":0.20,"complexity":0.10,"verbosity":-0.05})
+    return parsed
 
 
-async def architect_step(plan: dict, history: list[dict], gen_number: int, assignment: Optional[dict] = None) -> Optional[dict]:
-    user_msg = (
-        f"Chain so far:\n{_chain_brief(history)}\n\n"
-        f"PLAN:\n{json.dumps(plan, indent=2)}\n\n"
-        f"Now output the mutation spec for Gen {gen_number}. Its accent_hex, weights and improvement_note "
-        f"MUST differ meaningfully from every prior gen. Strict JSON."
-    )
+async def artist_step(teacher_spec: dict, assignment: Optional[dict] = None) -> Optional[dict]:
+    """Artist bot: designs the actual product following the Teacher's brief."""
     raw = await _call_role(
-        "architect",
-        [{"role": "system", "content": SYSTEM_ARCHITECT}, {"role": "user", "content": user_msg}],
-        assignment, temperature=0.9, max_tokens=700,
+        "architect",  # Artist uses the "architect" role slot
+        [{"role": "system", "content": SYSTEM_ARTIST},
+         {"role": "user", "content":
+            f"TEACHER SPEC:\n{json.dumps(teacher_spec, indent=2)}\n\n"
+            f"Design the product as strict JSON."}],
+        assignment, temperature=0.95, max_tokens=800,
     )
-    parsed = _extract_json(raw or "") if raw else {}
+    parsed = _extract_json(raw or "") or {}
     return parsed if parsed.get("name") else None
 
 
@@ -272,8 +299,17 @@ def _gen_brief(gen: dict, max_files: int = 3, max_lines: int = 25) -> str:
         f"improvement_note: {gen.get('improvement_note','')}",
         f"accents: {gen.get('accent_hex','?')} / {gen.get('accent2_hex','?')}",
         f"weights: {gen.get('weights','?')}",
-        "\n## File previews",
     ]
+    ex = gen.get("exec") or {}
+    if ex:
+        lines.append(
+            f"\n## Execution result (REAL RUN)\n"
+            f"started: {ex.get('started')} | port_listening: {ex.get('port_listening')} | "
+            f"exit_code: {ex.get('exit_code')} | duration: {ex.get('duration_s')}s"
+        )
+        if ex.get("stderr"):
+            lines.append("stderr tail:\n" + (ex["stderr"] or "")[-800:])
+    lines.append("\n## File previews")
     for f in gen.get("files", [])[:max_files]:
         head = "\n".join(f["content"].splitlines()[:max_lines])
         lines.append(f"\n--- {f['path']} (head) ---\n{head}")
@@ -323,6 +359,12 @@ async def evolve_chain_with_callback(
         gen_number = i + 2
         stages: dict = {}
 
+        # inject previous gen's real exec result into the planner prompt
+        # so it can learn from what actually failed / succeeded
+        prior_exec = None
+        if history and generations:
+            prior_exec = generations[-1].get("exec")
+
         # 1) planner
         plan = await plan_step(history, assignment=a["planner"])
         stages["plan"] = plan
@@ -351,7 +393,52 @@ async def evolve_chain_with_callback(
                       for f in spec["files"]],
         }
 
-        # 6) rater
+        # 5b) EXECUTOR — materialize + actually run the code, capture reality
+        #     Use a distinct port per gen so parallel executions don't collide.
+        workspace = _exec.materialize(chain_id, spec)
+        exec_port = 8100 + (gen_number * 17) % 800  # deterministic per-gen port
+        exec_result = await _exec.run_workspace(
+            workspace, timeout=25, port_to_check=exec_port
+        )
+        spec["exec"] = exec_result
+        stages["executor"] = {
+            "started": exec_result["started"],
+            "port_listening": exec_result["port_listening"],
+            "exit_code": exec_result["exit_code"],
+            "duration_s": exec_result["duration_s"],
+            "workspace": exec_result["root"],
+        }
+        exec_brief = _exec.brief(exec_result)
+
+        # 5c) if it didn't start, ask corrector to fix based on real error output
+        if not exec_result["started"] and exec_result.get("stderr"):
+            fix_prompt = (
+                f"The generated app FAILED TO START.\n\nSpec:\n{json.dumps({k: spec.get(k) for k in ('name','improvement_note','weights')}, indent=2)}"
+                f"\n\n{exec_brief}\n\nOutput the corrected spec JSON. Keep the schema; adjust "
+                f"'improvement_note' to acknowledge the fix."
+            )
+            fixed_raw = await _call_role(
+                "corrector",
+                [{"role": "system", "content": SYSTEM_CORRECTOR},
+                 {"role": "user", "content": fix_prompt}],
+                a["corrector"], temperature=0.4, max_tokens=800,
+            )
+            fixed = _extract_json(fixed_raw or "") if fixed_raw else {}
+            if fixed and fixed.get("name"):
+                spec.update({k: v for k, v in fixed.items() if k != "files"})
+                spec["files"] = seed_template.render(spec)
+                # re-run once after the fix
+                workspace = _exec.materialize(chain_id, spec)
+                exec_result = await _exec.run_workspace(workspace, timeout=20, port_to_check=exec_port)
+                spec["exec"] = exec_result
+                stages["executor_retry"] = {
+                    "started": exec_result["started"],
+                    "port_listening": exec_result["port_listening"],
+                    "exit_code": exec_result["exit_code"],
+                }
+                exec_brief = _exec.brief(exec_result)
+
+        # 6) reviewer — now grounded in real execution output
         scores = await rate_step(spec, assignment=a["rater"])
         spec["reward"] = scores or {"helpfulness": 0.0, "correctness": 0.0,
                                     "coherence": 0.0, "complexity": 0.0, "verbosity": 0.0}
@@ -366,6 +453,8 @@ async def evolve_chain_with_callback(
             "gen": gen_number, "name": spec.get("name"),
             "improvement_note": spec.get("improvement_note", ""),
             "accent_hex": spec.get("accent_hex"), "accent2_hex": spec.get("accent2_hex"),
+            "exec_started": (spec.get("exec") or {}).get("started"),
+            "exec_error": ((spec.get("exec") or {}).get("stderr") or "")[-200:],
         })
         await on_gen(chain_id, spec, fallback_used)
 

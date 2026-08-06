@@ -264,6 +264,7 @@ DEFAULT_ASSIGNMENTS = {
     "planner":   {"provider": "openrouter", "model": "nvidia/nemotron-3-super-120b-a12b:free"},
     "architect": {"provider": "openrouter", "model": "nvidia/nemotron-3-super-120b-a12b:free"},
     "builder":   {"provider": "openrouter", "model": "poolside/laguna-s-2.1:free"},
+    "executor":  {"provider": "local",      "model": "bash run.sh (subprocess, 30s timeout)"},
     "reviewer":  {"provider": "openrouter", "model": "google/gemma-4-31b-it:free"},
     "corrector": {"provider": "openrouter", "model": "poolside/laguna-s-2.1:free"},
     "rater":     {"provider": "openrouter", "model": "inclusionai/ling-3.0-flash:free"},
