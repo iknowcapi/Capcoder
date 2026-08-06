@@ -23,23 +23,36 @@ def _slug(s: str, fallback: str = "gen") -> str:
     return s or fallback
 
 
+def _is_safe_relpath(p: str) -> bool:
+    """Shared file-path predicate: reject absolute paths, `..`, backslashes, null bytes."""
+    if not p or p.startswith("/") or "\x00" in p or "\\" in p:
+        return False
+    parts = [seg for seg in p.split("/") if seg]
+    if not parts:
+        return False
+    for seg in parts:
+        if seg == ".." or seg == "." or seg.startswith(".."):
+            return False
+    return True
+
+
 def materialize(chain_id: str, gen: dict) -> pathlib.Path:
     """Write the gen's files to /workspaces/{chain}/{name} and return the dir.
 
-    SEC-002: every file path must resolve inside ``root``. Anything else is dropped.
+    SEC-002: reject anything that isn't a safe relative path AND double-check
+    it resolves inside ``root``.
     """
     slug = _slug(gen.get("name") or f"gen-{gen.get('gen')}", f"gen-{gen.get('gen')}")
     root = (WORKSPACE_ROOT / chain_id[:8] / slug).resolve()
     root.mkdir(parents=True, exist_ok=True)
     for f in gen.get("files", []):
         rel = (f.get("path") or "").strip().lstrip("/")
-        if not rel or "\x00" in rel:
+        if not _is_safe_relpath(rel):
             continue
         p = (root / rel).resolve()
         try:
             p.relative_to(root)
         except ValueError:
-            # path escaped the workspace — skip.
             continue
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(f["content"])

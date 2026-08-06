@@ -498,18 +498,8 @@ async def artist_step(teacher_spec: dict, exemplar_files: Optional[list[dict]] =
                                   "coherence": 0.20, "complexity": 0.10, "verbosity": -0.05})
     # Sanitize files array — reject entries missing path or content, drop obvious
     # placeholders, and REJECT any path that tries to escape the workspace via
-    # `..`, absolute paths, or backslashes / null bytes (SEC-002).
-    def _is_safe_relpath(p: str) -> bool:
-        if not p or p.startswith("/") or "\x00" in p or "\\" in p:
-            return False
-        parts = [seg for seg in p.split("/") if seg]
-        if not parts:
-            return False
-        for seg in parts:
-            if seg == ".." or seg == "." or seg.startswith(".."):
-                return False
-        return True
-
+    # `..`, absolute paths, or backslashes / null bytes (SEC-002). Reuse the
+    # shared predicate from `executor` so the guard is identical in every place.
     clean_files: list[dict] = []
     for f in parsed.get("files") or []:
         if not isinstance(f, dict):
@@ -518,7 +508,7 @@ async def artist_step(teacher_spec: dict, exemplar_files: Optional[list[dict]] =
         content = f.get("content")
         if not path or not isinstance(content, str) or not content.strip():
             continue
-        if not _is_safe_relpath(path):
+        if not _exec._is_safe_relpath(path):
             logger.warning("rejected unsafe artist file path: %r", path)
             continue
         if "..." in content and content.count("...") > 3 and len(content) < 200:
@@ -558,9 +548,7 @@ async def correct_step(spec: dict, stderr: str, assignment: Optional[dict] = Non
             if not (isinstance(f, dict) and f.get("path") and isinstance(f.get("content"), str)):
                 continue
             path = f["path"].strip().lstrip("/")
-            parts = [seg for seg in path.split("/") if seg]
-            if (not path or "\x00" in path or "\\" in path or not parts or
-                    any(seg == ".." or seg == "." or seg.startswith("..") for seg in parts)):
+            if not _exec._is_safe_relpath(path):
                 logger.warning("rejected unsafe corrector file path: %r", path)
                 continue
             clean.append({"path": path, "content": f["content"]})

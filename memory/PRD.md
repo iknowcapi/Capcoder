@@ -38,8 +38,17 @@ CapCode is a recursive bot-builder. Human types the app they want; the system ru
 - **Orphan sweep on boot.** Any chain still marked `running` when the backend starts gets moved to `failed` with reason "backend restarted before build finished — try again." No more zombie chains after supervisor reloads.
 - **Executor kills whole process group.** `os.setsid` + `os.killpg` — no more orphaned `python3 -m http.server` / `vite` children leaking after builds.
 
-### Providers
-User-driven. Server defaults route through **OpenRouter** (user has credits): Teacher = `deepseek/deepseek-v4-flash`, Artist = `anthropic/claude-sonnet-5`, Rater = `inclusionai/ling-3.0-flash:free`. Fallback = Venice `qwen3-coder-480b-a35b-instruct-turbo`. NVIDIA deprioritized. Users override anything in Settings.
+### Security posture (2026-08-06 — post audit)
+Audit ran; **DO NOT LAUNCH** verdict addressed by fixing the P0/P1 issues without breaking the framework:
+
+- ✅ **SEC-001 (Critical)** — Executor child env is now whitelisted (`PATH/HOME/TERM/LANG/LC_ALL/LC_CTYPE/USER/TMPDIR/PWD/SHELL` + injected `APP_PORT`). Provider keys and Mongo URL never reach AI-generated `run.sh`. Verified by testing agent: env dump contains no `NVIDIA_API_KEY`, `OPENROUTER_API_KEY`, `VENICE_API_KEY`, `MONGO_URL`, `DB_NAME`, nor their values.
+- ✅ **SEC-002 (High)** — Every Artist/corrector-authored file path goes through the shared `_is_safe_relpath` predicate (rejects `..`, absolute paths, backslashes, null bytes); `executor.materialize()` also `Path.resolve()`s and confirms the write target sits inside the workspace root. Verified against `../../etc/passwd`, `/tmp/pwned`, `..\pwn`, `dir/../../out`, `x\x00y`, `a/b/../../../../oops.txt` — all rejected.
+- ✅ **SEC-004 (Medium)** — GitHub push endpoint uses `GIT_ASKPASS` (PAT never in argv / `/proc`). `--force` only used when the repo was just freshly created (HTTP 201), not for existing repos (422).
+
+**Deferred out of scope (documented, not shipped):**
+- SEC-003 (auth/ownership on chains list/download/stream) — needs a full auth story; MVP intentionally leaves this open.
+- SEC-005 (rate limit on `/api/evolve`) — deferred; enable when BYOK usage rules are decided.
+- CORS `*` + client-generated `session_id` — low blast radius since keys stored in Mongo never leak back over the wire.
 
 ## Backlog (post-reliability)
 - P1: BYOK — let users paste their own OpenRouter/Venice keys.

@@ -680,9 +680,7 @@ async def push_to_github(chain_id: str, req: GithubPushRequest):
     with tempfile.TemporaryDirectory(prefix="capcode-push-") as tmp:
         for f in files:
             rel = (f.get("path") or "").strip().lstrip("/")
-            parts = [seg for seg in rel.split("/") if seg]
-            if (not rel or "\x00" in rel or "\\" in rel or not parts or
-                    any(seg == ".." or seg == "." or seg.startswith("..") for seg in parts)):
+            if not _exec._is_safe_relpath(rel):
                 continue
             p = Path(tmp) / rel
             try:
