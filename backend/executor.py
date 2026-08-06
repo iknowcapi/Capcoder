@@ -78,6 +78,7 @@ async def run_workspace(
         env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        preexec_fn=os.setsid,  # new process group so we can kill children too
     )
 
     # Poll port up to `timeout` seconds; when it opens we call it "started".
@@ -90,15 +91,31 @@ async def run_workspace(
             break
         await asyncio.sleep(0.5)
 
-    # Give it a beat to emit logs, then tear it down.
+    # Give it a beat to emit logs, then tear the whole process group down.
     await asyncio.sleep(0.5)
+    import signal as _signal
+    pgid = None
     try:
-        proc.terminate()
+        pgid = os.getpgid(proc.pid)
+    except Exception:
+        pass
+    try:
+        if pgid is not None:
+            os.killpg(pgid, _signal.SIGTERM)
+        else:
+            proc.terminate()
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
         except asyncio.TimeoutError:
-            proc.kill()
-            stdout, stderr = await proc.communicate()
+            if pgid is not None:
+                try: os.killpg(pgid, _signal.SIGKILL)
+                except Exception: pass
+            else:
+                proc.kill()
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=3)
+            except asyncio.TimeoutError:
+                stdout, stderr = b"", b""
     except ProcessLookupError:
         stdout, stderr = b"", b""
 

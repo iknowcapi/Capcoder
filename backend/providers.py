@@ -261,14 +261,16 @@ async def get_catalog(force: bool = False) -> list[dict]:
 
 
 DEFAULT_ASSIGNMENTS = {
-    # CapCode strict topology: Human -> Teacher -> Artist -> Product -> Rater.
-    "teacher": {"provider": "nvidia", "model": "z-ai/glm-5.2"},
-    "artist":  {"provider": "nvidia", "model": "z-ai/glm-5.2"},
-    "rater":   {"provider": "nvidia", "model": "nvidia/llama-3.3-nemotron-super-49b-v1.5"},
-    # NIM fallbacks used automatically if the primary provider errors.
-    "teacher_fallback": {"provider": "nvidia", "model": "z-ai/glm-5.2"},
-    "artist_fallback":  {"provider": "nvidia", "model": "z-ai/glm-5.2"},
-    "rater_fallback":   {"provider": "nvidia", "model": "nvidia/llama-3.3-nemotron-super-49b-v1.5"},
+    # CapCode topology: Human -> Teacher -> Artist -> Product -> Rater.
+    # Defaults route through OpenRouter (user has credits). NVIDIA is skipped
+    # by default because pay-as-you-go is unreliable.
+    "teacher": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash"},
+    "artist":  {"provider": "openrouter", "model": "anthropic/claude-sonnet-5"},
+    "rater":   {"provider": "openrouter", "model": "inclusionai/ling-3.0-flash:free"},
+    # Fallbacks route through Venice, then OpenRouter free.
+    "teacher_fallback": {"provider": "venice",     "model": "qwen3-coder-480b-a35b-instruct-turbo"},
+    "artist_fallback":  {"provider": "venice",     "model": "qwen3-coder-480b-a35b-instruct-turbo"},
+    "rater_fallback":   {"provider": "openrouter", "model": "openai/gpt-oss-20b:free"},
 }
 
 

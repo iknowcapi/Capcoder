@@ -45,8 +45,10 @@ def render(mutation: dict | None = None, seed_template_src: str | None = None,
            stack: str | None = None) -> list[dict]:
     """Render a complete runnable folder for the requested stack.
 
-    stack: "python-fastapi" (default) | "node-vite" | "rust" | "go" | "webgl"
-    Returns list of {path, content} dicts ready to write to disk or zip up.
+    If the mutation dict already carries an Artist-authored ``files`` list, those
+    files are used verbatim and this function only ADDS any missing scaffolding
+    (run.sh, package.json/Cargo.toml/go.mod/requirements.txt, README.md).
+    Otherwise a stack-appropriate boilerplate is rendered.
     """
     m = {**DEFAULT_MUTATION, **(mutation or {})}
     stack = (stack or m.get("stack") or "python-fastapi").lower().strip()
@@ -58,7 +60,14 @@ def render(mutation: dict | None = None, seed_template_src: str | None = None,
     improvement = m.get("improvement_note") or DEFAULT_MUTATION["improvement_note"]
     target = m.get("target_prompt") or m.get("target") or ""
 
-    # Route to non-python stacks
+    # ---- Artist-authored files: use verbatim, fill gaps only ------------
+    artist_files = [f for f in (m.get("files") or []) if isinstance(f, dict)
+                    and f.get("path") and isinstance(f.get("content"), str)]
+    if artist_files:
+        return _fill_gaps(artist_files, stack, name, tagline, philosophy, improvement,
+                          accent, accent2, target)
+
+    # ---- No artist files: fall back to stack boilerplate ----------------
     if "node" in stack or "vite" in stack or "react" in stack:
         return _render_node(name, tagline, philosophy, improvement, accent, accent2, target)
     if "rust" in stack:
@@ -68,7 +77,7 @@ def render(mutation: dict | None = None, seed_template_src: str | None = None,
     if "webgl" in stack or "html" in stack:
         return _render_webgl(name, tagline, philosophy, improvement, accent, accent2, target)
 
-    # Default: python-fastapi (existing template)
+    # Default: python-fastapi
     weights = {**DEFAULT_MUTATION["weights"], **(m.get("weights") or {})}
     if seed_template_src is None:
         seed_template_src = Path(__file__).read_text()
@@ -92,6 +101,58 @@ def render(mutation: dict | None = None, seed_template_src: str | None = None,
         )},
     ]
     return files
+
+
+def _fill_gaps(artist_files, stack, name, tagline, philosophy, improvement,
+               accent, accent2, target):
+    """Take the Artist's files, add any missing scaffolding for the stack.
+    Never overwrites what the Artist wrote."""
+    have = {f["path"] for f in artist_files}
+    out = list(artist_files)
+
+    def add_if_missing(path, content):
+        if path not in have:
+            out.append({"path": path, "content": content})
+
+    # README is always nice.
+    add_if_missing("README.md", f"# {name}\n\n> {tagline}\n\n{philosophy}\n\n**Target:** {target}\n\n{improvement}\n\n## Run\n\n```bash\nbash run.sh\n```\n")
+
+    if "node" in stack or "vite" in stack or "react" in stack:
+        if "package.json" not in have:
+            add_if_missing("package.json", json.dumps({
+                "name": _slug(name), "version": "0.1.0", "type": "module",
+                "scripts": {"dev": "vite --host --port ${APP_PORT:-8000}",
+                            "build": "vite build", "preview": "vite preview --port ${APP_PORT:-8000} --host"},
+                "dependencies": {"react": "^18.3.1", "react-dom": "^18.3.1"},
+                "devDependencies": {"vite": "^5.4.0", "@vitejs/plugin-react": "^4.3.1"},
+            }, indent=2))
+        add_if_missing("vite.config.js",
+            "import { defineConfig } from 'vite';\nimport react from '@vitejs/plugin-react';\n"
+            "export default defineConfig({ plugins:[react()], server:{ host:true, port: Number(process.env.APP_PORT)||8000 }});\n")
+        add_if_missing("run.sh",
+            '#!/usr/bin/env bash\nset -e\ncd "$(dirname "$0")"\n'
+            'npm install --silent >/dev/null 2>&1 || yarn install --silent\n'
+            'exec npx vite --host --port ${APP_PORT:-8000}\n')
+    elif "rust" in stack:
+        if "Cargo.toml" not in have:
+            add_if_missing("Cargo.toml", f'[package]\nname = "{_slug(name)}"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\ntiny_http = "0.12"\n')
+        add_if_missing("run.sh", '#!/usr/bin/env bash\nset -e\ncd "$(dirname "$0")"\ncargo run --release\n')
+    elif stack == "go" or stack.startswith("go-"):
+        add_if_missing("go.mod", f"module {_slug(name)}\n\ngo 1.22\n")
+        add_if_missing("run.sh", '#!/usr/bin/env bash\nset -e\ncd "$(dirname "$0")"\nexec go run main.go\n')
+    elif "webgl" in stack or "html" in stack:
+        add_if_missing("run.sh", '#!/usr/bin/env bash\nset -e\ncd "$(dirname "$0")"\nexec python3 -m http.server ${APP_PORT:-8000}\n')
+    else:
+        # python-fastapi default
+        add_if_missing("backend/requirements.txt",
+            "fastapi==0.115.0\nuvicorn[standard]==0.30.6\npydantic==2.9.2\nhttpx==0.27.2\n")
+        add_if_missing("run.sh",
+            '#!/usr/bin/env bash\nset -e\ncd "$(dirname "$0")"\n'
+            'python3 -m venv .venv 2>/dev/null || true\n'
+            'source .venv/bin/activate\n'
+            'pip install -q -r backend/requirements.txt\n'
+            'cd backend\nexec uvicorn server:app --host 0.0.0.0 --port ${APP_PORT:-8000}\n')
+    return out
 
 
 # ---------------------------------------------------------------------------

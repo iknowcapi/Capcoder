@@ -70,36 +70,54 @@ async def _chat(model: str, messages: list[dict], provider: str = "nvidia",
 
 
 def _extract_json(raw: str) -> dict:
+    """Extract the first top-level JSON object from a model response.
+    Tracks string state so braces inside string literals don't fool the parser."""
     raw = (raw or "").strip()
     if not raw:
         return {}
+    # If wrapped in a ```json fenced block, extract that first.
     m = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", raw)
-    cand = m.group(1) if m else None
-    if cand is None:
-        start = raw.find("{")
-        if start < 0:
-            return {}
+    candidates = []
+    if m:
+        candidates.append(m.group(1))
+    start = raw.find("{")
+    if start >= 0:
         depth = 0
+        in_str = False
+        esc = False
         end = -1
-        for i, c in enumerate(raw[start:], start=start):
-            if c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    end = i + 1
-                    break
-        cand = raw[start:end] if end > 0 else None
-    if not cand:
-        return {}
-    try:
-        return json.loads(cand)
-    except Exception:
+        for i in range(start, len(raw)):
+            c = raw[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+            else:
+                if c == '"':
+                    in_str = True
+                elif c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+        if end > 0:
+            candidates.append(raw[start:end])
+    for cand in candidates:
         try:
-            return json.loads(re.sub(r",\s*([}\]])", r"\1", cand))
+            return json.loads(cand, strict=False)
         except Exception:
-            logger.warning("JSON parse failed: %s", cand[:200])
-            return {}
+            try:
+                # trailing-comma tolerant
+                return json.loads(re.sub(r",\s*([}\]])", r"\1", cand), strict=False)
+            except Exception:
+                continue
+    logger.warning("JSON parse failed. head: %s | tail: %s", raw[:200], raw[-200:])
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -124,9 +142,20 @@ Output STRICT JSON only:
 }
 """
 
-SYSTEM_ARTIST = """You are the ARTIST — Bot 2 in CapCode's two-bot chain. Creative, sharp, novel. Given the Teacher's spec you design the actual PRODUCT (the thing the human asked for). Make it stand out while satisfying every must_have.
+SYSTEM_ARTIST = """You are the ARTIST — Bot 2 in CapCode's two-bot chain. Creative, sharp, novel. Given the Teacher's spec you WRITE THE ACTUAL SOURCE CODE for the app the human asked for. Do not describe. Do not hand-wave. Write real, runnable files.
 
-Output STRICT JSON only:
+Every string in `files[].content` MUST be complete source code — no "..." placeholders, no "TODO" stubs, no imports of packages you don't declare, no fake API keys. The app must start with a single `bash run.sh` and satisfy every must_have in the Teacher spec.
+
+Stack-specific rules:
+  - python-fastapi : include backend/server.py (FastAPI app with a real /api route that DOES the thing), backend/requirements.txt, run.sh (uvicorn on $APP_PORT). Optional frontend/index.html.
+  - node-vite      : include src/main.jsx (real React with real state/fetch/UI for the request), index.html, package.json (with correct deps), vite.config.js, run.sh (npm install + vite --host --port $APP_PORT). NO server-side rendering.
+  - rust           : include Cargo.toml, src/main.rs (real logic), run.sh (cargo run).
+  - go             : include go.mod, main.go (real logic), run.sh (go run main.go).
+  - webgl          : include a single self-contained index.html with real inline JS doing the requested thing, run.sh (python3 -m http.server $APP_PORT).
+
+For anything that needs a public API (prices, weather, quotes, jokes, etc), pick a well-known keyless public endpoint (CoinGecko, wttr.in, jsonplaceholder, etc). Never invent endpoints.
+
+Output STRICT JSON only — no prose before or after:
 {
   "name": "PascalCase product name",
   "tagline": "one line",
@@ -135,11 +164,15 @@ Output STRICT JSON only:
   "stack": "<echo the teacher's stack>",
   "accent_hex": "#rrggbb",
   "accent2_hex": "#rrggbb",
+  "files": [
+    {"path": "relative/path.ext", "content": "FULL FILE CONTENT — no ellipsis"},
+    ...
+  ],
   "weights": {"helpfulness":0.35,"correctness":0.30,"coherence":0.20,"complexity":0.10,"verbosity":-0.05}
 }
 """
 
-SYSTEM_CORRECTOR = """You are the CORRECTOR. The generated app FAILED TO START. Given the product spec + real stderr, output the CORRECTED spec JSON (same schema). Focus on the smallest change that makes it LOAD."""
+SYSTEM_CORRECTOR = """You are the CORRECTOR. The generated app FAILED TO START — given the source files and the real stderr, output the CORRECTED JSON (same schema as the Artist, including a `files` array). Focus on the smallest edits that make it start. Rewrite only the files that need to change; you may include unchanged files verbatim."""
 
 SYSTEM_RATER = ('Score on 5 dims (each 0.0-4.0). Output ONLY: '
                 '{"helpfulness":0.0,"correctness":0.0,"coherence":0.0,"complexity":0.0,"verbosity":0.0}')
@@ -182,15 +215,32 @@ async def teacher_step(target: str, exemplars: list[dict], assignment: Optional[
 
 
 async def artist_step(teacher_spec: dict, assignment: Optional[dict] = None) -> dict:
-    raw = await _call_role(
-        "artist",
-        [{"role": "system", "content": SYSTEM_ARTIST},
-         {"role": "user", "content":
-             f"TEACHER SPEC:\n{json.dumps(teacher_spec, indent=2)}\n\n"
-             f"Design the product as strict JSON."}],
-        assignment, temperature=0.8, max_tokens=500,
-    )
-    parsed = _extract_json(raw or "") or {}
+    parsed: dict = {}
+    raw = ""
+    for attempt in range(2):
+        directive = ("Write the source files as strict JSON. Include the FULL content of every "
+                     "file — no ellipsis, no TODOs.")
+        if attempt == 1:
+            directive += (" KEEP IT MINIMAL — target 3-4 files, ≤180 lines each. Your last "
+                          "response was truncated; be terser this time.")
+        raw = await _call_role(
+            "artist",
+            [{"role": "system", "content": SYSTEM_ARTIST},
+             {"role": "user", "content":
+                 f"TEACHER SPEC:\n{json.dumps(teacher_spec, indent=2)}\n\n{directive}"}],
+            assignment, temperature=0.7 if attempt == 0 else 0.4, max_tokens=12000,
+        )
+        parsed = _extract_json(raw or "") or {}
+        logger.info("ARTIST attempt=%d raw_len=%d keys=%s files=%d",
+                    attempt, len(raw or ""), list(parsed.keys()),
+                    len(parsed.get("files") or []))
+        if parsed.get("files"):
+            break
+        if not parsed:
+            try:
+                Path("/tmp/artist_raw.txt").write_text(raw or "")
+            except Exception:
+                pass
     # ensure required fields exist
     parsed.setdefault("name", f"Product-{teacher_spec.get('target','app')[:20]}")
     parsed.setdefault("tagline", "an app built by CapCode")
@@ -201,22 +251,53 @@ async def artist_step(teacher_spec: dict, assignment: Optional[dict] = None) -> 
     parsed.setdefault("accent2_hex", teacher_spec.get("accent2_hex", "#ff79c6"))
     parsed.setdefault("weights", {"helpfulness": 0.35, "correctness": 0.30,
                                   "coherence": 0.20, "complexity": 0.10, "verbosity": -0.05})
+    # Sanitize files array — reject entries missing path or content, and drop obvious placeholders.
+    clean_files: list[dict] = []
+    for f in parsed.get("files") or []:
+        if not isinstance(f, dict):
+            continue
+        path = (f.get("path") or "").strip().lstrip("/")
+        content = f.get("content")
+        if not path or not isinstance(content, str) or not content.strip():
+            continue
+        if "..." in content and content.count("...") > 3 and len(content) < 200:
+            continue  # obvious stub
+        clean_files.append({"path": path, "content": content})
+    parsed["files"] = clean_files
     return parsed
 
 
 async def correct_step(spec: dict, stderr: str, assignment: Optional[dict] = None) -> dict:
-    prompt = (f"Spec:\n{json.dumps({k: spec.get(k) for k in ('name','philosophy','improvement_note','stack','weights')}, indent=2)}"
-              f"\n\nSTDERR:\n{stderr[-1500:]}\n\nOutput the corrected spec JSON.")
+    file_dump = "\n\n".join(
+        f"### {f['path']}\n```\n{f['content'][:2000]}\n```"
+        for f in (spec.get("files") or [])[:10]
+    ) or "(no files)"
+    prompt = (
+        f"Stack: {spec.get('stack')}\nName: {spec.get('name')}\n\n"
+        f"CURRENT FILES:\n{file_dump}\n\n"
+        f"STDERR (tail):\n{stderr[-1500:]}\n\n"
+        f"Output the corrected JSON (Artist schema, including the full `files` array)."
+    )
     raw = await _call_role(
         "artist",  # corrector reuses the artist's model
         [{"role": "system", "content": SYSTEM_CORRECTOR},
          {"role": "user", "content": prompt}],
-        assignment, temperature=0.3, max_tokens=800,
+        assignment, temperature=0.3, max_tokens=6000,
     )
     fixed = _extract_json(raw or "") if raw else {}
-    if fixed and fixed.get("name"):
-        return {**spec, **{k: v for k, v in fixed.items() if k != "files"}}
-    return spec
+    if not fixed:
+        return spec
+    # merge: corrector's non-file fields overlay spec, corrector's files replace spec's files if present
+    merged = {**spec, **{k: v for k, v in fixed.items() if k != "files"}}
+    new_files = fixed.get("files")
+    if isinstance(new_files, list) and new_files:
+        clean = []
+        for f in new_files:
+            if isinstance(f, dict) and f.get("path") and isinstance(f.get("content"), str):
+                clean.append({"path": f["path"].strip().lstrip("/"), "content": f["content"]})
+        if clean:
+            merged["files"] = clean
+    return merged
 
 
 async def rate_step(spec: dict, exec_result: dict, assignment: Optional[dict] = None) -> dict:
@@ -288,9 +369,11 @@ async def evolve_chain_with_callback(
     product["artist_spec"] = {k: v for k, v in artist_spec.items() if k != "files"}
     product["files"] = seed_template.render(product, stack=product.get("stack") or teacher_spec.get("stack"))
 
-    # 4) EXECUTOR
+    # 4) EXECUTOR — longer timeout for stacks that need install/compile.
+    stack_l = (product.get("stack") or "").lower()
+    exec_timeout = 90 if any(k in stack_l for k in ("node", "vite", "react", "rust", "go")) else 25
     workspace = _exec.materialize(chain_id, product)
-    exec_result = await _exec.run_workspace(workspace, timeout=20, port_to_check=8123)
+    exec_result = await _exec.run_workspace(workspace, timeout=exec_timeout, port_to_check=8123)
     product["exec"] = exec_result
 
     # 5) ONE correction pass if it failed to start
@@ -299,7 +382,7 @@ async def evolve_chain_with_callback(
         product = await correct_step(product, exec_result["stderr"], assignment=a["artist"])
         product["files"] = seed_template.render(product, stack=product.get("stack"))
         workspace = _exec.materialize(chain_id, product)
-        exec_result = await _exec.run_workspace(workspace, timeout=20, port_to_check=8124)
+        exec_result = await _exec.run_workspace(workspace, timeout=exec_timeout, port_to_check=8124)
         product["exec"] = exec_result
 
     # 6) RATER
