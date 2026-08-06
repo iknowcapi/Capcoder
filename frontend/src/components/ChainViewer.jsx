@@ -57,12 +57,23 @@ const GenerationCard = ({ gen, chainId }) => {
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[11px] font-mono">
         <div className="bg-black border-l-2 border-neon_magenta p-2">
-          <div className="label-xs text-neon_magenta neon-magenta mb-1">INPUT</div>
-          <div className="text-phosphor">{gen.input_style || "—"}</div>
+          <div className="label-xs text-neon_magenta neon-magenta mb-1">MUTATION</div>
+          <div className="text-phosphor">{gen.improvement_note || "—"}</div>
         </div>
         <div className="bg-black border-l-2 border-neon_yellow p-2">
-          <div className="label-xs text-neon_yellow mb-1">OUTPUT</div>
-          <div className="text-phosphor">{gen.output_style || "—"}</div>
+          <div className="label-xs text-neon_yellow mb-1">PALETTE</div>
+          <div className="flex items-center gap-2 text-phosphor">
+            <span
+              className="inline-block w-4 h-4 border border-phosphor/30"
+              style={{ background: gen.accent_hex || "#7cffb2" }}
+            />
+            <span>{gen.accent_hex || "—"}</span>
+            <span
+              className="inline-block w-4 h-4 border border-phosphor/30 ml-2"
+              style={{ background: gen.accent2_hex || "#ff79c6" }}
+            />
+            <span>{gen.accent2_hex || "—"}</span>
+          </div>
         </div>
       </div>
 

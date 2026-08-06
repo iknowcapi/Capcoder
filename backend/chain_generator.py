@@ -24,6 +24,8 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
 
+import seed_template
+
 logger = logging.getLogger("chain")
 
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "").strip()
@@ -106,257 +108,72 @@ def _extract_json(raw: str) -> dict:
 # ---------------------------------------------------------------------------
 # Generator prompt
 # ---------------------------------------------------------------------------
-SYSTEM_PROMPT = """You are RECURSIVE.BBS, an evolution engine. You DESIGN a new code-builder application — an app that calls an LLM to generate code from input.
+SYSTEM_PROMPT = """You are RECURSIVE.BBS, an evolution engine. Each generation you design is a COMPLETE working replica of RECURSIVE.BBS — a real no-code code-builder application — with a distinct MUTATION vector applied.
 
-Given the chain so far, design the NEXT generation: a distinct code-builder differing in INPUT STYLE and OUTPUT STYLE from every prior gen.
+The next gen you design will be turned into a full FastAPI + single-page-HTML folder (~350 lines of working code) via a canonical template. You do NOT write the code — you specify the mutation.
 
-Output STRICT JSON ONLY — no prose, no fences, no trailing commas. Be CREATIVE and SPECIFIC. Keep it tight:
+Output STRICT JSON ONLY. No prose. No fences. No trailing commas. Be creative but realistic:
 {
-  "name": "PascalCase, 1-2 words",
-  "tagline": "one short line",
-  "philosophy": "2 sentences. What makes this gen's approach to code generation distinct from its ancestors?",
-  "input_style": "natural-language | structured-form | pseudocode | tests-first | diagram-DSL | Q-and-A-loop | sketch | voice-transcript | spec-by-example | type-signatures-first | constraints-as-code | etc",
-  "output_style": "single-file | multi-file-repo | patch | git-rebase | docker-compose | scaffold | migration | inline-comments-only | bash-pipeline | etc",
-  "system_prompt": "the system prompt the new gen's backend uses when it calls its own LLM (2-4 sentences, captures the philosophy)",
-  "ui_hint": "1 sentence describing the frontend's distinctive interaction (e.g. 'a single textarea labeled tests' or 'two-column diff-style editor' or 'numbered Q-and-A prompts that build up the spec')"
+  "name": "PascalCase, 1-2 words, distinct from every prior gen",
+  "tagline": "one short line describing this gen's personality",
+  "philosophy": "2 sentences. What this gen improves over its parent.",
+  "improvement_note": "the concrete mutation applied — e.g. 'tighter scoring rubric that penalizes verbosity harder', 'inverted accent palette', 'added second critic pass for security', 'shifted weights toward correctness'",
+  "accent_hex": "#rrggbb (primary phosphor color for the terminal UI)",
+  "accent2_hex": "#rrggbb (secondary neon accent)",
+  "weights": {
+    "helpfulness": 0.30 to 0.45,
+    "correctness": 0.25 to 0.40,
+    "coherence":   0.15 to 0.25,
+    "complexity":  0.05 to 0.15,
+    "verbosity":  -0.10 to 0.00
+  }
 }
+
+Weights should sum roughly to ~0.95 (verbosity is negative). Every gen MUST look and score meaningfully different from its ancestors.
 """
 
 
 def _chain_brief(history: list[dict]) -> str:
     """Compact chain history for the next-gen prompt."""
     if not history:
-        return "(no prior generations — you are generating Gen 2; the parent is RECURSIVE.BBS itself)"
+        return (
+            "(no prior descendants yet — you are designing Gen 2. "
+            "The parent is RECURSIVE.BBS itself: dark BBS terminal UI, "
+            "accent_hex=#7cffb2, accent2_hex=#ff79c6, standard weights "
+            "helpfulness=0.35, correctness=0.30, coherence=0.20, complexity=0.10, verbosity=-0.05.)"
+        )
     lines = []
     for g in history:
         lines.append(
-            f"- Gen {g['gen']}: {g.get('name','?')} — input:{g.get('input_style','?')} "
-            f"/ output:{g.get('output_style','?')}. {g.get('tagline','')}"
+            f"- Gen {g['gen']}: {g.get('name','?')} — {g.get('improvement_note','')}"
+            f" [accent {g.get('accent_hex','?')}/{g.get('accent2_hex','?')}]"
         )
     return "\n".join(lines)
 
 
 async def generate_gen(history: list[dict], gen_number: int) -> Optional[dict]:
-    """Ask GLM to DESIGN the next generation (tight JSON spec).
-
-    Files are synthesized deterministically from the spec via _synthesize_files()
-    — this guarantees syntactically valid code and keeps the LLM call fast.
-    """
+    """Ask GLM to design the next gen's MUTATION (tight JSON). File synthesis is deterministic."""
     user_msg = (
         f"Chain so far:\n{_chain_brief(history)}\n\n"
-        f"Now design Gen {gen_number}. Pick INPUT and OUTPUT styles that NONE of the prior "
-        f"gens used. Output strict JSON per the schema."
+        f"Now design Gen {gen_number}. Its mutation MUST differ meaningfully from every prior "
+        f"gen (different accent colors, different scoring emphasis, different improvement note). "
+        f"Output strict JSON per the schema."
     )
     raw = await _chat(
         GEN_MODEL,
         [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_msg}],
-        temperature=0.85,
-        max_tokens=900,
+        temperature=0.9,
+        max_tokens=700,
     )
     if not raw:
         return None
     parsed = _extract_json(raw)
     if not parsed.get("name"):
-        logger.warning("gen %s: no name in parsed output. raw head: %r", gen_number, raw[:300])
+        logger.warning("gen %s: no name in parsed output. raw head: %r", gen_number, raw[:200])
         return None
-    parsed["files"] = _synthesize_files(parsed)
+    # render the COMPLETE replica folder from the mutation spec via the seed template
+    parsed["files"] = seed_template.render(parsed)
     return parsed
-
-
-# ---------------------------------------------------------------------------
-# Deterministic file synthesis (turn the AI-designed spec into real code)
-# ---------------------------------------------------------------------------
-def _safe_str(s: str) -> str:
-    return (s or "").replace('"""', '\\"\\"\\"')
-
-
-def _synthesize_files(spec: dict) -> list[dict]:
-    name = spec.get("name") or "GenApp"
-    tagline = spec.get("tagline") or "a code-builder"
-    philosophy = spec.get("philosophy") or ""
-    input_style = spec.get("input_style") or "natural-language"
-    output_style = spec.get("output_style") or "single-file"
-    sys_prompt = spec.get("system_prompt") or (
-        f"You are {name}, a code generator. Input style: {input_style}. "
-        f"Output style: {output_style}. Produce only the code, no prose."
-    )
-    ui_hint = spec.get("ui_hint") or "a single textarea + Generate button"
-
-    server_py = f'''"""
-{name} — {tagline}
-Code-builder gen produced by RECURSIVE.BBS.
-Input style: {input_style}.  Output style: {output_style}.
-"""
-import os
-from pathlib import Path
-
-from fastapi import FastAPI
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-
-SYSTEM_PROMPT = """{_safe_str(sys_prompt)}"""
-
-API_KEY = os.environ.get("NVIDIA_API_KEY", "").strip()
-STUB_MODE = not API_KEY
-_client = None
-if not STUB_MODE:
-    try:
-        from openai import OpenAI
-        _client = OpenAI(api_key=API_KEY, base_url="https://integrate.api.nvidia.com/v1", timeout=60)
-    except Exception:
-        STUB_MODE = True
-
-app = FastAPI(title="{name}")
-FRONTEND = Path(__file__).resolve().parent.parent / "frontend"
-
-
-class GenReq(BaseModel):
-    input: str
-
-
-@app.get("/api/info")
-def info():
-    return {{
-        "name": "{name}",
-        "input_style": "{input_style}",
-        "output_style": "{output_style}",
-        "stub_mode": STUB_MODE,
-    }}
-
-
-@app.post("/api/generate")
-def generate(req: GenReq):
-    if STUB_MODE or _client is None:
-        body = req.input.strip() or "hello world"
-        return {{"code": f"# stub output for {{body!r}}\\n# input_style: {input_style}\\n# output_style: {output_style}\\nprint({{body!r}})\\n"}}
-    try:
-        r = _client.chat.completions.create(
-            model="z-ai/glm-5.1",
-            messages=[
-                {{"role": "system", "content": SYSTEM_PROMPT}},
-                {{"role": "user", "content": req.input}},
-            ],
-            temperature=0.6,
-            max_tokens=1500,
-        )
-        msg = r.choices[0].message
-        code = (msg.content or "").strip()
-        if not code:
-            code = (getattr(msg, "reasoning_content", "") or "").strip()
-        return {{"code": code}}
-    except Exception as exc:
-        return {{"code": f"# generation failed: {{exc}}\\n"}}
-
-
-if FRONTEND.exists():
-    app.mount("/static", StaticFiles(directory=str(FRONTEND)), name="static")
-
-    @app.get("/")
-    def index():
-        return FileResponse(FRONTEND / "index.html")
-'''
-
-    html = f"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>{name}</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-  :root {{ --bg:#0a0a0a; --fg:#7cffb2; --mut:#5a5a5a; --line:#222; --acc:#ff79c6; }}
-  *{{box-sizing:border-box}}
-  body{{margin:0;background:var(--bg);color:var(--fg);font:14px ui-monospace,SFMono-Regular,Menlo,monospace;padding:24px;max-width:1100px;margin:0 auto}}
-  header{{border-bottom:1px solid var(--line);padding-bottom:12px;margin-bottom:18px}}
-  h1{{margin:0;color:var(--fg);font-size:18px;letter-spacing:.1em;text-transform:uppercase}}
-  .pill{{display:inline-block;padding:2px 8px;border:1px solid var(--acc);color:var(--acc);font-size:11px;letter-spacing:.1em;text-transform:uppercase;margin-left:8px}}
-  .muted{{color:var(--mut)}}
-  textarea,input{{background:#111;color:var(--fg);border:1px solid var(--line);padding:10px;font:inherit;width:100%}}
-  button{{background:transparent;color:var(--fg);border:1px solid var(--fg);padding:8px 14px;cursor:pointer;font:inherit;text-transform:uppercase;letter-spacing:.1em}}
-  button:hover{{background:var(--fg);color:#000}}
-  pre{{background:#000;padding:14px;border:1px solid var(--line);white-space:pre-wrap;max-height:60vh;overflow:auto}}
-  .row{{display:flex;gap:10px;align-items:center;margin:10px 0}}
-</style>
-</head>
-<body>
-<header>
-  <h1>{name}<span class="pill">{input_style} -&gt; {output_style}</span></h1>
-  <div class="muted" style="margin-top:6px">{tagline}</div>
-  <div class="muted" style="margin-top:4px;font-size:12px">{ui_hint}</div>
-</header>
-
-<div class="muted" style="font-size:12px;margin-bottom:6px">describe what you want as <strong>{input_style}</strong>:</div>
-<textarea id="i" rows="8" placeholder="enter your {input_style} here…"></textarea>
-<div class="row">
-  <button id="b">Generate {output_style}</button>
-  <span id="s" class="muted"></span>
-</div>
-<pre id="o" class="muted">[ output will appear here ]</pre>
-
-<script>
-const B = document.getElementById('b');
-const S = document.getElementById('s');
-B.onclick = async () => {{
-  const input = document.getElementById('i').value;
-  if (!input.trim()) return;
-  B.disabled = true; S.textContent = 'thinking…';
-  try {{
-    const r = await fetch('/api/generate', {{
-      method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{input}})
-    }});
-    const data = await r.json();
-    document.getElementById('o').textContent = data.code || '(no output)';
-  }} catch (e) {{
-    document.getElementById('o').textContent = String(e);
-  }} finally {{
-    B.disabled = false; S.textContent = '';
-  }}
-}};
-</script>
-</body>
-</html>
-"""
-
-    run_sh = """#!/usr/bin/env bash
-set -e
-cd "$(dirname "$0")"
-python3 -m venv .venv 2>/dev/null || true
-source .venv/bin/activate
-pip install -q -r backend/requirements.txt
-cd backend
-exec uvicorn server:app --host 0.0.0.0 --port 8000
-"""
-
-    requirements_txt = "fastapi==0.115.0\nuvicorn[standard]==0.30.6\npydantic==2.9.2\nopenai==1.99.9\n"
-
-    readme = f"""# {name}
-
-> {tagline}
-
-Generated by RECURSIVE.BBS.
-
-**Philosophy:** {philosophy}
-
-- Input style: `{input_style}`
-- Output style: `{output_style}`
-
-## Run
-
-```bash
-export NVIDIA_API_KEY=nvapi-…   # optional; falls back to STUB_MODE if missing
-bash run.sh
-```
-
-Then open http://localhost:8000 — `{ui_hint}`.
-"""
-
-    return [
-        {"path": "backend/server.py", "content": server_py},
-        {"path": "backend/requirements.txt", "content": requirements_txt},
-        {"path": "frontend/index.html", "content": html},
-        {"path": "run.sh", "content": run_sh},
-        {"path": "README.md", "content": readme},
-    ]
 
 
 # ---------------------------------------------------------------------------
@@ -367,8 +184,9 @@ def _gen_brief(gen: dict, max_files: int = 3, max_lines: int = 25) -> str:
         f"# {gen.get('name','app')} (Gen {gen.get('gen','?')})",
         f"tagline: {gen.get('tagline','')}",
         f"philosophy: {gen.get('philosophy','')}",
-        f"input_style: {gen.get('input_style','')}",
-        f"output_style: {gen.get('output_style','')}",
+        f"improvement_note: {gen.get('improvement_note','')}",
+        f"accents: {gen.get('accent_hex','?')} / {gen.get('accent2_hex','?')}",
+        f"weights: {gen.get('weights','?')}",
         "\n## File previews",
     ]
     for f in gen.get("files", [])[:max_files]:
@@ -463,8 +281,11 @@ async def evolve_chain_with_callback(
         gen["composite_score"] = composite(gen["reward"])
         generations.append(gen)
         history.append({
-            "gen": gen_number, "name": gen.get("name"), "tagline": gen.get("tagline"),
-            "input_style": gen.get("input_style"), "output_style": gen.get("output_style"),
+            "gen": gen_number,
+            "name": gen.get("name"),
+            "improvement_note": gen.get("improvement_note", ""),
+            "accent_hex": gen.get("accent_hex"),
+            "accent2_hex": gen.get("accent2_hex"),
         })
         await on_gen(chain_id, gen, fallback_used)
 
@@ -514,9 +335,9 @@ async def evolve_chain(depth: int = 3) -> dict:
             {
                 "gen": gen_number,
                 "name": gen.get("name"),
-                "tagline": gen.get("tagline"),
-                "input_style": gen.get("input_style"),
-                "output_style": gen.get("output_style"),
+                "improvement_note": gen.get("improvement_note", ""),
+                "accent_hex": gen.get("accent_hex"),
+                "accent2_hex": gen.get("accent2_hex"),
             }
         )
 
@@ -533,73 +354,30 @@ async def evolve_chain(depth: int = 3) -> dict:
 # Fallback (only used if the LLM call fails outright)
 # ---------------------------------------------------------------------------
 def _fallback_gen(n: int, history: list[dict]) -> dict:
-    name = f"FallbackGen{n}"
-    server_py = f'''"""
-{name} — placeholder gen (NIM was unreachable). Still a runnable FastAPI code-builder.
-"""
-import os
-from fastapi import FastAPI
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
-from pathlib import Path
-from pydantic import BaseModel
+    """Deterministic mutation applied via the same seed template."""
+    import random as _rand
 
-try:
-    from openai import OpenAI
-    _key = os.environ.get("NVIDIA_API_KEY", "")
-    _client = OpenAI(api_key=_key, base_url="https://integrate.api.nvidia.com/v1") if _key else None
-except Exception:
-    _client = None
-
-app = FastAPI(title="{name}")
-FRONTEND = Path(__file__).resolve().parent.parent / "frontend"
-
-class GenReq(BaseModel):
-    input: str
-
-@app.post("/api/generate")
-def generate(req: GenReq):
-    if _client is None:
-        return {{"code": f"# stub-{{req.input}}\\nprint('hello from {name}')\\n", "files": []}}
-    r = _client.chat.completions.create(
-        model="z-ai/glm-5.1",
-        messages=[
-            {{"role": "system", "content": "Output Python code only, no prose."}},
-            {{"role": "user", "content": req.input}},
-        ],
-    )
-    return {{"code": r.choices[0].message.content or "", "files": []}}
-
-if FRONTEND.exists():
-    app.mount("/static", StaticFiles(directory=str(FRONTEND)), name="static")
-    @app.get("/")
-    def index():
-        return FileResponse(FRONTEND / "index.html")
-'''
-    html = f"""<!doctype html><html><head><meta charset="utf-8"><title>{name}</title>
-<style>body{{background:#0a0a0a;color:#7cffb2;font:14px ui-monospace;padding:20px}}
-textarea,button{{background:#111;color:#7cffb2;border:1px solid #2a2a2a;padding:8px;font:inherit}}
-button{{cursor:pointer}} pre{{background:#000;padding:12px;border:1px solid #2a2a2a;white-space:pre-wrap}}</style>
-</head><body><h1>{name}</h1>
-<textarea id=i rows=4 cols=80 placeholder="describe code to generate"></textarea><br>
-<button onclick=go()>generate</button><pre id=o></pre>
-<script>
-async function go() {{
-  const r = await fetch('/api/generate',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{input:document.getElementById('i').value}})}});
-  document.getElementById('o').textContent = (await r.json()).code;
-}}
-</script></body></html>"""
-    return {
-        "name": name,
-        "tagline": "fallback code-builder",
-        "philosophy": "Minimal placeholder generated when the upstream LLM was unreachable.",
-        "input_style": "natural-language",
-        "output_style": "single-file",
-        "files": [
-            {"path": "backend/server.py", "content": server_py},
-            {"path": "backend/requirements.txt", "content": "fastapi\nuvicorn[standard]\npydantic\nopenai\npython-dotenv\n"},
-            {"path": "frontend/index.html", "content": html},
-            {"path": "run.sh", "content": "#!/usr/bin/env bash\nset -e\ncd \"$(dirname \"$0\")\"\npython3 -m venv .venv 2>/dev/null || true\nsource .venv/bin/activate\npip install -q -r backend/requirements.txt\ncd backend\nexec uvicorn server:app --host 0.0.0.0 --port 8000\n"},
-            {"path": "README.md", "content": f"# {name}\n\nFallback gen (no LLM available at evolve-time).\n\n## Run\n```bash\nbash run.sh\n```\n"},
-        ],
+    rng = _rand.Random(n * 37 + len(history))
+    palettes = [
+        ("#7cffb2", "#ff79c6"), ("#39ffea", "#ffea00"),
+        ("#ff8c66", "#bbf7d0"), ("#c084fc", "#fde047"),
+        ("#f472b6", "#67e8f9"),
+    ]
+    a1, a2 = rng.choice(palettes)
+    mutation = {
+        "name": f"AutoGen{n}",
+        "tagline": "a deterministically mutated replica",
+        "philosophy": "Auto-mutated descendant produced when the upstream LLM was unreachable.",
+        "improvement_note": "shifted accent palette and rebalanced scoring weights deterministically",
+        "accent_hex": a1,
+        "accent2_hex": a2,
+        "weights": {
+            "helpfulness": round(0.35 + rng.uniform(-0.05, 0.05), 2),
+            "correctness": round(0.30 + rng.uniform(-0.05, 0.05), 2),
+            "coherence":   round(0.20 + rng.uniform(-0.05, 0.05), 2),
+            "complexity":  round(0.10 + rng.uniform(-0.03, 0.05), 2),
+            "verbosity":  round(-0.05 + rng.uniform(-0.03, 0.03), 2),
+        },
     }
+    mutation["files"] = seed_template.render(mutation)
+    return mutation

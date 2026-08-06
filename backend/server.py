@@ -19,7 +19,7 @@ from typing import List, Optional
 
 from dotenv import load_dotenv
 from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.cors import CORSMiddleware
@@ -58,13 +58,15 @@ class GenFile(BaseModel):
 
 
 class Generation(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="allow")
     gen: int
     name: str = ""
     tagline: str = ""
     philosophy: str = ""
-    input_style: str = ""
-    output_style: str = ""
+    improvement_note: str = ""
+    accent_hex: str = ""
+    accent2_hex: str = ""
+    weights: dict = Field(default_factory=dict)
     files: list[GenFile] = Field(default_factory=list)
     critic_notes: str = ""
     reward: Reward = Field(default_factory=Reward)
@@ -314,8 +316,8 @@ async def download_chain(chain_id: str):
     if doc.get("status") != "complete":
         raise HTTPException(409, f"chain status is {doc.get('status')} — not ready to download")
     buf, fname = _build_zip(doc)
-    return StreamingResponse(
-        buf,
+    return Response(
+        content=buf.getvalue(),
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{fname}"'},
     )
@@ -327,8 +329,8 @@ async def download_gen(chain_id: str, gen: int):
     if not doc:
         raise HTTPException(404, "chain not found")
     buf, fname = _build_zip(doc, single_gen=gen)
-    return StreamingResponse(
-        buf,
+    return Response(
+        content=buf.getvalue(),
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{fname}"'},
     )
