@@ -125,29 +125,36 @@ def _extract_json(raw: str) -> dict:
 # ---------------------------------------------------------------------------
 # Generator prompt
 # ---------------------------------------------------------------------------
-SYSTEM_PROMPT = """You are RECURSIVE.BBS, an evolution engine. Each generation you design is a COMPLETE working replica of RECURSIVE.BBS — a real no-code code-builder application — with a distinct MUTATION vector applied.
+SYSTEM_PLANNER = """You are the PLANNER. Given the chain history, write a tight PLAN describing what the NEXT gen should improve over its parents. Focus on WHAT changes and WHY, not HOW.
 
-The next gen you design will be turned into a full FastAPI + single-page-HTML folder (~350 lines of working code) via a canonical template. You do NOT write the code — you specify the mutation.
-
-Output STRICT JSON ONLY. No prose. No fences. No trailing commas. Be creative but realistic:
+Output STRICT JSON only:
 {
-  "name": "PascalCase, 1-2 words, distinct from every prior gen",
-  "tagline": "one short line describing this gen's personality",
-  "philosophy": "2 sentences. What this gen improves over its parent.",
-  "improvement_note": "the concrete mutation applied — e.g. 'tighter scoring rubric that penalizes verbosity harder', 'inverted accent palette', 'added second critic pass for security', 'shifted weights toward correctness'",
-  "accent_hex": "#rrggbb (primary phosphor color for the terminal UI)",
-  "accent2_hex": "#rrggbb (secondary neon accent)",
-  "weights": {
-    "helpfulness": 0.30 to 0.45,
-    "correctness": 0.25 to 0.40,
-    "coherence":   0.15 to 0.25,
-    "complexity":  0.05 to 0.15,
-    "verbosity":  -0.10 to 0.00
-  }
+  "intent": "one sentence — what capability shift this gen embodies",
+  "capability_focus": "which axis (visual identity | scoring rigor | philosophy | UX interaction | provider handling)",
+  "constraints": "what must be preserved from parents"
 }
-
-Weights should sum roughly to ~0.95 (verbosity is negative). Every gen MUST look and score meaningfully different from its ancestors.
 """
+
+SYSTEM_ARCHITECT = """You are the ARCHITECT. Given the PLAN and chain history, output a concrete mutation SPEC. This spec is fed to a template renderer that writes real code.
+
+Output STRICT JSON only:
+{
+  "name": "PascalCase, 1-2 words",
+  "tagline": "one short line",
+  "philosophy": "2 sentences",
+  "improvement_note": "the concrete mutation applied",
+  "accent_hex": "#rrggbb",
+  "accent2_hex": "#rrggbb",
+  "weights": {"helpfulness": 0.30-0.45, "correctness": 0.25-0.40, "coherence": 0.15-0.25, "complexity": 0.05-0.15, "verbosity": -0.10-0.00}
+}
+"""
+
+SYSTEM_REVIEWER = """You are the REVIEWER. Identify 2-3 concrete weaknesses in the mutation spec (imbalanced weights, unclear improvement, palette clash, weak philosophy). One paragraph, no markdown, no preamble, under 100 words."""
+
+SYSTEM_CORRECTOR = """You are the CORRECTOR. Given a spec and the reviewer's notes, output the SAME spec JSON with fixes applied. Preserve fields the reviewer didn't flag. Output STRICT JSON only, same schema as the input spec."""
+
+# Legacy prompt retained for backwards-compat callers (unused after refactor).
+SYSTEM_PROMPT = SYSTEM_ARCHITECT
 
 
 def _chain_brief(history: list[dict]) -> str:
@@ -168,34 +175,90 @@ def _chain_brief(history: list[dict]) -> str:
     return "\n".join(lines)
 
 
-async def generate_gen(
-    history: list[dict], gen_number: int, assignment: Optional[dict] = None
-) -> Optional[dict]:
-    """Ask the assigned generator model to design the next gen's MUTATION."""
+async def _call_role(role: str, messages: list[dict], assignment: Optional[dict], **kwargs) -> Optional[str]:
+    """Route a role call through its assigned provider/model with fallback."""
+    a = assignment or _providers.DEFAULT_ASSIGNMENTS[role]
+    fb = _providers.DEFAULT_ASSIGNMENTS.get(f"{role}_fallback", {"provider": "nvidia", "model": "z-ai/glm-5.1"})
+    return await _chat(
+        a["model"], messages, provider=a["provider"],
+        fallback=(fb["provider"], fb["model"]), **kwargs,
+    )
+
+
+async def plan_step(history: list[dict], assignment: Optional[dict] = None) -> dict:
+    raw = await _call_role(
+        "planner",
+        [{"role": "system", "content": SYSTEM_PLANNER},
+         {"role": "user", "content": f"Chain so far:\n{_chain_brief(history)}\n\nWrite the PLAN as strict JSON."}],
+        assignment, temperature=0.7, max_tokens=400,
+    )
+    return _extract_json(raw or "") or {"intent": "diverge in visual identity", "capability_focus": "visual identity", "constraints": "same core template"}
+
+
+async def architect_step(plan: dict, history: list[dict], gen_number: int, assignment: Optional[dict] = None) -> Optional[dict]:
     user_msg = (
         f"Chain so far:\n{_chain_brief(history)}\n\n"
-        f"Now design Gen {gen_number}. Its mutation MUST differ meaningfully from every prior "
-        f"gen (different accent colors, different scoring emphasis, different improvement note). "
-        f"Output strict JSON per the schema."
+        f"PLAN:\n{json.dumps(plan, indent=2)}\n\n"
+        f"Now output the mutation spec for Gen {gen_number}. Its accent_hex, weights and improvement_note "
+        f"MUST differ meaningfully from every prior gen. Strict JSON."
     )
-    a = assignment or _providers.DEFAULT_ASSIGNMENTS["generator"]
-    fb = _providers.DEFAULT_ASSIGNMENTS["generator_fallback"]
-    raw = await _chat(
-        a["model"],
-        [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_msg}],
-        provider=a["provider"],
-        fallback=(fb["provider"], fb["model"]),
-        temperature=0.9,
-        max_tokens=700,
+    raw = await _call_role(
+        "architect",
+        [{"role": "system", "content": SYSTEM_ARCHITECT}, {"role": "user", "content": user_msg}],
+        assignment, temperature=0.9, max_tokens=700,
     )
-    if not raw:
+    parsed = _extract_json(raw or "") if raw else {}
+    return parsed if parsed.get("name") else None
+
+
+async def review_step(spec: dict, assignment: Optional[dict] = None) -> Optional[str]:
+    raw = await _call_role(
+        "reviewer",
+        [{"role": "system", "content": SYSTEM_REVIEWER},
+         {"role": "user", "content": json.dumps({k: spec.get(k) for k in ("name","philosophy","improvement_note","accent_hex","accent2_hex","weights")}, indent=2)}],
+        assignment, temperature=0.5, max_tokens=1200,
+    )
+    return raw.strip() if raw else None
+
+
+async def correct_step(spec: dict, review: str, assignment: Optional[dict] = None) -> dict:
+    if not review or "no issue" in (review or "").lower():
+        return spec
+    raw = await _call_role(
+        "corrector",
+        [{"role": "system", "content": SYSTEM_CORRECTOR},
+         {"role": "user", "content": f"Spec:\n{json.dumps(spec, indent=2)}\n\nReviewer notes:\n{review}\n\nOutput the corrected spec as strict JSON."}],
+        assignment, temperature=0.4, max_tokens=800,
+    )
+    fixed = _extract_json(raw or "") if raw else {}
+    # merge: keep original fields, override with corrections
+    if fixed and fixed.get("name"):
+        return {**spec, **fixed}
+    return spec
+
+
+async def rate_step(spec: dict, assignment: Optional[dict] = None) -> Optional[dict]:
+    rubric = (
+        "Score on 5 dims (each 0.0-4.0). Output ONLY: "
+        '{"helpfulness":0.0,"correctness":0.0,"coherence":0.0,"complexity":0.0,"verbosity":0.0}'
+    )
+    raw = await _call_role(
+        "rater",
+        [{"role": "system", "content": rubric},
+         {"role": "user", "content": _gen_brief(spec, max_lines=20)}],
+        assignment, temperature=0.1, max_tokens=3500,
+    )
+    data = _extract_json(raw or "") if raw else {}
+    if not data:
         return None
-    parsed = _extract_json(raw)
-    if not parsed.get("name"):
-        logger.warning("gen %s: no name in parsed output. raw head: %r", gen_number, raw[:200])
-        return None
-    parsed["files"] = seed_template.render(parsed)
-    return parsed
+    keys = ("helpfulness", "correctness", "coherence", "complexity", "verbosity")
+    return {k: float(data.get(k, 0.0)) for k in keys}
+
+
+# Legacy aliases (kept for any external caller)
+generate_gen = architect_step  # signature differs; kept only for import safety
+critique_gen = review_step
+score_gen = rate_step
 
 
 # ---------------------------------------------------------------------------
@@ -217,56 +280,12 @@ def _gen_brief(gen: dict, max_files: int = 3, max_lines: int = 25) -> str:
     return "\n".join(lines)
 
 
-async def critique_gen(gen: dict, assignment: Optional[dict] = None) -> Optional[str]:
-    a = assignment or _providers.DEFAULT_ASSIGNMENTS["critic"]
-    fb = _providers.DEFAULT_ASSIGNMENTS["critic_fallback"]
-    raw = await _chat(
-        a["model"],
-        [
-            {
-                "role": "system",
-                "content": (
-                    "You are a code reviewer. Identify 2-3 concrete weaknesses in this "
-                    "generated code-builder app (missing endpoints, schema gaps, runtime "
-                    "bugs, UX issues, weak prompt-handling). One paragraph, no markdown, "
-                    "no preamble, under 100 words."
-                ),
-            },
-            {"role": "user", "content": _gen_brief(gen)},
-        ],
-        provider=a["provider"],
-        fallback=(fb["provider"], fb["model"]),
-        temperature=0.5,
-        max_tokens=1200,
-    )
-    return raw.strip() if raw else None
+async def critique_gen_deprecated(gen: dict, assignment: Optional[dict] = None) -> Optional[str]:
+    return await review_step(gen, assignment=assignment)
 
 
-async def score_gen(gen: dict, assignment: Optional[dict] = None) -> Optional[dict]:
-    a = assignment or _providers.DEFAULT_ASSIGNMENTS["rater"]
-    fb = _providers.DEFAULT_ASSIGNMENTS["rater_fallback"]
-    rubric = (
-        "Score the generated code-builder app on 5 dimensions, each 0.0-4.0. Output ONLY this "
-        'JSON: {"helpfulness":0.0,"correctness":0.0,"coherence":0.0,"complexity":0.0,"verbosity":0.0}'
-    )
-    raw = await _chat(
-        a["model"],
-        [
-            {"role": "system", "content": rubric},
-            {"role": "user", "content": _gen_brief(gen, max_lines=20)},
-        ],
-        provider=a["provider"],
-        fallback=(fb["provider"], fb["model"]),
-        temperature=0.1,
-        max_tokens=3500,
-    )
-    if not raw:
-        return None
-    data = _extract_json(raw)
-    if not data:
-        return None
-    keys = ("helpfulness", "correctness", "coherence", "complexity", "verbosity")
-    return {k: float(data.get(k, 0.0)) for k in keys}
+async def score_gen_deprecated(gen: dict, assignment: Optional[dict] = None) -> Optional[dict]:
+    return await rate_step(gen, assignment=assignment)
 
 
 def composite(scores: dict) -> float:
@@ -286,49 +305,69 @@ def composite(scores: dict) -> float:
 async def evolve_chain_with_callback(
     chain_id: str, depth: int, on_gen, on_done, assignments: Optional[dict] = None
 ) -> dict:
-    """Run the evolution loop and call `on_gen(gen_dict)` after each generation completes,
-    and `on_done(chain_dict)` when finished. `assignments` is a dict:
-        {"generator": {"provider":"...","model":"..."},
-         "critic":    {"provider":"...","model":"..."},
-         "rater":     {"provider":"...","model":"..."}}
-    Missing keys fall back to DEFAULT_ASSIGNMENTS.
+    """Six-stage pipeline per generation:
+       planner → architect → builder(deterministic) → reviewer → corrector → rater.
+    Each stage's model is picked from `assignments`, falling back to DEFAULT_ASSIGNMENTS.
     """
     depth = max(1, min(5, int(depth)))
     a = dict(_providers.DEFAULT_ASSIGNMENTS)
-    for role in ("generator", "critic", "rater"):
+    for role in ("planner", "architect", "builder", "reviewer", "corrector", "rater"):
         if assignments and assignments.get(role):
             a[role] = assignments[role]
+
     history: list[dict] = []
     generations: list[dict] = []
     fallback_used = False
 
     for i in range(depth):
         gen_number = i + 2
-        gen = await generate_gen(history, gen_number, assignment=a["generator"])
-        if not gen:
+        stages: dict = {}
+
+        # 1) planner
+        plan = await plan_step(history, assignment=a["planner"])
+        stages["plan"] = plan
+
+        # 2) architect
+        spec = await architect_step(plan, history, gen_number, assignment=a["architect"])
+        if not spec:
             fallback_used = True
-            gen = _fallback_gen(gen_number, history)
-        gen["gen"] = gen_number
-        critic, scores = await asyncio.gather(
-            critique_gen(gen, assignment=a["critic"]),
-            score_gen(gen, assignment=a["rater"]),
-            return_exceptions=False,
-        )
-        gen["critic_notes"] = critic or "(critic unavailable for this generation)"
-        gen["reward"] = scores or {
-            "helpfulness": 0.0, "correctness": 0.0, "coherence": 0.0,
-            "complexity": 0.0, "verbosity": 0.0,
+            spec = _fallback_gen(gen_number, history)
+        stages["architect_spec"] = {k: spec.get(k) for k in spec if k != "files"}
+
+        # 3) reviewer
+        review = await review_step(spec, assignment=a["reviewer"])
+        stages["review"] = review or ""
+
+        # 4) corrector (skipped if review is empty/positive)
+        if review:
+            spec = await correct_step(spec, review, assignment=a["corrector"])
+            stages["corrected_spec"] = {k: spec.get(k) for k in spec if k != "files"}
+
+        # 5) builder — deterministic template render (uses builder model choice for metadata only)
+        spec["files"] = seed_template.render(spec)
+        stages["builder"] = {
+            "role_model": a["builder"],
+            "files": [{"path": f["path"], "lines": len(f["content"].splitlines())}
+                      for f in spec["files"]],
         }
-        gen["composite_score"] = composite(gen["reward"])
-        generations.append(gen)
+
+        # 6) rater
+        scores = await rate_step(spec, assignment=a["rater"])
+        spec["reward"] = scores or {"helpfulness": 0.0, "correctness": 0.0,
+                                    "coherence": 0.0, "complexity": 0.0, "verbosity": 0.0}
+        spec["composite_score"] = composite(spec["reward"])
+        spec["gen"] = gen_number
+        spec["critic_notes"] = review or "(reviewer unavailable)"
+        spec["pipeline"] = stages
+        spec["assignments"] = {k: a[k] for k in ("planner","architect","builder","reviewer","corrector","rater")}
+
+        generations.append(spec)
         history.append({
-            "gen": gen_number,
-            "name": gen.get("name"),
-            "improvement_note": gen.get("improvement_note", ""),
-            "accent_hex": gen.get("accent_hex"),
-            "accent2_hex": gen.get("accent2_hex"),
+            "gen": gen_number, "name": spec.get("name"),
+            "improvement_note": spec.get("improvement_note", ""),
+            "accent_hex": spec.get("accent_hex"), "accent2_hex": spec.get("accent2_hex"),
         })
-        await on_gen(chain_id, gen, fallback_used)
+        await on_gen(chain_id, spec, fallback_used)
 
     final = {
         "id": chain_id, "depth": depth, "fallback_used": fallback_used,
@@ -337,58 +376,6 @@ async def evolve_chain_with_callback(
     }
     await on_done(chain_id, final)
     return final
-
-
-async def evolve_chain(depth: int = 3) -> dict:
-    """Generate a chain of N code-builders (gen 2 through gen N+1). Returns full chain doc."""
-    depth = max(1, min(5, int(depth)))
-    chain_id = str(uuid.uuid4())
-    history: list[dict] = []
-    generations: list[dict] = []
-    fallback_used = False
-
-    for i in range(depth):
-        gen_number = i + 2  # Gen 1 is RECURSIVE.BBS itself
-        gen = await generate_gen(history, gen_number)
-        if not gen:
-            # fallback: minimal deterministic stub so the chain still produces something
-            fallback_used = True
-            gen = _fallback_gen(gen_number, history)
-
-        gen["gen"] = gen_number
-        # critic + rater in parallel
-        critic, scores = await asyncio.gather(
-            critique_gen(gen),
-            score_gen(gen),
-            return_exceptions=False,
-        )
-        gen["critic_notes"] = critic or "(critic unavailable for this generation)"
-        gen["reward"] = scores or {
-            "helpfulness": 0.0,
-            "correctness": 0.0,
-            "coherence": 0.0,
-            "complexity": 0.0,
-            "verbosity": 0.0,
-        }
-        gen["composite_score"] = composite(gen["reward"])
-        generations.append(gen)
-        history.append(
-            {
-                "gen": gen_number,
-                "name": gen.get("name"),
-                "improvement_note": gen.get("improvement_note", ""),
-                "accent_hex": gen.get("accent_hex"),
-                "accent2_hex": gen.get("accent2_hex"),
-            }
-        )
-
-    return {
-        "id": chain_id,
-        "depth": depth,
-        "fallback_used": fallback_used,
-        "generations": generations,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
 
 
 # ---------------------------------------------------------------------------

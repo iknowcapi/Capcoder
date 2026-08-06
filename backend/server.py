@@ -231,19 +231,21 @@ async def catalog(refresh: bool = False):
 
 
 class SettingsPayload(BaseModel):
-    generator: Optional[dict] = None
-    critic: Optional[dict] = None
+    planner: Optional[dict] = None
+    architect: Optional[dict] = None
+    builder: Optional[dict] = None
+    reviewer: Optional[dict] = None
+    corrector: Optional[dict] = None
     rater: Optional[dict] = None
 
 
 @api.get("/settings")
 async def get_settings(session_id: str):
     doc = await db.settings.find_one({"session_id": session_id}, {"_id": 0}) or {}
+    roles = ("planner", "architect", "builder", "reviewer", "corrector", "rater")
     return {
         "session_id": session_id,
-        "generator": doc.get("generator") or _providers.DEFAULT_ASSIGNMENTS["generator"],
-        "critic": doc.get("critic") or _providers.DEFAULT_ASSIGNMENTS["critic"],
-        "rater": doc.get("rater") or _providers.DEFAULT_ASSIGNMENTS["rater"],
+        **{r: doc.get(r) or _providers.DEFAULT_ASSIGNMENTS[r] for r in roles},
     }
 
 
@@ -270,7 +272,8 @@ async def evolve(req: EvolveRequest, background_tasks: BackgroundTasks):
     if req.session_id:
         s = await db.settings.find_one({"session_id": req.session_id}, {"_id": 0})
         if s:
-            assignments = {k: s[k] for k in ("generator", "critic", "rater") if s.get(k)}
+            roles = ("planner", "architect", "builder", "reviewer", "corrector", "rater")
+            assignments = {r: s[r] for r in roles if s.get(r)}
 
     import uuid as _uuid
 

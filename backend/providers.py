@@ -260,13 +260,19 @@ async def get_catalog(force: bool = False) -> list[dict]:
 
 
 DEFAULT_ASSIGNMENTS = {
-    # Free OpenRouter coding defaults (user can override via /api/settings).
-    "generator": {"provider": "openrouter", "model": "nvidia/nemotron-3-super-120b-a12b:free"},
-    "critic":    {"provider": "openrouter", "model": "google/gemma-4-31b-it:free"},
+    # Six-stage dev-team pipeline. Each role has its own model choice.
+    "planner":   {"provider": "openrouter", "model": "nvidia/nemotron-3-super-120b-a12b:free"},
+    "architect": {"provider": "openrouter", "model": "nvidia/nemotron-3-super-120b-a12b:free"},
+    "builder":   {"provider": "openrouter", "model": "poolside/laguna-s-2.1:free"},
+    "reviewer":  {"provider": "openrouter", "model": "google/gemma-4-31b-it:free"},
+    "corrector": {"provider": "openrouter", "model": "poolside/laguna-s-2.1:free"},
     "rater":     {"provider": "openrouter", "model": "inclusionai/ling-3.0-flash:free"},
-    # NIM fallback used if OpenRouter unreachable or the picked model errors:
-    "generator_fallback": {"provider": "nvidia", "model": "z-ai/glm-5.1"},
-    "critic_fallback":    {"provider": "nvidia", "model": "minimaxai/minimax-m2.7"},
+    # NIM fallbacks used automatically if the primary provider errors.
+    "planner_fallback":   {"provider": "nvidia", "model": "z-ai/glm-5.1"},
+    "architect_fallback": {"provider": "nvidia", "model": "z-ai/glm-5.1"},
+    "builder_fallback":   {"provider": "nvidia", "model": "z-ai/glm-5.1"},
+    "reviewer_fallback":  {"provider": "nvidia", "model": "minimaxai/minimax-m2.7"},
+    "corrector_fallback": {"provider": "nvidia", "model": "z-ai/glm-5.1"},
     "rater_fallback":     {"provider": "nvidia", "model": "nvidia/llama-3.3-nemotron-super-49b-v1.5"},
 }
 

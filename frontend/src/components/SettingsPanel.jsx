@@ -4,9 +4,12 @@ import { API } from "@/lib/api";
 import { Search, Save, RefreshCw, X, Zap, DollarSign } from "lucide-react";
 
 const ROLES = [
-  { key: "generator", label: "GENERATOR", desc: "designs each gen's mutation" },
-  { key: "critic", label: "CRITIC", desc: "reviews the generated code" },
-  { key: "rater", label: "RATER", desc: "scores on 5 dimensions" },
+  { key: "planner",   label: "PLANNER",   desc: "decides what the next gen should improve" },
+  { key: "architect", label: "ARCHITECT", desc: "translates the plan into a concrete spec" },
+  { key: "builder",   label: "BUILDER",   desc: "renders the spec into working code" },
+  { key: "reviewer",  label: "REVIEWER",  desc: "flags weaknesses in the spec" },
+  { key: "corrector", label: "CORRECTOR", desc: "applies fixes from the reviewer" },
+  { key: "rater",     label: "RATER",     desc: "scores the result on 5 dimensions" },
 ];
 
 const PriceBadge = ({ tier }) => {
@@ -28,7 +31,7 @@ export const SettingsPanel = ({ sessionId, open, onClose, onSaved }) => {
   const [catalog, setCatalog] = useState([]);
   const [defaults, setDefaults] = useState(null);
   const [settings, setSettings] = useState({});
-  const [activeRole, setActiveRole] = useState("generator");
+  const [activeRole, setActiveRole] = useState("planner");
   const [query, setQuery] = useState("");
   const [providerFilter, setProviderFilter] = useState("all");
   const [uncensoredOnly, setUncensoredOnly] = useState(false);
@@ -46,8 +49,11 @@ export const SettingsPanel = ({ sessionId, open, onClose, onSaved }) => {
       setCatalog(cat.models || []);
       setDefaults(cat.defaults || {});
       setSettings({
-        generator: s.generator,
-        critic: s.critic,
+        planner: s.planner,
+        architect: s.architect,
+        builder: s.builder,
+        reviewer: s.reviewer,
+        corrector: s.corrector,
         rater: s.rater,
       });
     } finally {
@@ -123,7 +129,7 @@ export const SettingsPanel = ({ sessionId, open, onClose, onSaved }) => {
         </div>
 
         {/* role tabs */}
-        <div className="flex border-b border-phosphor/30">
+        <div className="flex border-b border-phosphor/30 overflow-x-auto">
           {ROLES.map((r) => {
             const current = settings[r.key] || {};
             const isDefault =
@@ -134,7 +140,7 @@ export const SettingsPanel = ({ sessionId, open, onClose, onSaved }) => {
                 key={r.key}
                 data-testid={`role-tab-${r.key}`}
                 onClick={() => setActiveRole(r.key)}
-                className={`flex-1 text-left px-4 py-3 border-r border-phosphor/20 last:border-r-0 transition-colors ${
+                className={`min-w-[170px] text-left px-3 py-3 border-r border-phosphor/20 last:border-r-0 transition-colors ${
                   activeRole === r.key
                     ? "bg-phosphor/10 text-phosphor neon-text"
                     : "text-phosphor2 hover:bg-phosphor/5"
@@ -278,8 +284,11 @@ export const SettingsPanel = ({ sessionId, open, onClose, onSaved }) => {
               data-testid="settings-reset"
               onClick={() =>
                 setSettings({
-                  generator: defaults?.generator,
-                  critic: defaults?.critic,
+                  planner: defaults?.planner,
+                  architect: defaults?.architect,
+                  builder: defaults?.builder,
+                  reviewer: defaults?.reviewer,
+                  corrector: defaults?.corrector,
                   rater: defaults?.rater,
                 })
               }
