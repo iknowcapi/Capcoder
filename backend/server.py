@@ -388,6 +388,49 @@ async def download_gen(chain_id: str, gen: int):
     )
 
 
+@api.post("/chains/{chain_id}/workspace/{gen}")
+async def open_in_vscode(chain_id: str, gen: int):
+    """Materialize a generation's files to /workspaces so the local code-server
+    (Emergent's built-in VSCode-in-browser) can open the folder."""
+    doc = await db.chains.find_one({"id": chain_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "chain not found")
+    gens = doc.get("generations", [])
+    g = next((x for x in gens if x.get("gen") == gen), None)
+    if not g:
+        raise HTTPException(404, f"gen {gen} not in chain")
+
+    import re as _re
+    import pathlib
+
+    slug = _re.sub(r"[^A-Za-z0-9]+", "-", g.get("name") or f"gen-{gen}").strip("-") or f"gen-{gen}"
+    workspace_dir = pathlib.Path(f"/workspaces/{chain_id[:8]}/{slug}")
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+
+    written = []
+    for f in g.get("files", []):
+        target = workspace_dir / f["path"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f["content"])
+        # make .sh executable
+        if target.suffix == ".sh":
+            target.chmod(0o755)
+        written.append(str(target.relative_to(workspace_dir)))
+
+    return {
+        "workspace_path": str(workspace_dir),
+        "folder_query": f"?folder={workspace_dir}",
+        "gen": gen,
+        "name": g.get("name"),
+        "files": written,
+        # Users can open this folder in code-server (Emergent's built-in VSCode).
+        # The exact code-server URL depends on the environment ingress; standard
+        # Emergent layouts expose it via a port-1111 subdomain or /vscode path.
+        "hint": "Open Emergent's code-server and use File > Open Folder → workspace_path, "
+                "or append folder_query to the code-server URL.",
+    }
+
+
 app.include_router(api)
 app.add_middleware(
     CORSMiddleware,

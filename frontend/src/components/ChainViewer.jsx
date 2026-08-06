@@ -1,6 +1,7 @@
 import React, { useState } from "react";
-import { Download, FileCode, Folder, GitBranch } from "lucide-react";
+import { Download, FileCode, Folder, GitBranch, ExternalLink } from "lucide-react";
 import { API } from "@/lib/api";
+import axios from "axios";
 
 const Bar = ({ label, value, max = 4, color = "phosphor" }) => {
   const pct = Math.max(0, Math.min(1, value / max));
@@ -53,6 +54,34 @@ const GenerationCard = ({ gen, chainId }) => {
         >
           <Download size={14} /> .ZIP
         </a>
+        <button
+          data-testid={`vscode-gen-${gen.gen}`}
+          onClick={async () => {
+            try {
+              const r = await axios.post(`${API}/chains/${chainId}/workspace/${gen.gen}`);
+              const q = r.data.folder_query;
+              // try common code-server URL patterns
+              const host = window.location.host;
+              const candidates = [
+                `https://${host.replace(/^([^.]+)\./, "$1-code.")}/${q}`,
+                `${window.location.protocol}//${host}:1111/${q}`,
+                `${window.location.protocol}//${host}/vscode/${q}`,
+              ];
+              window.open(candidates[0], "_blank", "noopener");
+              // eslint-disable-next-line no-alert
+              window.setTimeout(() => alert(
+                `Workspace ready at:\n${r.data.workspace_path}\n\nOpen Emergent's VSCode ` +
+                `and use File > Open Folder to load it, or paste one of these URLs:\n\n` +
+                candidates.join("\n")
+              ), 300);
+            } catch (e) {
+              console.error(e);
+            }
+          }}
+          className="flex items-center gap-2 border border-neon_cyan/60 text-neon_cyan px-3 py-2 hover:bg-neon_cyan hover:text-black transition-colors label-xs whitespace-nowrap"
+        >
+          <ExternalLink size={14} /> VSCODE
+        </button>
       </header>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[11px] font-mono">
