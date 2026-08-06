@@ -39,9 +39,10 @@ PROVIDERS = {
         "models_url": "https://integrate.api.nvidia.com/v1/models",
         # NVIDIA doesn't expose pricing on /models; pin the known-good models we support.
         "static_models": [
-            {"id": "z-ai/glm-5.1", "coding": True, "uncensored": False, "roles": ["gen"]},
-            {"id": "minimaxai/minimax-m2.7", "coding": True, "uncensored": False, "roles": ["critic"]},
+            {"id": "z-ai/glm-5.2", "coding": True, "uncensored": False, "roles": ["teacher"]},
+            {"id": "minimaxai/minimax-m3", "coding": True, "uncensored": False, "roles": ["artist"]},
             {"id": "nvidia/llama-3.3-nemotron-super-49b-v1.5", "coding": False, "uncensored": False, "roles": ["rater"]},
+            {"id": "deepseek-ai/deepseek-v4-pro", "coding": True, "uncensored": False, "roles": ["teacher", "artist"]},
         ],
     },
     "openrouter": {
@@ -260,21 +261,14 @@ async def get_catalog(force: bool = False) -> list[dict]:
 
 
 DEFAULT_ASSIGNMENTS = {
-    # Six-stage dev-team pipeline. Each role has its own model choice.
-    "planner":   {"provider": "openrouter", "model": "nvidia/nemotron-3-super-120b-a12b:free"},
-    "architect": {"provider": "openrouter", "model": "nvidia/nemotron-3-super-120b-a12b:free"},
-    "builder":   {"provider": "openrouter", "model": "poolside/laguna-s-2.1:free"},
-    "executor":  {"provider": "local",      "model": "bash run.sh (subprocess, 30s timeout)"},
-    "reviewer":  {"provider": "openrouter", "model": "google/gemma-4-31b-it:free"},
-    "corrector": {"provider": "openrouter", "model": "poolside/laguna-s-2.1:free"},
-    "rater":     {"provider": "openrouter", "model": "inclusionai/ling-3.0-flash:free"},
+    # CapCode strict topology: Human -> Teacher -> Artist -> Product -> Rater.
+    "teacher": {"provider": "nvidia", "model": "z-ai/glm-5.2"},
+    "artist":  {"provider": "nvidia", "model": "z-ai/glm-5.2"},
+    "rater":   {"provider": "nvidia", "model": "nvidia/llama-3.3-nemotron-super-49b-v1.5"},
     # NIM fallbacks used automatically if the primary provider errors.
-    "planner_fallback":   {"provider": "nvidia", "model": "z-ai/glm-5.1"},
-    "architect_fallback": {"provider": "nvidia", "model": "z-ai/glm-5.1"},
-    "builder_fallback":   {"provider": "nvidia", "model": "z-ai/glm-5.1"},
-    "reviewer_fallback":  {"provider": "nvidia", "model": "minimaxai/minimax-m2.7"},
-    "corrector_fallback": {"provider": "nvidia", "model": "z-ai/glm-5.1"},
-    "rater_fallback":     {"provider": "nvidia", "model": "nvidia/llama-3.3-nemotron-super-49b-v1.5"},
+    "teacher_fallback": {"provider": "nvidia", "model": "z-ai/glm-5.2"},
+    "artist_fallback":  {"provider": "nvidia", "model": "z-ai/glm-5.2"},
+    "rater_fallback":   {"provider": "nvidia", "model": "nvidia/llama-3.3-nemotron-super-49b-v1.5"},
 }
 
 

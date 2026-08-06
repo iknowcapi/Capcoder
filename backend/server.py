@@ -77,17 +77,20 @@ class Generation(BaseModel):
 class Chain(BaseModel):
     model_config = ConfigDict(extra="ignore")
     id: str
-    depth: int
+    target_prompt: str = ""
+    depth: int = 1
     status: str = "running"  # running | complete | failed
     fallback_used: bool = False
+    verified: bool = False
     generations: list[Generation] = Field(default_factory=list)
     created_at: datetime
     completed_at: Optional[datetime] = None
 
 
 class EvolveRequest(BaseModel):
-    depth: int = 3
-    session_id: Optional[str] = None  # if set, uses saved settings; otherwise defaults
+    target_prompt: str
+    depth: int = 1
+    session_id: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +116,8 @@ def _build_zip(chain_doc: dict, single_gen: Optional[int] = None) -> tuple[io.By
             for f in gen.get("files", []):
                 zf.writestr(f"{folder}/{f['path']}", f["content"])
             zf.writestr(f"{folder}/.recursive-bbs.json", json.dumps(_gen_manifest(gen), indent=2))
+            zf.writestr(f"{folder}/TEACHER_SPEC.md", _teacher_md(chain_doc, gen))
+            zf.writestr(f"{folder}/ARTIST_NOTES.md", _artist_md(gen))
             return buf, f"{folder}.zip"
 
         # whole chain
@@ -124,6 +129,8 @@ def _build_zip(chain_doc: dict, single_gen: Optional[int] = None) -> tuple[io.By
                 f"{chain_slug}/{sub}/.recursive-bbs.json",
                 json.dumps(_gen_manifest(g), indent=2),
             )
+            zf.writestr(f"{chain_slug}/{sub}/TEACHER_SPEC.md", _teacher_md(chain_doc, g))
+            zf.writestr(f"{chain_slug}/{sub}/ARTIST_NOTES.md", _artist_md(g))
         # top-level chain manifest
         zf.writestr(f"{chain_slug}/CHAIN.md", _chain_markdown(chain_doc))
         zf.writestr(
@@ -148,12 +155,46 @@ def _gen_manifest(g: dict) -> dict:
         "name": g.get("name"),
         "tagline": g.get("tagline"),
         "philosophy": g.get("philosophy"),
-        "input_style": g.get("input_style"),
-        "output_style": g.get("output_style"),
+        "stack": g.get("stack"),
         "reward": g.get("reward"),
         "composite_score": g.get("composite_score"),
         "critic_notes": g.get("critic_notes"),
     }
+
+
+def _teacher_md(chain_doc: dict, g: dict) -> str:
+    t = g.get("teacher_spec") or {}
+    lines = [
+        f"# Teacher Spec — {t.get('name','TeacherSpec')}",
+        "",
+        f"**Human target:** {chain_doc.get('target_prompt','')}",
+        f"**Stack:** {t.get('stack','python-fastapi')}",
+        "",
+        "## Artist Brief",
+        t.get("artist_brief", ""),
+        "",
+        "## Must Have",
+        *[f"- {x}" for x in (t.get("must_have") or [])],
+        "",
+        "## Should Avoid",
+        *[f"- {x}" for x in (t.get("should_avoid") or [])],
+    ]
+    return "\n".join(lines)
+
+
+def _artist_md(g: dict) -> str:
+    a = g.get("artist_spec") or {}
+    return "\n".join([
+        f"# Artist Notes — {a.get('name', g.get('name',''))}",
+        "",
+        f"**Tagline:** {a.get('tagline','')}",
+        "",
+        "## Philosophy",
+        a.get("philosophy", ""),
+        "",
+        "## Improvement Note",
+        a.get("improvement_note", ""),
+    ])
 
 
 def _chain_markdown(chain_doc: dict) -> str:
@@ -231,18 +272,15 @@ async def catalog(refresh: bool = False):
 
 
 class SettingsPayload(BaseModel):
-    planner: Optional[dict] = None
-    architect: Optional[dict] = None
-    builder: Optional[dict] = None
-    reviewer: Optional[dict] = None
-    corrector: Optional[dict] = None
+    teacher: Optional[dict] = None
+    artist: Optional[dict] = None
     rater: Optional[dict] = None
 
 
 @api.get("/settings")
 async def get_settings(session_id: str):
     doc = await db.settings.find_one({"session_id": session_id}, {"_id": 0}) or {}
-    roles = ("planner", "architect", "builder", "reviewer", "corrector", "rater")
+    roles = ("teacher", "artist", "rater")
     return {
         "session_id": session_id,
         **{r: doc.get(r) or _providers.DEFAULT_ASSIGNMENTS[r] for r in roles},
@@ -262,27 +300,47 @@ async def save_settings(session_id: str, payload: SettingsPayload):
 
 @api.post("/evolve", response_model=Chain)
 async def evolve(req: EvolveRequest, background_tasks: BackgroundTasks):
-    """One button. Kicks off chain evolution as a background task; returns the
-    chain stub immediately. Poll GET /api/chains/{id} until status == 'complete'."""
+    """Human types a target. Teacher -> Artist -> Product -> Rater runs in background.
+    Returns the chain stub immediately; poll GET /api/chains/{id} until status == 'complete'."""
     if not chain_generator.ENABLED:
         raise HTTPException(503, "No provider API key configured — cannot evolve a chain.")
+
+    target = (req.target_prompt or "").strip()
+    if not target:
+        raise HTTPException(400, "target_prompt is required — tell CapCode what app to build.")
 
     # resolve assignments from saved settings (or defaults)
     assignments = None
     if req.session_id:
         s = await db.settings.find_one({"session_id": req.session_id}, {"_id": 0})
         if s:
-            roles = ("planner", "architect", "builder", "reviewer", "corrector", "rater")
+            roles = ("teacher", "artist", "rater")
             assignments = {r: s[r] for r in roles if s.get(r)}
 
-    import uuid as _uuid
+    # gather top-verified prior chains as exemplars for the Teacher
+    exemplar_docs = await db.chains.find(
+        {"verified": True},
+        {"_id": 0, "target_prompt": 1, "generations.name": 1, "generations.teacher_spec": 1},
+    ).sort("verified_at", -1).limit(3).to_list(3)
+    exemplars = []
+    for d in exemplar_docs:
+        g = (d.get("generations") or [{}])[0]
+        ts = g.get("teacher_spec") or {}
+        exemplars.append({
+            "target": d.get("target_prompt", ""),
+            "name": g.get("name", ""),
+            "artist_brief": ts.get("artist_brief", ""),
+        })
 
+    import uuid as _uuid
     chain_id = str(_uuid.uuid4())
     stub = {
         "id": chain_id,
-        "depth": req.depth,
+        "target_prompt": target,
+        "depth": 1,
         "status": "running",
         "fallback_used": False,
+        "verified": False,
         "generations": [],
         "created_at": datetime.now(timezone.utc).isoformat(),
         "completed_at": None,
@@ -308,7 +366,8 @@ async def evolve(req: EvolveRequest, background_tasks: BackgroundTasks):
     async def _runner():
         try:
             await chain_generator.evolve_chain_with_callback(
-                chain_id, req.depth, on_gen, on_done, assignments=assignments
+                chain_id, target, on_gen, on_done,
+                assignments=assignments, exemplars=exemplars,
             )
         except Exception as exc:
             logger.exception("chain %s failed: %s", chain_id, exc)
@@ -318,7 +377,6 @@ async def evolve(req: EvolveRequest, background_tasks: BackgroundTasks):
             )
 
     background_tasks.add_task(_runner)
-    # return the stub immediately
     stub_out = {**stub}
     stub_out["created_at"] = datetime.fromisoformat(stub_out["created_at"])
     return stub_out
@@ -429,6 +487,31 @@ async def open_in_vscode(chain_id: str, gen: int):
         "hint": "Open Emergent's code-server and use File > Open Folder → workspace_path, "
                 "or append folder_query to the code-server URL.",
     }
+
+
+@api.post("/chains/{chain_id}/verify")
+async def verify_chain(chain_id: str):
+    """Human marks a completed chain as 'works'. Boosts its composite_score so
+    it is more likely to be shown as a Teacher exemplar for future builds."""
+    doc = await db.chains.find_one({"id": chain_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "chain not found")
+    if doc.get("status") != "complete":
+        raise HTTPException(409, "chain not complete — cannot verify")
+    # boost each generation's composite_score by +0.5 (capped at 4.0)
+    new_gens = list(doc.get("generations") or [])
+    for g in new_gens:
+        cur = float(g.get("composite_score") or 0)
+        g["composite_score"] = round(min(4.0, cur + 0.5), 3)
+    await db.chains.update_one(
+        {"id": chain_id},
+        {"$set": {
+            "verified": True,
+            "verified_at": datetime.now(timezone.utc).isoformat(),
+            "generations": new_gens,
+        }},
+    )
+    return {"id": chain_id, "verified": True}
 
 
 app.include_router(api)

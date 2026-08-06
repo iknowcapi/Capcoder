@@ -4,12 +4,9 @@ import { API } from "@/lib/api";
 import { Search, Save, RefreshCw, X, Zap, DollarSign } from "lucide-react";
 
 const ROLES = [
-  { key: "planner",   label: "PLANNER",   desc: "decides what the next gen should improve" },
-  { key: "architect", label: "ARCHITECT", desc: "translates the plan into a concrete spec" },
-  { key: "builder",   label: "BUILDER",   desc: "renders the spec into working code" },
-  { key: "reviewer",  label: "REVIEWER",  desc: "flags weaknesses in the spec" },
-  { key: "corrector", label: "CORRECTOR", desc: "applies fixes from the reviewer" },
-  { key: "rater",     label: "RATER",     desc: "scores the result on 5 dimensions" },
+  { key: "teacher", label: "TEACHER", desc: "rigid, strict; writes the Artist's brief from your target" },
+  { key: "artist",  label: "ARTIST",  desc: "creative, novel; designs the actual product" },
+  { key: "rater",   label: "RATER",   desc: "scores the finished product on 5 dimensions" },
 ];
 
 const PriceBadge = ({ tier }) => {
@@ -31,7 +28,7 @@ export const SettingsPanel = ({ sessionId, open, onClose, onSaved }) => {
   const [catalog, setCatalog] = useState([]);
   const [defaults, setDefaults] = useState(null);
   const [settings, setSettings] = useState({});
-  const [activeRole, setActiveRole] = useState("planner");
+  const [activeRole, setActiveRole] = useState("teacher");
   const [query, setQuery] = useState("");
   const [providerFilter, setProviderFilter] = useState("all");
   const [uncensoredOnly, setUncensoredOnly] = useState(false);
@@ -49,11 +46,8 @@ export const SettingsPanel = ({ sessionId, open, onClose, onSaved }) => {
       setCatalog(cat.models || []);
       setDefaults(cat.defaults || {});
       setSettings({
-        planner: s.planner,
-        architect: s.architect,
-        builder: s.builder,
-        reviewer: s.reviewer,
-        corrector: s.corrector,
+        teacher: s.teacher,
+        artist: s.artist,
         rater: s.rater,
       });
     } finally {
@@ -284,11 +278,8 @@ export const SettingsPanel = ({ sessionId, open, onClose, onSaved }) => {
               data-testid="settings-reset"
               onClick={() =>
                 setSettings({
-                  planner: defaults?.planner,
-                  architect: defaults?.architect,
-                  builder: defaults?.builder,
-                  reviewer: defaults?.reviewer,
-                  corrector: defaults?.corrector,
+                  teacher: defaults?.teacher,
+                  artist: defaults?.artist,
                   rater: defaults?.rater,
                 })
               }

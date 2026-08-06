@@ -26,7 +26,6 @@ function App() {
   const [chains, setChains] = useState([]);
   const [chain, setChain] = useState(null);
   const [busy, setBusy] = useState(false);
-  const [depth, setDepth] = useState(3);
   const [stage, setStage] = useState(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [assignments, setAssignments] = useState(null);
@@ -43,12 +42,12 @@ function App() {
 
   useEffect(() => { refresh(); }, [refresh]);
 
-  const handleEvolve = async () => {
+  const handleEvolve = async (targetPrompt) => {
     setBusy(true);
     setStage("kicking off…");
     let pollId = null;
     try {
-      const stub = await api.evolve(depth, sessionId);
+      const stub = await api.evolve(targetPrompt, sessionId);
       setChain(stub);
       await new Promise((resolve, reject) => {
         pollId = setInterval(async () => {
@@ -56,17 +55,17 @@ function App() {
             const c = await api.getChain(stub.id);
             setChain(c);
             const done = c.generations?.length || 0;
-            setStage(`gen ${done}/${c.depth} …`);
+            setStage(done > 0 ? "rating…" : "teacher → artist…");
             if (c.status === "complete") { clearInterval(pollId); resolve(); }
-            else if (c.status === "failed") { clearInterval(pollId); reject(new Error("evolution failed")); }
+            else if (c.status === "failed") { clearInterval(pollId); reject(new Error("build failed")); }
           } catch (e) { clearInterval(pollId); reject(e); }
         }, 3000);
       });
-      toast.success(`CHAIN FORGED :: ${depth} GENS`);
+      toast.success("PRODUCT BUILT");
       refresh();
     } catch (e) {
       console.error(e);
-      const msg = e?.response?.data?.detail || e?.message || "evolution failed";
+      const msg = e?.response?.data?.detail || e?.message || "build failed";
       toast.error(msg);
     } finally {
       if (pollId) clearInterval(pollId);
@@ -77,6 +76,18 @@ function App() {
 
   const openChain = async (id) => {
     try { const c = await api.getChain(id); setChain(c); } catch (e) { console.error(e); }
+  };
+
+  const handleVerify = async (id) => {
+    try {
+      await api.verifyChain(id);
+      toast.success("VERIFIED :: ADDED TO TEACHER EXEMPLARS");
+      const c = await api.getChain(id);
+      setChain(c);
+      refresh();
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "verify failed");
+    }
   };
 
   return (
@@ -105,11 +116,11 @@ function App() {
         </div>
 
         <EvolveButton
-          onEvolve={handleEvolve} busy={busy} depth={depth}
-          setDepth={setDepth} currentStage={stage} assignments={assignments}
+          onEvolve={handleEvolve} busy={busy}
+          currentStage={stage} assignments={assignments}
         />
 
-        <ChainViewer chain={chain} />
+        <ChainViewer chain={chain} onVerify={handleVerify} />
 
         {chains.length > 0 && (
           <section className="panel p-4" data-testid="chain-history"

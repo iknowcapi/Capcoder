@@ -177,7 +177,7 @@ const GenerationCard = ({ gen, chainId }) => {
   );
 };
 
-export const ChainViewer = ({ chain }) => {
+export const ChainViewer = ({ chain, onVerify }) => {
   if (!chain) {
     return (
       <section
@@ -185,45 +185,70 @@ export const ChainViewer = ({ chain }) => {
         data-testid="chain-empty"
       >
         <div className="font-bbs text-3xl text-phosphor neon-text mb-3 uppercase tracking-widest">
-          ░░ no chain yet ░░
+          ░░ no build yet ░░
         </div>
         <p className="text-phosphor3 font-mono text-sm">
-          press EVOLVE above to generate a new lineage of code-builder applications.
+          type a target prompt above and press BUILD to run the Teacher → Artist → Product chain.
         </p>
       </section>
     );
   }
 
   const downloadAll = `${API}/chains/${chain.id}/download`;
+  const isComplete = chain.status === "complete";
 
   return (
     <section className="space-y-4 sm:space-y-6" data-testid="chain-viewer">
       <header
-        className="panel p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3"
+        className="panel p-4 sm:p-5 flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3"
         style={{ borderColor: "rgba(255,0,255,0.5)" }}
       >
-        <div>
+        <div className="min-w-0 flex-1">
           <div className="label-xs text-neon_magenta neon-magenta">
             [ CHAIN :: {chain.id.slice(0, 12)} ]
           </div>
           <div className="font-bbs text-2xl sm:text-3xl text-phosphor neon-text uppercase tracking-widest leading-none mt-1">
-            lineage // {chain.generations?.length || 0} generations
+            {chain.verified ? "✓ verified build" : "product build"}
           </div>
-          <p className="text-xs text-phosphor2 mt-1 font-mono">
-            evolved {new Date(chain.created_at).toLocaleString()}{" "}
+          {chain.target_prompt && (
+            <p className="text-xs sm:text-sm text-phosphor2 mt-2 font-mono">
+              <span className="text-phosphor3">target ::</span>{" "}
+              <span data-testid="chain-target">{chain.target_prompt}</span>
+            </p>
+          )}
+          <p className="text-xs text-phosphor3 mt-1 font-mono">
+            {new Date(chain.created_at).toLocaleString()}
             {chain.fallback_used && (
-              <span className="text-amber_warn ml-2">[fallback used in 1+ gens]</span>
+              <span className="text-amber_warn ml-2">[correction pass used]</span>
             )}
           </p>
         </div>
-        <a
-          data-testid="download-chain"
-          href={downloadAll}
-          className="flex items-center gap-2 border-2 border-phosphor bg-phosphor/10 text-phosphor px-4 py-3 hover:bg-phosphor hover:text-black transition-colors uppercase tracking-widest neon-text"
-        >
-          <Download size={18} />
-          <span className="font-bbs text-lg">download whole chain</span>
-        </a>
+        <div className="flex flex-col gap-2 shrink-0">
+          {isComplete && (
+            <a
+              data-testid="download-chain"
+              href={downloadAll}
+              className="flex items-center gap-2 border-2 border-phosphor bg-phosphor/10 text-phosphor px-4 py-2 hover:bg-phosphor hover:text-black transition-colors uppercase tracking-widest neon-text"
+            >
+              <Download size={16} />
+              <span className="font-bbs text-base">download .zip</span>
+            </a>
+          )}
+          {isComplete && !chain.verified && (
+            <button
+              data-testid="verify-chain"
+              onClick={() => onVerify?.(chain.id)}
+              className="flex items-center gap-2 border-2 border-neon_yellow bg-neon_yellow/10 text-neon_yellow px-4 py-2 hover:bg-neon_yellow hover:text-black transition-colors uppercase tracking-widest"
+            >
+              <span className="font-bbs text-base">✓ works — verify</span>
+            </button>
+          )}
+          {isComplete && chain.verified && (
+            <span className="border-2 border-neon_yellow text-neon_yellow px-3 py-2 label-xs text-center">
+              ✓ verified
+            </span>
+          )}
+        </div>
       </header>
 
       {/* lineage breadcrumb */}
@@ -232,17 +257,24 @@ export const ChainViewer = ({ chain }) => {
         data-testid="chain-breadcrumb"
         style={{ borderColor: "rgba(57,255,20,0.25)" }}
       >
-        <span className="label-xs text-phosphor3 shrink-0">RECURSIVE.BBS</span>
+        <span className="label-xs text-phosphor3 shrink-0">HUMAN</span>
+        <GitBranch size={12} className="text-neon_cyan shrink-0" />
+        <span className="label-xs text-neon_cyan neon-cyan shrink-0 border border-neon_cyan/40 px-2 py-0.5">
+          TEACHER
+        </span>
+        <GitBranch size={12} className="text-neon_magenta shrink-0" />
+        <span className="label-xs text-neon_magenta neon-magenta shrink-0 border border-neon_magenta/40 px-2 py-0.5">
+          ARTIST
+        </span>
+        <GitBranch size={12} className="text-neon_yellow shrink-0" />
         {chain.generations?.map((g) => (
-          <React.Fragment key={g.gen}>
-            <GitBranch size={12} className="text-neon_cyan shrink-0" />
-            <span
-              className="label-xs text-neon_cyan neon-cyan shrink-0 border border-neon_cyan/40 px-2 py-0.5"
-              data-testid={`breadcrumb-gen-${g.gen}`}
-            >
-              GEN-{String(g.gen).padStart(2, "0")} :: {g.name || "?"}
-            </span>
-          </React.Fragment>
+          <span
+            key={g.gen}
+            className="label-xs text-neon_yellow shrink-0 border border-neon_yellow/40 px-2 py-0.5"
+            data-testid={`breadcrumb-gen-${g.gen}`}
+          >
+            PRODUCT :: {g.name || "?"}
+          </span>
         ))}
       </div>
 

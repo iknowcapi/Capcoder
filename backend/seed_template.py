@@ -41,55 +41,212 @@ DEFAULT_MUTATION = {
 }
 
 
-def render(mutation: dict | None = None, seed_template_src: str | None = None) -> list[dict]:
-    """Render a complete code-builder folder from a mutation spec.
+def render(mutation: dict | None = None, seed_template_src: str | None = None,
+           stack: str | None = None) -> list[dict]:
+    """Render a complete runnable folder for the requested stack.
 
-    Returns a list of {path, content} dicts ready to write to disk or zip up.
+    stack: "python-fastapi" (default) | "node-vite" | "rust" | "go" | "webgl"
+    Returns list of {path, content} dicts ready to write to disk or zip up.
     """
     m = {**DEFAULT_MUTATION, **(mutation or {})}
-    # safe accessors
+    stack = (stack or m.get("stack") or "python-fastapi").lower().strip()
     name = (m.get("name") or "RecursiveBBS").strip()
     tagline = m.get("tagline") or DEFAULT_MUTATION["tagline"]
     philosophy = m.get("philosophy") or DEFAULT_MUTATION["philosophy"]
     accent = m.get("accent_hex") or DEFAULT_MUTATION["accent_hex"]
     accent2 = m.get("accent2_hex") or DEFAULT_MUTATION["accent2_hex"]
-    weights = {**DEFAULT_MUTATION["weights"], **(m.get("weights") or {})}
     improvement = m.get("improvement_note") or DEFAULT_MUTATION["improvement_note"]
+    target = m.get("target_prompt") or m.get("target") or ""
 
-    # The generated gen carries a copy of the seed template so it can spawn its own next gen.
+    # Route to non-python stacks
+    if "node" in stack or "vite" in stack or "react" in stack:
+        return _render_node(name, tagline, philosophy, improvement, accent, accent2, target)
+    if "rust" in stack:
+        return _render_rust(name, tagline, philosophy, improvement, target)
+    if stack == "go" or stack.startswith("go-"):
+        return _render_go(name, tagline, philosophy, improvement, target)
+    if "webgl" in stack or "html" in stack:
+        return _render_webgl(name, tagline, philosophy, improvement, accent, accent2, target)
+
+    # Default: python-fastapi (existing template)
+    weights = {**DEFAULT_MUTATION["weights"], **(m.get("weights") or {})}
     if seed_template_src is None:
         seed_template_src = Path(__file__).read_text()
-
     files = [
         {"path": "backend/server.py", "content": _SERVER_PY.format(
-            name=name,
-            tagline=_q(tagline),
-            philosophy=_q(philosophy),
+            name=name, tagline=_q(tagline), philosophy=_q(philosophy),
             improvement=_q(improvement),
-            w_help=weights["helpfulness"],
-            w_correct=weights["correctness"],
-            w_cohere=weights["coherence"],
-            w_complex=weights["complexity"],
+            w_help=weights["helpfulness"], w_correct=weights["correctness"],
+            w_cohere=weights["coherence"], w_complex=weights["complexity"],
             w_verbose=weights["verbosity"],
         )},
         {"path": "backend/seed_template.py", "content": seed_template_src},
         {"path": "backend/requirements.txt", "content":
             "fastapi==0.115.0\nuvicorn[standard]==0.30.6\npydantic==2.9.2\nopenai==1.99.9\n"},
         {"path": "frontend/index.html", "content": _INDEX_HTML.format(
-            name=name,
-            tagline=tagline.replace('"', "'"),
-            accent=accent,
-            accent2=accent2,
+            name=name, tagline=tagline.replace('"', "'"), accent=accent, accent2=accent2,
         )},
         {"path": "run.sh", "content": _RUN_SH},
         {"path": "README.md", "content": _README.format(
-            name=name,
-            tagline=tagline,
-            philosophy=philosophy,
-            improvement=improvement,
+            name=name, tagline=tagline, philosophy=philosophy, improvement=improvement,
         )},
     ]
     return files
+
+
+# ---------------------------------------------------------------------------
+# Multi-stack minimal renderers (node/vite, rust, go, webgl)
+# ---------------------------------------------------------------------------
+def _slug(s: str) -> str:
+    import re as _re
+    return _re.sub(r"[^a-z0-9-]+", "-", (s or "app").lower()).strip("-") or "app"
+
+
+def _render_node(name, tagline, philosophy, improvement, accent, accent2, target):
+    slug = _slug(name)
+    pkg = {
+        "name": slug, "version": "0.1.0", "type": "module",
+        "scripts": {"dev": "vite", "build": "vite build", "preview": "vite preview --port 8000 --host"},
+        "dependencies": {"react": "^18.3.1", "react-dom": "^18.3.1"},
+        "devDependencies": {"vite": "^5.4.0", "@vitejs/plugin-react": "^4.3.1"},
+    }
+    index_html = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>{name}</title>
+<style>body{{background:#070907;color:{accent};font:14px ui-monospace,monospace;padding:24px;margin:0}}
+h1{{color:{accent};text-shadow:0 0 6px {accent}}} .tag{{color:{accent2}}}</style></head>
+<body><div id="root"></div><script type="module" src="/src/main.jsx"></script></body></html>
+"""
+    main_jsx = f"""import React from "react"; import ReactDOM from "react-dom/client";
+function App(){{ return (<div>
+<h1>{name}</h1><p className="tag">{tagline}</p>
+<p style={{{{maxWidth:640}}}}>{philosophy}</p>
+<p><b>Target:</b> {target}</p><p><b>Delta:</b> {improvement}</p>
+</div>); }}
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+"""
+    vite_cfg = """import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+export default defineConfig({ plugins:[react()], server:{ host:true, port: Number(process.env.APP_PORT)||8000 }});
+"""
+    run_sh = """#!/usr/bin/env bash
+set -e
+cd "$(dirname "$0")"
+npm install --silent >/dev/null 2>&1 || yarn install --silent
+exec npx vite --host --port ${APP_PORT:-8000}
+"""
+    readme = f"# {name}\n\n> {tagline}\n\n{philosophy}\n\n## Run\n\n```bash\nbash run.sh\n```\n"
+    return [
+        {"path": "package.json", "content": json.dumps(pkg, indent=2)},
+        {"path": "index.html", "content": index_html},
+        {"path": "src/main.jsx", "content": main_jsx},
+        {"path": "vite.config.js", "content": vite_cfg},
+        {"path": "run.sh", "content": run_sh},
+        {"path": "README.md", "content": readme},
+    ]
+
+
+def _render_rust(name, tagline, philosophy, improvement, target):
+    slug = _slug(name)
+    cargo = f"""[package]
+name = "{slug}"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tiny_http = "0.12"
+"""
+    main_rs = f"""use tiny_http::{{Server, Response}};
+fn main() {{
+    let port = std::env::var("APP_PORT").unwrap_or_else(|_| "8000".to_string());
+    let addr = format!("0.0.0.0:{{}}", port);
+    let server = Server::http(&addr).unwrap();
+    println!("{name} listening on {{}}", addr);
+    for req in server.incoming_requests() {{
+        let body = format!("<h1>{name}</h1><p>{tagline}</p><p>{philosophy}</p><p>target: {target}</p>");
+        let _ = req.respond(Response::from_string(body).with_header(
+            tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap()));
+    }}
+}}
+"""
+    run_sh = """#!/usr/bin/env bash
+set -e
+cd "$(dirname "$0")"
+cargo run --release
+"""
+    readme = f"# {name}\n\n> {tagline}\n\n{philosophy}\n\n{improvement}\n"
+    return [
+        {"path": "Cargo.toml", "content": cargo},
+        {"path": "src/main.rs", "content": main_rs},
+        {"path": "run.sh", "content": run_sh},
+        {"path": "README.md", "content": readme},
+    ]
+
+
+def _render_go(name, tagline, philosophy, improvement, target):
+    slug = _slug(name)
+    gomod = f"module {slug}\n\ngo 1.22\n"
+    main_go = f"""package main
+
+import (
+    "fmt"
+    "net/http"
+    "os"
+)
+
+func main() {{
+    port := os.Getenv("APP_PORT")
+    if port == "" {{ port = "8000" }}
+    http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {{
+        w.Header().Set("Content-Type", "text/html; charset=utf-8")
+        fmt.Fprintf(w, "<h1>{name}</h1><p>{tagline}</p><p>{philosophy}</p><p>target: {target}</p>")
+    }})
+    fmt.Println("{name} listening on :" + port)
+    http.ListenAndServe(":"+port, nil)
+}}
+"""
+    run_sh = """#!/usr/bin/env bash
+set -e
+cd "$(dirname "$0")"
+exec go run main.go
+"""
+    readme = f"# {name}\n\n> {tagline}\n\n{philosophy}\n\n{improvement}\n"
+    return [
+        {"path": "go.mod", "content": gomod},
+        {"path": "main.go", "content": main_go},
+        {"path": "run.sh", "content": run_sh},
+        {"path": "README.md", "content": readme},
+    ]
+
+
+def _render_webgl(name, tagline, philosophy, improvement, accent, accent2, target):
+    html = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>{name}</title>
+<style>html,body{{margin:0;height:100%;background:#000;color:{accent};font:14px ui-monospace,monospace}}
+canvas{{display:block;width:100vw;height:100vh}} .overlay{{position:fixed;top:10px;left:10px}}
+h1{{margin:0;text-shadow:0 0 6px {accent}}} .tag{{color:{accent2}}}</style></head>
+<body>
+<div class="overlay"><h1>{name}</h1><div class="tag">{tagline}</div>
+<div>target: {target}</div><div>philosophy: {philosophy}</div></div>
+<canvas id="c"></canvas>
+<script>
+const c=document.getElementById("c"); c.width=innerWidth; c.height=innerHeight;
+const gl=c.getContext("webgl"); gl.clearColor(0.02,0.05,0.02,1);
+function loop(t){{ gl.clearColor(0.02+0.02*Math.sin(t/900),0.05,0.02,1); gl.clear(gl.COLOR_BUFFER_BIT); requestAnimationFrame(loop); }}
+requestAnimationFrame(loop);
+</script></body></html>
+"""
+    run_sh = """#!/usr/bin/env bash
+set -e
+cd "$(dirname "$0")"
+exec python3 -m http.server ${APP_PORT:-8000}
+"""
+    readme = f"# {name}\n\n> {tagline}\n\n{philosophy}\n\n{improvement}\n"
+    return [
+        {"path": "index.html", "content": html},
+        {"path": "run.sh", "content": run_sh},
+        {"path": "README.md", "content": readme},
+    ]
+
 
 
 def _q(s: str) -> str:
@@ -108,7 +265,7 @@ python3 -m venv .venv 2>/dev/null || true
 source .venv/bin/activate
 pip install -q -r backend/requirements.txt
 cd backend
-exec uvicorn server:app --host 0.0.0.0 --port 8000
+exec uvicorn server:app --host 0.0.0.0 --port ${APP_PORT:-8000}
 """
 
 
