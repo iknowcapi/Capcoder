@@ -275,27 +275,70 @@ class SettingsPayload(BaseModel):
     teacher: Optional[dict] = None
     artist: Optional[dict] = None
     rater: Optional[dict] = None
+    keys: Optional[dict] = None  # {openrouter?, venice?, nvidia?}
+    github: Optional[dict] = None  # {token?, username?}
 
 
 @api.get("/settings")
 async def get_settings(session_id: str):
     doc = await db.settings.find_one({"session_id": session_id}, {"_id": 0}) or {}
     roles = ("teacher", "artist", "rater")
+    # Never leak the actual secret values back to the frontend — just say whether
+    # each key is set. Model choices are safe to echo.
+    keys = doc.get("keys") or {}
+    keys_set = {p: bool((keys.get(p) or "").strip()) for p in ("openrouter", "venice", "nvidia")}
+    gh = doc.get("github") or {}
     return {
         "session_id": session_id,
         **{r: doc.get(r) or _providers.DEFAULT_ASSIGNMENTS[r] for r in roles},
+        "keys_set": keys_set,
+        "github": {"username": gh.get("username", ""), "token_set": bool((gh.get("token") or "").strip())},
     }
 
 
 @api.post("/settings")
 async def save_settings(session_id: str, payload: SettingsPayload):
-    update = {k: v for k, v in payload.model_dump().items() if v is not None}
+    update = {}
+    if payload.teacher is not None: update["teacher"] = payload.teacher
+    if payload.artist is not None:  update["artist"] = payload.artist
+    if payload.rater is not None:   update["rater"] = payload.rater
+    if payload.keys is not None:
+        # Merge with existing keys — empty string means "clear this key".
+        existing = (await db.settings.find_one({"session_id": session_id}, {"_id": 0, "keys": 1}) or {}).get("keys") or {}
+        for k, v in (payload.keys or {}).items():
+            if k in ("openrouter", "venice", "nvidia"):
+                v = (v or "").strip()
+                if v:
+                    existing[k] = v
+                else:
+                    existing.pop(k, None)
+        update["keys"] = existing
+    if payload.github is not None:
+        existing = (await db.settings.find_one({"session_id": session_id}, {"_id": 0, "github": 1}) or {}).get("github") or {}
+        gh = payload.github or {}
+        if "username" in gh:
+            existing["username"] = (gh.get("username") or "").strip()
+        if "token" in gh:
+            tok = (gh.get("token") or "").strip()
+            if tok:
+                existing["token"] = tok
+            elif tok == "":
+                existing.pop("token", None)
+        update["github"] = existing
     await db.settings.update_one(
         {"session_id": session_id},
         {"$set": {"session_id": session_id, **update}},
         upsert=True,
     )
     return await get_settings(session_id)
+
+
+async def _load_user_keys(session_id: Optional[str]) -> dict:
+    """Return {provider: apikey} the user has BYOK'd, or empty dict."""
+    if not session_id:
+        return {}
+    doc = await db.settings.find_one({"session_id": session_id}, {"_id": 0, "keys": 1})
+    return (doc or {}).get("keys") or {}
 
 
 @api.post("/evolve", response_model=Chain)
@@ -377,10 +420,11 @@ async def evolve(req: EvolveRequest, background_tasks: BackgroundTasks):
 
     async def _runner():
         try:
+            user_keys = await _load_user_keys(req.session_id)
             await chain_generator.evolve_chain_with_callback(
                 chain_id, target, on_gen, on_done,
                 assignments=assignments, exemplars=exemplars,
-                exemplar_files=exemplar_files,
+                exemplar_files=exemplar_files, user_keys=user_keys,
             )
         except chain_generator.ArtistFailedError as exc:
             logger.warning("chain %s: artist failed — %s", chain_id, exc)
@@ -541,6 +585,133 @@ async def verify_chain(chain_id: str):
     return {"id": chain_id, "verified": True}
 
 
+@api.get("/chains/{chain_id}/stream")
+async def stream_chain(chain_id: str):
+    """Server-Sent Events feed for a running chain. Emits Teacher/Artist token
+    deltas and stage transitions. Closes when the chain completes."""
+    import asyncio as _asyncio
+    q = chain_generator.get_stream_queue(chain_id)
+
+    async def gen():
+        # initial ping so proxies flush headers
+        yield "event: open\ndata: connected\n\n"
+        while True:
+            try:
+                item = await _asyncio.wait_for(q.get(), timeout=90)
+            except _asyncio.TimeoutError:
+                # keep-alive
+                yield ": ping\n\n"
+                # If the chain has already finished, exit.
+                doc = await db.chains.find_one({"id": chain_id}, {"_id": 0, "status": 1})
+                if doc and doc.get("status") in ("complete", "failed"):
+                    break
+                continue
+            event = item.get("event", "message")
+            if event == "done":
+                yield "event: done\ndata: end\n\n"
+                break
+            data = item.get("data", "")
+            # Escape newlines per SSE spec (each newline needs its own data: prefix).
+            if isinstance(data, str) and "\n" in data:
+                for line in data.split("\n"):
+                    yield f"event: {event}\ndata: {line}\n\n"
+            else:
+                payload = data if isinstance(data, str) else json.dumps(data)
+                yield f"event: {event}\ndata: {payload}\n\n"
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )
+
+
+class GithubPushRequest(BaseModel):
+    session_id: str
+    repo: str  # target repo name (without owner)
+    private: bool = True
+
+
+@api.post("/chains/{chain_id}/push")
+async def push_to_github(chain_id: str, req: GithubPushRequest):
+    """Push a completed chain's Product folder to the user's GitHub as a new repo.
+    Requires the user to have saved a PAT + username under /api/settings."""
+    doc = await db.chains.find_one({"id": chain_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "chain not found")
+    if doc.get("status") != "complete":
+        raise HTTPException(409, "chain not complete — cannot push")
+
+    settings = await db.settings.find_one({"session_id": req.session_id}, {"_id": 0}) or {}
+    gh = (settings.get("github") or {})
+    token = (gh.get("token") or "").strip()
+    username = (gh.get("username") or "").strip()
+    if not token or not username:
+        raise HTTPException(400, "github credentials missing — save your username + PAT in settings first")
+
+    repo_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", req.repo).strip("-.") or f"capcode-{chain_id[:8]}"
+
+    # 1) Create the repo on GitHub (idempotent — if it exists, we reuse).
+    import httpx as _httpx
+    async with _httpx.AsyncClient(timeout=20) as http:
+        r = await http.post(
+            "https://api.github.com/user/repos",
+            headers={"Authorization": f"Bearer {token}",
+                     "Accept": "application/vnd.github+json"},
+            json={"name": repo_name, "private": bool(req.private), "auto_init": False},
+        )
+        if r.status_code not in (201, 422):  # 422 = already exists
+            raise HTTPException(502, f"github repo create failed: {r.status_code} {r.text[:200]}")
+
+    # 2) Write files to a temp dir and push with git subprocess.
+    gen = (doc.get("generations") or [{}])[0]
+    files = gen.get("files") or []
+    if not files:
+        raise HTTPException(409, "chain has no files to push")
+
+    import tempfile
+    import subprocess
+
+    def _run(cmd, cwd):
+        return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=60)
+
+    with tempfile.TemporaryDirectory(prefix="capcode-push-") as tmp:
+        for f in files:
+            p = Path(tmp) / f["path"]
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(f["content"])
+        # Include the spec docs too so the repo is self-explanatory.
+        Path(tmp, "TEACHER_SPEC.md").write_text(_teacher_md(doc, gen))
+        Path(tmp, "ARTIST_NOTES.md").write_text(_artist_md(gen))
+
+        env_str = f"https://{username}:{token}@github.com/{username}/{repo_name}.git"
+        steps = [
+            ["git", "init", "-b", "main"],
+            ["git", "config", "user.email", "capcode@emergent.host"],
+            ["git", "config", "user.name", "CapCode"],
+            ["git", "add", "-A"],
+            ["git", "commit", "-m", f"CapCode build: {doc.get('target_prompt','')[:120]}"],
+            ["git", "remote", "add", "origin", env_str],
+            ["git", "push", "-u", "origin", "main", "--force"],
+        ]
+        for cmd in steps:
+            res = _run(cmd, tmp)
+            if res.returncode != 0:
+                # scrub token from any error output before returning it.
+                err = (res.stderr or res.stdout or "").replace(token, "***")
+                # `remote add origin` might fail if invoked twice; ignore only that one.
+                if cmd[:3] == ["git", "remote", "add"] and "already exists" in err:
+                    continue
+                raise HTTPException(502, f"git step {' '.join(cmd[:3])} failed: {err[:300]}")
+
+    return {
+        "id": chain_id,
+        "repo": f"{username}/{repo_name}",
+        "url": f"https://github.com/{username}/{repo_name}",
+        "private": bool(req.private),
+    }
+
+
 app.include_router(api)
 app.add_middleware(
     CORSMiddleware,
@@ -549,6 +720,26 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def _sweep_orphans():
+    """On boot, mark any chains that were still 'running' as failed. A prior
+    process (supervisor reload, hot-reload, crash) cannot resume its background
+    task, so leaving them 'running' would deadlock the UI polling forever."""
+    try:
+        r = await db.chains.update_many(
+            {"status": "running"},
+            {"$set": {
+                "status": "failed",
+                "error": "backend restarted before build finished — try again",
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            }},
+        )
+        if r.modified_count:
+            logger.info("startup sweep: marked %d orphaned chain(s) as failed", r.modified_count)
+    except Exception as exc:
+        logger.warning("startup sweep failed: %s", exc)
 
 
 @app.on_event("shutdown")

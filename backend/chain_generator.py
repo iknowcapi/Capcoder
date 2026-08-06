@@ -35,25 +35,88 @@ ENABLED = any(_providers.provider_available(p) for p in ("openrouter", "nvidia",
 
 
 # ---------------------------------------------------------------------------
+# Per-chain stream broadcasters (SSE) — one asyncio.Queue per active chain
+# ---------------------------------------------------------------------------
+import asyncio
+_stream_queues: dict[str, asyncio.Queue] = {}
+
+
+def get_stream_queue(chain_id: str) -> asyncio.Queue:
+    q = _stream_queues.get(chain_id)
+    if q is None:
+        q = asyncio.Queue()
+        _stream_queues[chain_id] = q
+    return q
+
+
+def close_stream(chain_id: str):
+    q = _stream_queues.pop(chain_id, None)
+    if q is not None:
+        try:
+            q.put_nowait({"event": "done"})
+        except Exception:
+            pass
+
+
+async def _emit(chain_id: Optional[str], event: str, data):
+    if not chain_id:
+        return
+    q = _stream_queues.get(chain_id)
+    if q is None:
+        return
+    try:
+        q.put_nowait({"event": event, "data": data})
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # LLM helper
 # ---------------------------------------------------------------------------
-_client_cache: dict[str, object] = {}
-
-
-def _get_client(provider: str):
+def _client_for(provider: str, user_keys: Optional[dict] = None):
+    """Fresh client if user provided BYOK for this provider, else cached env client."""
+    user_key = (user_keys or {}).get(provider) if user_keys else None
+    if user_key:
+        return _providers.openai_client_for(provider, api_key=user_key)
     if provider not in _client_cache:
         _client_cache[provider] = _providers.openai_client_for(provider)
     return _client_cache[provider]
 
 
+_client_cache: dict[str, object] = {}
+
+
 async def _chat(model: str, messages: list[dict], provider: str = "nvidia",
-                fallback: Optional[tuple[str, str]] = None, **kwargs) -> Optional[str]:
-    client = _get_client(provider)
+                fallback: Optional[tuple[str, str]] = None,
+                user_keys: Optional[dict] = None,
+                stream_chain_id: Optional[str] = None,
+                stream_event: Optional[str] = None,
+                **kwargs) -> Optional[str]:
+    client = _client_for(provider, user_keys)
     if client is None:
         if fallback:
-            return await _chat(fallback[1], messages, provider=fallback[0], **kwargs)
+            return await _chat(fallback[1], messages, provider=fallback[0],
+                               user_keys=user_keys,
+                               stream_chain_id=stream_chain_id,
+                               stream_event=stream_event, **kwargs)
         return None
+    do_stream = bool(stream_chain_id and stream_event)
     try:
+        if do_stream:
+            # Streaming path — accumulate content, emit deltas over SSE.
+            stream = await client.chat.completions.create(
+                model=model, messages=messages, stream=True, **kwargs)
+            buf = []
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                piece = getattr(delta, "content", None) or ""
+                if piece:
+                    buf.append(piece)
+                    await _emit(stream_chain_id, stream_event, piece)
+            out = "".join(buf).strip()
+            return out
         r = await client.chat.completions.create(model=model, messages=messages, **kwargs)
         msg = r.choices[0].message
         out = (msg.content or "").strip()
@@ -65,7 +128,10 @@ async def _chat(model: str, messages: list[dict], provider: str = "nvidia",
     except Exception as exc:
         logger.error("%s/%s call failed: %s", provider, model, exc)
         if fallback:
-            return await _chat(fallback[1], messages, provider=fallback[0], **kwargs)
+            return await _chat(fallback[1], messages, provider=fallback[0],
+                               user_keys=user_keys,
+                               stream_chain_id=stream_chain_id,
+                               stream_event=stream_event, **kwargs)
         return None
 
 
@@ -303,26 +369,37 @@ SYSTEM_RATER = ('Score on 5 dims (each 0.0-4.0). Output ONLY: '
 # ---------------------------------------------------------------------------
 # Bot steps
 # ---------------------------------------------------------------------------
-async def _call_role(role: str, messages: list[dict], assignment: Optional[dict], **kwargs) -> Optional[str]:
+async def _call_role(role: str, messages: list[dict], assignment: Optional[dict],
+                     user_keys: Optional[dict] = None,
+                     stream_chain_id: Optional[str] = None,
+                     stream_event: Optional[str] = None,
+                     **kwargs) -> Optional[str]:
     a = assignment or _providers.DEFAULT_ASSIGNMENTS[role]
     fb = _providers.DEFAULT_ASSIGNMENTS.get(f"{role}_fallback", {"provider": "nvidia", "model": "z-ai/glm-5.1"})
     return await _chat(a["model"], messages, provider=a["provider"],
-                       fallback=(fb["provider"], fb["model"]), **kwargs)
+                       fallback=(fb["provider"], fb["model"]),
+                       user_keys=user_keys,
+                       stream_chain_id=stream_chain_id,
+                       stream_event=stream_event, **kwargs)
 
 
-async def teacher_step(target: str, exemplars: list[dict], assignment: Optional[dict] = None) -> dict:
+async def teacher_step(target: str, exemplars: list[dict], assignment: Optional[dict] = None,
+                       user_keys: Optional[dict] = None, chain_id: Optional[str] = None) -> dict:
     exemplar_block = "\n\n".join(
         f"[verified — target: {e.get('target','?')} — product: {e.get('name','?')}]\n"
         f"artist_brief was: {e.get('artist_brief','?')}"
         for e in exemplars[:3]
     ) or "(no verified exemplars yet — apply first principles)"
+    await _emit(chain_id, "stage", "teacher")
     raw = await _call_role(
         "teacher",
         [{"role": "system", "content": SYSTEM_TEACHER},
          {"role": "user", "content":
              f"HUMAN TARGET:\n{target}\n\nTOP-VERIFIED PRIOR CHAINS:\n{exemplar_block}\n\n"
              f"Design the Teacher spec as strict JSON."}],
-        assignment, temperature=0.4, max_tokens=800,
+        assignment, user_keys=user_keys,
+        stream_chain_id=chain_id, stream_event="teacher_delta",
+        temperature=0.4, max_tokens=800,
     )
     parsed = _extract_json(raw or "") or {}
     parsed.setdefault("target", target)
@@ -341,7 +418,9 @@ class ArtistFailedError(Exception):
 
 
 async def artist_step(teacher_spec: dict, exemplar_files: Optional[list[dict]] = None,
-                      assignment: Optional[dict] = None) -> dict:
+                      assignment: Optional[dict] = None,
+                      user_keys: Optional[dict] = None,
+                      chain_id: Optional[str] = None) -> dict:
     parsed: dict = {}
     raw = ""
     exemplar_block = ""
@@ -359,6 +438,7 @@ async def artist_step(teacher_spec: dict, exemplar_files: Optional[list[dict]] =
             )
         exemplar_block = "\n\n".join(parts)
 
+    await _emit(chain_id, "stage", "artist")
     for attempt in range(3):
         directive = ("Write the source files as strict JSON. Include the FULL content of every "
                      "file — no ellipsis, no TODOs.")
@@ -375,11 +455,15 @@ async def artist_step(teacher_spec: dict, exemplar_files: Optional[list[dict]] =
                 f"{exemplar_block}\n\n"
             )
         user_msg += directive
+        if attempt > 0:
+            await _emit(chain_id, "stage", f"artist-retry-{attempt}")
         raw = await _call_role(
             "artist",
             [{"role": "system", "content": SYSTEM_ARTIST},
              {"role": "user", "content": user_msg}],
             assignment,
+            user_keys=user_keys,
+            stream_chain_id=chain_id, stream_event="artist_delta",
             temperature=(0.7, 0.4, 0.2)[attempt],
             max_tokens=(12000, 8000, 4000)[attempt],
         )
@@ -428,7 +512,8 @@ async def artist_step(teacher_spec: dict, exemplar_files: Optional[list[dict]] =
     return parsed
 
 
-async def correct_step(spec: dict, stderr: str, assignment: Optional[dict] = None) -> dict:
+async def correct_step(spec: dict, stderr: str, assignment: Optional[dict] = None,
+                       user_keys: Optional[dict] = None) -> dict:
     file_dump = "\n\n".join(
         f"### {f['path']}\n```\n{f['content'][:2000]}\n```"
         for f in (spec.get("files") or [])[:10]
@@ -443,7 +528,7 @@ async def correct_step(spec: dict, stderr: str, assignment: Optional[dict] = Non
         "artist",  # corrector reuses the artist's model
         [{"role": "system", "content": SYSTEM_CORRECTOR},
          {"role": "user", "content": prompt}],
-        assignment, temperature=0.3, max_tokens=6000,
+        assignment, user_keys=user_keys, temperature=0.3, max_tokens=6000,
     )
     fixed = _extract_json(raw or "") if raw else {}
     if not fixed:
@@ -461,7 +546,8 @@ async def correct_step(spec: dict, stderr: str, assignment: Optional[dict] = Non
     return merged
 
 
-async def rate_step(spec: dict, exec_result: dict, assignment: Optional[dict] = None) -> dict:
+async def rate_step(spec: dict, exec_result: dict, assignment: Optional[dict] = None,
+                    user_keys: Optional[dict] = None) -> dict:
     brief = json.dumps({
         "name": spec.get("name"), "philosophy": spec.get("philosophy"),
         "improvement_note": spec.get("improvement_note"),
@@ -472,7 +558,7 @@ async def rate_step(spec: dict, exec_result: dict, assignment: Optional[dict] = 
         "rater",
         [{"role": "system", "content": SYSTEM_RATER},
          {"role": "user", "content": brief}],
-        assignment, temperature=0.1, max_tokens=2000,
+        assignment, user_keys=user_keys, temperature=0.1, max_tokens=2000,
     )
     data = _extract_json(raw or "") if raw else {}
     keys = ("helpfulness", "correctness", "coherence", "complexity", "verbosity")
@@ -506,6 +592,7 @@ async def evolve_chain_with_callback(
     assignments: Optional[dict] = None,
     exemplars: Optional[list[dict]] = None,
     exemplar_files: Optional[list[dict]] = None,
+    user_keys: Optional[dict] = None,
 ) -> dict:
     """One chain = one product build:
        Human target -> Teacher spec -> Artist product -> Executor (+ 1 correction) -> Rater.
@@ -519,57 +606,71 @@ async def evolve_chain_with_callback(
     exemplars = exemplars or []
     fallback_used = False
 
-    # 1) TEACHER
-    teacher_spec = await teacher_step(target_prompt, exemplars, assignment=a["teacher"])
+    try:
+        # 1) TEACHER
+        teacher_spec = await teacher_step(target_prompt, exemplars,
+                                          assignment=a["teacher"],
+                                          user_keys=user_keys,
+                                          chain_id=chain_id)
 
-    # 2) ARTIST — writes the real source files. Raises if all attempts truncate.
-    artist_spec = await artist_step(teacher_spec, exemplar_files=exemplar_files,
-                                    assignment=a["artist"])
+        # 2) ARTIST — writes the real source files. Raises if all attempts truncate.
+        artist_spec = await artist_step(teacher_spec, exemplar_files=exemplar_files,
+                                        assignment=a["artist"],
+                                        user_keys=user_keys,
+                                        chain_id=chain_id)
 
-    # 3) BUILD PRODUCT (deterministic template render, driven by artist_spec + teacher.stack)
-    product = dict(artist_spec)
-    product["target_prompt"] = target_prompt
-    product["teacher_spec"] = teacher_spec
-    product["artist_spec"] = {k: v for k, v in artist_spec.items() if k != "files"}
-    product["files"] = seed_template.render(product, stack=product.get("stack") or teacher_spec.get("stack"))
+        # 3) BUILD PRODUCT
+        await _emit(chain_id, "stage", "materialize")
+        product = dict(artist_spec)
+        product["target_prompt"] = target_prompt
+        product["teacher_spec"] = teacher_spec
+        product["artist_spec"] = {k: v for k, v in artist_spec.items() if k != "files"}
+        product["files"] = seed_template.render(product, stack=product.get("stack") or teacher_spec.get("stack"))
 
-    # 4) EXECUTOR — longer timeout for stacks that need install/compile.
-    stack_l = (product.get("stack") or "").lower()
-    exec_timeout = 90 if any(k in stack_l for k in ("node", "vite", "react", "rust", "go")) else 25
-    workspace = _exec.materialize(chain_id, product)
-    exec_result = await _exec.run_workspace(workspace, timeout=exec_timeout, port_to_check=8123)
-    product["exec"] = exec_result
-
-    # 5) ONE correction pass if it failed to start
-    if not exec_result.get("started") and exec_result.get("stderr"):
-        fallback_used = True
-        product = await correct_step(product, exec_result["stderr"], assignment=a["artist"])
-        product["files"] = seed_template.render(product, stack=product.get("stack"))
+        # 4) EXECUTOR — longer timeout for stacks that need install/compile.
+        await _emit(chain_id, "stage", "execute")
+        stack_l = (product.get("stack") or "").lower()
+        exec_timeout = 90 if any(k in stack_l for k in ("node", "vite", "react", "rust", "go")) else 25
         workspace = _exec.materialize(chain_id, product)
-        exec_result = await _exec.run_workspace(workspace, timeout=exec_timeout, port_to_check=8124)
+        exec_result = await _exec.run_workspace(workspace, timeout=exec_timeout, port_to_check=8123)
         product["exec"] = exec_result
 
-    # 6) RATER
-    scores = await rate_step(product, exec_result, assignment=a["rater"])
-    product["reward"] = scores
-    product["composite_score"] = composite(scores)
-    product["gen"] = 1
-    product["critic_notes"] = (
-        f"Ran: {exec_result.get('started')}. "
-        f"Exit: {exec_result.get('exit_code')}. "
-        f"Port listening: {exec_result.get('port_listening')}."
-    )
-    product["assignments"] = {k: a[k] for k in ("teacher", "artist", "rater")}
+        # 5) ONE correction pass if it failed to start
+        if not exec_result.get("started") and exec_result.get("stderr"):
+            fallback_used = True
+            await _emit(chain_id, "stage", "corrector")
+            product = await correct_step(product, exec_result["stderr"],
+                                         assignment=a["artist"], user_keys=user_keys)
+            product["files"] = seed_template.render(product, stack=product.get("stack"))
+            workspace = _exec.materialize(chain_id, product)
+            exec_result = await _exec.run_workspace(workspace, timeout=exec_timeout, port_to_check=8124)
+            product["exec"] = exec_result
 
-    await on_gen(chain_id, product, fallback_used)
+        # 6) RATER
+        await _emit(chain_id, "stage", "rater")
+        scores = await rate_step(product, exec_result, assignment=a["rater"], user_keys=user_keys)
+        product["reward"] = scores
+        product["composite_score"] = composite(scores)
+        product["gen"] = 1
+        product["critic_notes"] = (
+            f"Ran: {exec_result.get('started')}. "
+            f"Exit: {exec_result.get('exit_code')}. "
+            f"Port listening: {exec_result.get('port_listening')}."
+        )
+        product["assignments"] = {k: a[k] for k in ("teacher", "artist", "rater")}
 
-    final = {
-        "id": chain_id,
-        "target_prompt": target_prompt,
-        "depth": 1,
-        "fallback_used": fallback_used,
-        "generations": [product],
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    await on_done(chain_id, final)
-    return final
+        await on_gen(chain_id, product, fallback_used)
+
+        final = {
+            "id": chain_id,
+            "target_prompt": target_prompt,
+            "depth": 1,
+            "fallback_used": fallback_used,
+            "generations": [product],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        await on_done(chain_id, final)
+        await _emit(chain_id, "stage", "complete")
+        return final
+    finally:
+        close_stream(chain_id)

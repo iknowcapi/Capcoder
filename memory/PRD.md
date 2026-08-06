@@ -24,18 +24,22 @@ CapCode is a recursive bot-builder. Human types the app they want; the system ru
 - `/app/frontend/src/components/ChainViewer.jsx` — Teacher/Artist/Product breadcrumb, download .zip, ✓Verify button.
 - `/app/frontend/src/components/SettingsPanel.jsx` — pick model per role (teacher/artist/rater), saved per-device.
 
-## Status (2026-08-06 — post recursion fix)
+## Status (2026-08-06 — final state)
 
-### ✅ Working end-to-end AND recursively learning
-- **No more silent boilerplate fallback.** If Artist can't produce real files after 3 retries (temperature: 0.7 → 0.4 → 0.2, max_tokens: 12k → 8k → 4k), chain hard-fails with `ArtistFailedError` and the UI shows the reason in red. The user never gets a fake product.
-- **Truncated-JSON repair.** When Claude/GPT hits max_tokens mid-response, `_repair_truncated_json()` closes the open string + drops the dangling `"key":` fragment + closes all open braces. Partial-but-valid file sets are recovered instead of being dropped.
-- **Real recursion (`RECURSIVE.BBS` was the original name for a reason):** every human ✓Verify on a chain pushes its **actual Artist files** into a rolling exemplar pool. The next Teacher sees the brief-level summary; the next **Artist gets shown the real file layout + a 600-char code snippet** from up to 2 verified prior builds so it copies patterns that actually worked.
-- Multi-attempt Artist with per-attempt directives (attempt 1 → "be terser, 3-4 files ≤150 lines", attempt 2 → "tiniest possible working version, one main file ≤120 lines").
-- Executor kills whole process group (`os.setsid` + `killpg`) — no more orphaned children.
-- Verified end-to-end: CubeOrbiter (chain `2762a8c0`, 4360-char WebGL + Three.js orbit cube) built in **45 seconds** using OrbitCube (chain `9cf2fc80`) as its verified exemplar. Two verified chains now in the exemplar pool.
+### ✅ Shipped this session
+- **Real code gen.** Artist emits `files: [{path, content}]` real source. `seed_template` fills gaps only. Verified with WebGL, Vite, and mixed builds (OrbitCube, VoidCube, CubeOrbiter, SatoshiPulse).
+- **Hard failure, never fake success.** Artist retries 3× with decreasing token budgets; if still empty, chain hard-fails with a red banner and a clear reason. No more silent boilerplate.
+- **Truncated-JSON repair.** `_repair_truncated_json` closes unfinished strings + dangling `"key":` fragments + open braces so partial LLM outputs still yield valid file sets.
+- **Real recursion.** Every ✓Verify pushes the chain's actual Artist files into a rolling exemplar pool. Next Artist sees the file layout + 600-char code snippet from up to 2 verified prior builds and copies patterns that worked.
+- **SSE streaming.** `GET /api/chains/{id}/stream` emits Teacher/Artist token deltas + stage transitions. UI shows live tokens in a two-pane console (Teacher cyan, Artist magenta). Confirmed live: real per-token deltas arriving during a build.
+- **BYOK.** Users paste their own OpenRouter/Venice/NVIDIA keys in Settings. Keys are stored per-device only; the frontend only sees `keys_set` booleans, never the values. If a user key is set for a provider, it overrides the server default for that user's chains.
+- **GitHub push.** `POST /api/chains/{id}/push` creates a new GitHub repo (public/private), writes the Artist files + `TEACHER_SPEC.md` + `ARTIST_NOTES.md`, git-inits, force-pushes to `main`. UI has a "PUSH TO GITHUB" button with a repo-name field. Requires the user to have saved a GitHub username + PAT (scope `repo`) in Settings.
+- **Verified filter tab** in the Archive so returning users can see only human-approved chains.
+- **Orphan sweep on boot.** Any chain still marked `running` when the backend starts gets moved to `failed` with reason "backend restarted before build finished — try again." No more zombie chains after supervisor reloads.
+- **Executor kills whole process group.** `os.setsid` + `os.killpg` — no more orphaned `python3 -m http.server` / `vite` children leaking after builds.
 
 ### Providers
-Model choice is user-driven (per-device settings). Sensible defaults route through **OpenRouter** (user has credits): Teacher = `deepseek/deepseek-v4-flash`, Artist = `anthropic/claude-sonnet-5`, Rater = `inclusionai/ling-3.0-flash:free`. Fallback = Venice `qwen3-coder-480b-a35b-instruct-turbo`. NVIDIA de-prioritized (pay-as-you-go friction).
+User-driven. Server defaults route through **OpenRouter** (user has credits): Teacher = `deepseek/deepseek-v4-flash`, Artist = `anthropic/claude-sonnet-5`, Rater = `inclusionai/ling-3.0-flash:free`. Fallback = Venice `qwen3-coder-480b-a35b-instruct-turbo`. NVIDIA deprioritized. Users override anything in Settings.
 
 ## Backlog (post-reliability)
 - P1: BYOK — let users paste their own OpenRouter/Venice keys.

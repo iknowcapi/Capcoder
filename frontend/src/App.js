@@ -1,8 +1,8 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import "@/App.css";
 import { Toaster, toast } from "sonner";
 import { Settings } from "lucide-react";
-import { api } from "@/lib/api";
+import { api, API } from "@/lib/api";
 import { TerminalHero } from "@/components/TerminalHero";
 import { EvolveButton } from "@/components/EvolveButton";
 import { ChainViewer } from "@/components/ChainViewer";
@@ -30,6 +30,8 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [assignments, setAssignments] = useState(null);
   const [historyFilter, setHistoryFilter] = useState("all"); // "all" | "verified"
+  const [streamBuf, setStreamBuf] = useState({ teacher: "", artist: "" });
+  const esRef = useRef(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -46,17 +48,30 @@ function App() {
   const handleEvolve = async (targetPrompt) => {
     setBusy(true);
     setStage("kicking off…");
+    setStreamBuf({ teacher: "", artist: "" });
     let pollId = null;
     try {
       const stub = await api.evolve(targetPrompt, sessionId);
       setChain(stub);
+      // Open SSE stream so we can render Teacher/Artist tokens live.
+      try { esRef.current && esRef.current.close(); } catch { /* noop */ }
+      const es = new EventSource(`${API}/chains/${stub.id}/stream`);
+      esRef.current = es;
+      es.addEventListener("teacher_delta", (ev) => {
+        setStreamBuf((b) => ({ ...b, teacher: b.teacher + ev.data + (ev.data.endsWith(" ") ? "" : "") }));
+      });
+      es.addEventListener("artist_delta", (ev) => {
+        setStreamBuf((b) => ({ ...b, artist: b.artist + ev.data }));
+      });
+      es.addEventListener("stage", (ev) => setStage(String(ev.data || "").trim()));
+      es.addEventListener("done", () => { try { es.close(); } catch { /* noop */ } });
+      es.onerror = () => { try { es.close(); } catch { /* noop */ } };
+
       await new Promise((resolve, reject) => {
         pollId = setInterval(async () => {
           try {
             const c = await api.getChain(stub.id);
             setChain(c);
-            const done = c.generations?.length || 0;
-            setStage(done > 0 ? "rating…" : "teacher → artist…");
             if (c.status === "complete") { clearInterval(pollId); resolve(); }
             else if (c.status === "failed") {
               clearInterval(pollId);
@@ -73,6 +88,8 @@ function App() {
       toast.error(msg);
     } finally {
       if (pollId) clearInterval(pollId);
+      try { esRef.current && esRef.current.close(); } catch { /* noop */ }
+      esRef.current = null;
       setBusy(false);
       setStage(null);
     }
@@ -91,6 +108,18 @@ function App() {
       refresh();
     } catch (e) {
       toast.error(e?.response?.data?.detail || "verify failed");
+    }
+  };
+
+  const handlePush = async (id, repo, isPrivate) => {
+    try {
+      const r = await api.pushChain(id, sessionId, repo, isPrivate);
+      toast.success(`PUSHED :: ${r.repo}`);
+      window.open(r.url, "_blank", "noopener");
+      return r;
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "push failed");
+      throw e;
     }
   };
 
@@ -124,14 +153,39 @@ function App() {
           currentStage={stage} assignments={assignments}
         />
 
-        <ChainViewer chain={chain} onVerify={handleVerify} />
+        <ChainViewer
+          chain={chain}
+          onVerify={handleVerify}
+          onPush={handlePush}
+          streamBuf={streamBuf}
+        />
 
         {chains.length > 0 && (
           <section className="panel p-4" data-testid="chain-history"
                    style={{ borderColor: "rgba(255,234,0,0.35)" }}>
-            <div className="label-xs text-neon_yellow mb-3">=== [ ARCHIVE :: PRIOR CHAINS ] ===</div>
+            <div className="flex items-center justify-between mb-3">
+              <div className="label-xs text-neon_yellow">=== [ ARCHIVE :: PRIOR CHAINS ] ===</div>
+              <div className="flex gap-1 text-[11px] font-mono">
+                <button
+                  data-testid="filter-all"
+                  onClick={() => setHistoryFilter("all")}
+                  className={`px-2 py-1 border ${historyFilter === "all"
+                    ? "border-phosphor bg-phosphor/15 text-phosphor neon-text"
+                    : "border-phosphor/40 text-phosphor2 hover:border-phosphor"}`}
+                >all</button>
+                <button
+                  data-testid="filter-verified"
+                  onClick={() => setHistoryFilter("verified")}
+                  className={`px-2 py-1 border ${historyFilter === "verified"
+                    ? "border-neon_yellow bg-neon_yellow/15 text-neon_yellow"
+                    : "border-phosphor/40 text-phosphor2 hover:border-neon_yellow"}`}
+                >✓ verified</button>
+              </div>
+            </div>
             <ul className="divide-y divide-phosphor/10 max-h-72 overflow-y-auto">
-              {chains.map((c) => (
+              {chains
+                .filter((c) => historyFilter === "all" || c.verified)
+                .map((c) => (
                 <li key={c.id}>
                   <button
                     data-testid={`history-chain-${c.id.slice(0, 8)}`}
@@ -142,10 +196,12 @@ function App() {
                   >
                     <div className="flex justify-between items-center gap-2">
                       <span className="text-phosphor truncate">
-                        chain://{c.id.slice(0, 12)} — {c.generations?.length || 0} gens
+                        {c.verified && <span className="text-neon_yellow">✓ </span>}
+                        chain://{c.id.slice(0, 12)}
+                        {c.target_prompt && <span className="text-phosphor2"> — {c.target_prompt.slice(0, 50)}</span>}
                       </span>
-                      <span className="text-phosphor3">
-                        {c.generations?.map((g) => g.name || "?").join(" → ").slice(0, 60)}
+                      <span className="text-phosphor3 shrink-0">
+                        {c.status === "failed" ? "▲ failed" : `${c.generations?.length || 0} gen`}
                       </span>
                     </div>
                   </button>

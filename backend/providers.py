@@ -274,9 +274,13 @@ DEFAULT_ASSIGNMENTS = {
 }
 
 
-def openai_client_for(provider: str):
-    """Return an AsyncOpenAI client bound to the named provider, or None if key missing."""
-    key = provider_key(provider)
+def openai_client_for(provider: str, api_key: Optional[str] = None):
+    """Return an AsyncOpenAI client bound to the named provider, or None if key missing.
+
+    If ``api_key`` is passed (BYOK from user settings) it's used verbatim; otherwise
+    the value falls back to the env var registered for the provider.
+    """
+    key = (api_key or "").strip() or provider_key(provider)
     if not key or provider not in PROVIDERS:
         return None
     try:

@@ -49,6 +49,10 @@ export const SettingsPanel = ({ sessionId, open, onClose, onSaved }) => {
         teacher: s.teacher,
         artist: s.artist,
         rater: s.rater,
+        keys: { openrouter: "", venice: "", nvidia: "" },
+        keys_set: s.keys_set || {},
+        github: { username: s.github?.username || "", token: "" },
+        github_token_set: !!s.github?.token_set,
       });
     } finally {
       setLoading(false);
@@ -81,7 +85,25 @@ export const SettingsPanel = ({ sessionId, open, onClose, onSaved }) => {
   const save = async () => {
     setSaving(true);
     try {
-      await axios.post(`${API}/settings`, settings, {
+      const payload = {
+        teacher: settings.teacher,
+        artist: settings.artist,
+        rater: settings.rater,
+      };
+      // Only send non-empty keys; empty string clears a saved key.
+      const outKeys = {};
+      ["openrouter", "venice", "nvidia"].forEach((p) => {
+        const v = settings.keys?.[p];
+        if (typeof v === "string" && v.length > 0) outKeys[p] = v;
+      });
+      if (Object.keys(outKeys).length) payload.keys = outKeys;
+      const gh = settings.github || {};
+      if (gh.username !== undefined || gh.token) {
+        payload.github = {};
+        if (gh.username !== undefined) payload.github.username = gh.username;
+        if (gh.token) payload.github.token = gh.token;
+      }
+      await axios.post(`${API}/settings`, payload, {
         params: { session_id: sessionId },
       });
       onSaved?.(settings);
@@ -268,6 +290,76 @@ export const SettingsPanel = ({ sessionId, open, onClose, onSaved }) => {
               );
             })}
           </ul>
+        </div>
+
+        {/* BYOK + GitHub */}
+        <div className="border-t border-phosphor/30 p-4 space-y-3 max-h-72 overflow-y-auto"
+             data-testid="keys-section">
+          <div className="label-xs text-neon_cyan neon-cyan">
+            [ YOUR KEYS :: BYOK ]
+          </div>
+          <p className="text-[10px] text-phosphor3 font-mono">
+            Paste your own OpenRouter / Venice / NVIDIA keys. If set, CapCode uses YOUR keys
+            for every LLM call — leave blank to keep using the server defaults.
+            Keys are stored per-device and never sent back to your browser once saved.
+          </p>
+          {["openrouter", "venice", "nvidia"].map((p) => (
+            <div key={p} className="flex items-center gap-2">
+              <label className="w-28 text-xs font-mono text-phosphor2 uppercase">
+                {p}
+                {settings.keys_set?.[p] && (
+                  <span className="ml-1 text-phosphor neon-text">✓</span>
+                )}
+              </label>
+              <input
+                data-testid={`key-input-${p}`}
+                type="password"
+                placeholder={settings.keys_set?.[p] ? "•••••••• (saved — retype to replace, empty to keep)" : "paste key"}
+                value={settings.keys?.[p] || ""}
+                onChange={(e) => setSettings((s) => ({
+                  ...s,
+                  keys: { ...(s.keys || {}), [p]: e.target.value },
+                }))}
+                className="flex-1 bg-black border border-phosphor/40 focus:border-neon_cyan text-phosphor px-2 py-1 font-mono text-xs outline-none"
+              />
+            </div>
+          ))}
+
+          <div className="pt-2 mt-2 border-t border-phosphor/20">
+            <div className="label-xs text-neon_cyan neon-cyan mb-2">
+              [ GITHUB :: PUSH TARGET ]
+            </div>
+            <p className="text-[10px] text-phosphor3 font-mono mb-2">
+              To use &ldquo;push to github&rdquo;, save your username + a PAT (fine-grained, scope: repo).
+            </p>
+            <div className="flex items-center gap-2 mb-2">
+              <label className="w-28 text-xs font-mono text-phosphor2 uppercase">username</label>
+              <input
+                data-testid="github-username"
+                value={settings.github?.username || ""}
+                onChange={(e) => setSettings((s) => ({
+                  ...s, github: { ...(s.github || {}), username: e.target.value },
+                }))}
+                placeholder="octocat"
+                className="flex-1 bg-black border border-phosphor/40 focus:border-neon_cyan text-phosphor px-2 py-1 font-mono text-xs outline-none"
+              />
+            </div>
+            <div className="flex items-center gap-2">
+              <label className="w-28 text-xs font-mono text-phosphor2 uppercase">
+                token {settings.github_token_set && <span className="text-phosphor neon-text">✓</span>}
+              </label>
+              <input
+                data-testid="github-token"
+                type="password"
+                placeholder={settings.github_token_set ? "•••••••• (saved)" : "ghp_..."}
+                value={settings.github?.token || ""}
+                onChange={(e) => setSettings((s) => ({
+                  ...s, github: { ...(s.github || {}), token: e.target.value },
+                }))}
+                className="flex-1 bg-black border border-phosphor/40 focus:border-neon_cyan text-phosphor px-2 py-1 font-mono text-xs outline-none"
+              />
+            </div>
+          </div>
         </div>
 
         {/* footer */}

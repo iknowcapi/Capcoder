@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { Download, FileCode, GitBranch } from "lucide-react";
+import { Download, FileCode, GitBranch, Github } from "lucide-react";
 import { API } from "@/lib/api";
 
 const Bar = ({ label, value, max = 4, color = "phosphor" }) => {
@@ -157,7 +157,12 @@ const GenerationCard = ({ gen, chainId }) => {
   );
 };
 
-export const ChainViewer = ({ chain, onVerify }) => {
+export const ChainViewer = ({ chain, onVerify, onPush, streamBuf }) => {
+  const [pushOpen, setPushOpen] = useState(false);
+  const [repoName, setRepoName] = useState("");
+  const [pushPrivate, setPushPrivate] = useState(true);
+  const [pushing, setPushing] = useState(false);
+
   if (!chain) {
     return (
       <section
@@ -176,6 +181,9 @@ export const ChainViewer = ({ chain, onVerify }) => {
 
   const downloadAll = `${API}/chains/${chain.id}/download`;
   const isComplete = chain.status === "complete";
+  const isRunning = chain.status === "running";
+  const buf = streamBuf || { teacher: "", artist: "" };
+  const showStream = isRunning && (buf.teacher.length + buf.artist.length > 0);
 
   return (
     <section className="space-y-4 sm:space-y-6" data-testid="chain-viewer">
@@ -240,8 +248,80 @@ export const ChainViewer = ({ chain, onVerify }) => {
               ✓ verified
             </span>
           )}
+          {isComplete && (
+            <button
+              data-testid="open-push"
+              onClick={() => setPushOpen((v) => !v)}
+              className="flex items-center gap-2 border border-neon_cyan/60 text-neon_cyan px-4 py-2 hover:bg-neon_cyan hover:text-black transition-colors label-xs"
+            >
+              <Github size={14} /> push to github
+            </button>
+          )}
         </div>
       </header>
+
+      {pushOpen && isComplete && (
+        <div className="panel p-4 space-y-3" data-testid="push-dialog"
+             style={{ borderColor: "rgba(0,255,255,0.4)" }}>
+          <div className="label-xs text-neon_cyan neon-cyan">[ PUSH :: NEW REPO ]</div>
+          <div className="flex flex-col sm:flex-row gap-2">
+            <input
+              data-testid="push-repo-name"
+              value={repoName}
+              onChange={(e) => setRepoName(e.target.value)}
+              placeholder="repo-name (e.g. my-cube)"
+              className="flex-1 bg-black border border-phosphor/40 focus:border-neon_cyan text-phosphor px-3 py-2 font-mono text-sm outline-none"
+            />
+            <label className="flex items-center gap-1 text-xs font-mono text-phosphor2">
+              <input
+                data-testid="push-private"
+                type="checkbox"
+                checked={pushPrivate}
+                onChange={(e) => setPushPrivate(e.target.checked)}
+              />
+              private
+            </label>
+            <button
+              data-testid="push-confirm"
+              disabled={pushing || !repoName.trim()}
+              onClick={async () => {
+                setPushing(true);
+                try {
+                  await onPush?.(chain.id, repoName.trim(), pushPrivate);
+                  setPushOpen(false);
+                } catch { /* toast handled upstream */ } finally { setPushing(false); }
+              }}
+              className="border-2 border-neon_cyan bg-neon_cyan/10 text-neon_cyan px-4 py-2 hover:bg-neon_cyan hover:text-black transition-colors label-xs disabled:opacity-40"
+            >
+              {pushing ? "pushing…" : "▶ push"}
+            </button>
+          </div>
+          <p className="text-[10px] text-phosphor3 font-mono">
+            requires your github username + a personal access token (scope:{" "}
+            <code className="text-neon_cyan">repo</code>) saved under model settings.
+          </p>
+        </div>
+      )}
+
+      {showStream && (
+        <div className="panel p-3 space-y-2" data-testid="stream-panel"
+             style={{ borderColor: "rgba(0,255,255,0.35)" }}>
+          {buf.teacher && (
+            <div>
+              <div className="label-xs text-neon_cyan neon-cyan mb-1">TEACHER (streaming)</div>
+              <pre className="text-[11px] font-mono text-phosphor2 whitespace-pre-wrap max-h-32 overflow-y-auto"
+                   data-testid="stream-teacher">{buf.teacher.slice(-1200)}</pre>
+            </div>
+          )}
+          {buf.artist && (
+            <div>
+              <div className="label-xs text-neon_magenta neon-magenta mb-1">ARTIST (streaming)</div>
+              <pre className="text-[11px] font-mono text-phosphor2 whitespace-pre-wrap max-h-40 overflow-y-auto"
+                   data-testid="stream-artist">{buf.artist.slice(-1600)}</pre>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* lineage breadcrumb */}
       <div
