@@ -29,6 +29,7 @@ function App() {
   const [stage, setStage] = useState(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [assignments, setAssignments] = useState(null);
+  const [historyFilter, setHistoryFilter] = useState("all"); // "all" | "verified"
 
   const refresh = useCallback(async () => {
     try {
