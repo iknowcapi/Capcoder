@@ -112,6 +112,9 @@ export const SettingsPanel = ({ sessionId, open, onClose, onSaved }) => {
             <div className="font-bbs text-2xl text-phosphor neon-text uppercase tracking-widest mt-1">
               choose your agents
             </div>
+            <div className="label-xs text-phosphor3 mt-1">
+              saved per device — this browser only
+            </div>
           </div>
           <button
             data-testid="settings-close"

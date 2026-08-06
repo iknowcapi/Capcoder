@@ -52,10 +52,10 @@ export const TerminalHero = ({ status }) => {
         </div>
 
         <div className="font-mono text-sm sm:text-base text-phosphor2 max-w-3xl mt-2">
-          <span className="text-phosphor neon-text">capcode</span> — an application that
-          builds no-code code-builders. push <span className="text-neon_cyan">one button</span>{" "}
-          — no prompt, no input from you. NVIDIA / OpenRouter / Venice hand off gen to gen.
-          you download the whole chain&apos;s working code in one folder.
+          <span className="text-phosphor neon-text">capcode</span> — you type what you want built.
+          the <span className="text-neon_cyan">Teacher bot</span> writes the brief, the{" "}
+          <span className="text-neon_magenta">Artist bot</span> designs the product, and the code is
+          materialized, executed, and delivered as a downloadable folder. no further human input.
         </div>
 
         <div className="flex flex-wrap gap-2 sm:gap-4 text-[10px] sm:text-xs label-xs mt-2">
