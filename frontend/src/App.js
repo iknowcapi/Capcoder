@@ -58,7 +58,10 @@ function App() {
             const done = c.generations?.length || 0;
             setStage(done > 0 ? "rating…" : "teacher → artist…");
             if (c.status === "complete") { clearInterval(pollId); resolve(); }
-            else if (c.status === "failed") { clearInterval(pollId); reject(new Error("build failed")); }
+            else if (c.status === "failed") {
+              clearInterval(pollId);
+              reject(new Error(c.error || "build failed"));
+            }
           } catch (e) { clearInterval(pollId); reject(e); }
         }, 3000);
       });

@@ -181,19 +181,31 @@ export const ChainViewer = ({ chain, onVerify }) => {
     <section className="space-y-4 sm:space-y-6" data-testid="chain-viewer">
       <header
         className="panel p-4 sm:p-5 flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3"
-        style={{ borderColor: "rgba(255,0,255,0.5)" }}
+        style={{ borderColor: chain.status === "failed" ? "rgba(255,68,68,0.5)" : "rgba(255,0,255,0.5)" }}
       >
         <div className="min-w-0 flex-1">
           <div className="label-xs text-neon_magenta neon-magenta">
             [ CHAIN :: {chain.id.slice(0, 12)} ]
           </div>
           <div className="font-bbs text-2xl sm:text-3xl text-phosphor neon-text uppercase tracking-widest leading-none mt-1">
-            {chain.verified ? "✓ verified build" : "product build"}
+            {chain.status === "failed"
+              ? "▲ build failed"
+              : chain.verified
+                ? "✓ verified build"
+                : chain.status === "running"
+                  ? "…building"
+                  : "product build"}
           </div>
           {chain.target_prompt && (
             <p className="text-xs sm:text-sm text-phosphor2 mt-2 font-mono">
               <span className="text-phosphor3">target ::</span>{" "}
               <span data-testid="chain-target">{chain.target_prompt}</span>
+            </p>
+          )}
+          {chain.status === "failed" && chain.error && (
+            <p className="text-xs sm:text-sm mt-2 font-mono border-l-2 border-red-500 pl-3 py-1 bg-red-500/10"
+               style={{ color: "#ff6b6b" }} data-testid="chain-error">
+              <span className="text-red-400">error ::</span> {chain.error}
             </p>
           )}
           <p className="text-xs text-phosphor3 mt-1 font-mono">

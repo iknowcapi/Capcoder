@@ -317,12 +317,16 @@ async def evolve(req: EvolveRequest, background_tasks: BackgroundTasks):
             roles = ("teacher", "artist", "rater")
             assignments = {r: s[r] for r in roles if s.get(r)}
 
-    # gather top-verified prior chains as exemplars for the Teacher
+    # gather top-verified prior chains as exemplars for the Teacher (brief)
+    # AND for the Artist (real file structures) — this is the recursive loop.
     exemplar_docs = await db.chains.find(
         {"verified": True},
-        {"_id": 0, "target_prompt": 1, "generations.name": 1, "generations.teacher_spec": 1},
-    ).sort("verified_at", -1).limit(3).to_list(3)
+        {"_id": 0, "target_prompt": 1, "generations.name": 1,
+         "generations.teacher_spec": 1, "generations.files": 1,
+         "generations.stack": 1, "generations.composite_score": 1},
+    ).sort("verified_at", -1).limit(5).to_list(5)
     exemplars = []
+    exemplar_files = []
     for d in exemplar_docs:
         g = (d.get("generations") or [{}])[0]
         ts = g.get("teacher_spec") or {}
@@ -331,6 +335,14 @@ async def evolve(req: EvolveRequest, background_tasks: BackgroundTasks):
             "name": g.get("name", ""),
             "artist_brief": ts.get("artist_brief", ""),
         })
+        if g.get("files"):
+            exemplar_files.append({
+                "target": d.get("target_prompt", ""),
+                "name": g.get("name", ""),
+                "stack": g.get("stack", ""),
+                "files": g.get("files", []),
+                "score": g.get("composite_score", 0),
+            })
 
     import uuid as _uuid
     chain_id = str(_uuid.uuid4())
@@ -368,12 +380,27 @@ async def evolve(req: EvolveRequest, background_tasks: BackgroundTasks):
             await chain_generator.evolve_chain_with_callback(
                 chain_id, target, on_gen, on_done,
                 assignments=assignments, exemplars=exemplars,
+                exemplar_files=exemplar_files,
+            )
+        except chain_generator.ArtistFailedError as exc:
+            logger.warning("chain %s: artist failed — %s", chain_id, exc)
+            await db.chains.update_one(
+                {"id": chain_id},
+                {"$set": {
+                    "status": "failed",
+                    "error": str(exc),
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                }},
             )
         except Exception as exc:
             logger.exception("chain %s failed: %s", chain_id, exc)
             await db.chains.update_one(
                 {"id": chain_id},
-                {"$set": {"status": "failed", "error": str(exc)}},
+                {"$set": {
+                    "status": "failed",
+                    "error": str(exc),
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                }},
             )
 
     background_tasks.add_task(_runner)

@@ -69,9 +69,128 @@ async def _chat(model: str, messages: list[dict], provider: str = "nvidia",
         return None
 
 
+def _repair_truncated_json(raw: str, start: int) -> str | None:
+    """When a model hits max_tokens mid-JSON, close the open string/braces so
+    the partial output still parses. Returns a repaired candidate or None."""
+    depth = 0
+    in_str = False
+    esc = False
+    last_complete_end = -1
+    for i in range(start, len(raw)):
+        c = raw[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        else:
+            if c == '"':
+                in_str = True
+            elif c == "{" or c == "[":
+                depth += 1
+            elif c == "}" or c == "]":
+                depth -= 1
+                if depth == 0:
+                    last_complete_end = i + 1
+    if last_complete_end > 0 and last_complete_end == len(raw):
+        return None  # complete, no repair needed
+    # Truncated. Close the open string (if any) then close remaining braces/brackets.
+    # Track brace/bracket types to close them in reverse order.
+    stack: list[str] = []
+    in_str = False
+    esc = False
+    for i in range(start, len(raw)):
+        c = raw[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        else:
+            if c == '"':
+                in_str = True
+            elif c == "{":
+                stack.append("}")
+            elif c == "[":
+                stack.append("]")
+            elif c == "}" or c == "]":
+                if stack:
+                    stack.pop()
+    if not stack and not in_str:
+        return None
+    tail = raw[start:]
+    # Drop a trailing partial token like `"conten` or `"content": "hello wo` — cut at
+    # the last comma or opening-brace so we don't leave a dangling field.
+    # Strategy: if we're inside a string, close it. Then remove any dangling
+    # `"key":` or trailing comma at end.
+    if in_str:
+        # find the position of the opening quote of the unfinished string
+        # so we can drop the whole partial field to keep JSON valid.
+        depth2 = 0
+        in_s2 = False
+        esc2 = False
+        last_boundary = -1  # position of last comma or `{` or `[` at depth root
+        open_quote_pos = -1
+        for j in range(len(tail)):
+            c = tail[j]
+            if in_s2:
+                if esc2:
+                    esc2 = False
+                elif c == "\\":
+                    esc2 = True
+                elif c == '"':
+                    in_s2 = False
+            else:
+                if c == '"':
+                    in_s2 = True
+                    if j > 0:
+                        open_quote_pos = j
+                elif c in ("{", "[", ","):
+                    last_boundary = j
+                elif c in ("}", "]"):
+                    pass
+        # Prefer cutting at the last boundary before the unclosed string.
+        cut = last_boundary if 0 <= last_boundary < open_quote_pos else open_quote_pos
+        if cut > 0:
+            tail = tail[:cut]
+    # strip trailing dangling `"key":` or `,` or whitespace
+    tail = re.sub(r"[\s,]*\"?[A-Za-z_][A-Za-z0-9_]*\"?\s*:\s*$", "", tail)
+    tail = re.sub(r"[\s,]+$", "", tail)
+    # Recompute what still needs closing.
+    stack = []
+    in_str = False
+    esc = False
+    for c in tail:
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        else:
+            if c == '"':
+                in_str = True
+            elif c == "{":
+                stack.append("}")
+            elif c == "[":
+                stack.append("]")
+            elif c in ("}", "]") and stack:
+                stack.pop()
+    if in_str:
+        tail += '"'
+    tail += "".join(reversed(stack))
+    return tail
+
+
 def _extract_json(raw: str) -> dict:
     """Extract the first top-level JSON object from a model response.
-    Tracks string state so braces inside string literals don't fool the parser."""
+    Tracks string state so braces inside string literals don't fool the parser.
+    Also attempts repair on truncated (max_tokens hit) responses."""
     raw = (raw or "").strip()
     if not raw:
         return {}
@@ -107,12 +226,15 @@ def _extract_json(raw: str) -> dict:
                         break
         if end > 0:
             candidates.append(raw[start:end])
+        # ALSO try repairing truncated JSON
+        repaired = _repair_truncated_json(raw, start)
+        if repaired:
+            candidates.append(repaired)
     for cand in candidates:
         try:
             return json.loads(cand, strict=False)
         except Exception:
             try:
-                # trailing-comma tolerant
                 return json.loads(re.sub(r",\s*([}\]])", r"\1", cand), strict=False)
             except Exception:
                 continue
@@ -214,21 +336,52 @@ async def teacher_step(target: str, exemplars: list[dict], assignment: Optional[
     return parsed
 
 
-async def artist_step(teacher_spec: dict, assignment: Optional[dict] = None) -> dict:
+class ArtistFailedError(Exception):
+    """Raised when the Artist cannot produce a real file set after retries."""
+
+
+async def artist_step(teacher_spec: dict, exemplar_files: Optional[list[dict]] = None,
+                      assignment: Optional[dict] = None) -> dict:
     parsed: dict = {}
     raw = ""
-    for attempt in range(2):
+    exemplar_block = ""
+    if exemplar_files:
+        parts = []
+        for i, ex in enumerate(exemplar_files[:2], 1):
+            paths = ", ".join(f["path"] for f in ex.get("files", [])[:6])
+            first_file = (ex.get("files") or [{}])[0]
+            snippet = (first_file.get("content", "") or "")[:600]
+            parts.append(
+                f"### Verified exemplar {i} — target: {ex.get('target','?')}\n"
+                f"file layout: {paths}\n"
+                f"first-file snippet ({first_file.get('path','?')}):\n"
+                f"{snippet}"
+            )
+        exemplar_block = "\n\n".join(parts)
+
+    for attempt in range(3):
         directive = ("Write the source files as strict JSON. Include the FULL content of every "
                      "file — no ellipsis, no TODOs.")
         if attempt == 1:
-            directive += (" KEEP IT MINIMAL — target 3-4 files, ≤180 lines each. Your last "
-                          "response was truncated; be terser this time.")
+            directive += (" Your last response was truncated — be TERSER. 3-4 files max, ≤150 lines each."
+                          " Prioritize a working minimum over completeness.")
+        if attempt == 2:
+            directive += (" Third attempt. Output the tiniest possible working version — one main file,"
+                          " ≤120 lines, plus run.sh. Skip README, skip niceties.")
+        user_msg = f"TEACHER SPEC:\n{json.dumps(teacher_spec, indent=2)}\n\n"
+        if exemplar_block:
+            user_msg += (
+                "PRIOR VERIFIED WORKING BUILDS FOR SIMILAR TARGETS (learn from these file structures):\n"
+                f"{exemplar_block}\n\n"
+            )
+        user_msg += directive
         raw = await _call_role(
             "artist",
             [{"role": "system", "content": SYSTEM_ARTIST},
-             {"role": "user", "content":
-                 f"TEACHER SPEC:\n{json.dumps(teacher_spec, indent=2)}\n\n{directive}"}],
-            assignment, temperature=0.7 if attempt == 0 else 0.4, max_tokens=12000,
+             {"role": "user", "content": user_msg}],
+            assignment,
+            temperature=(0.7, 0.4, 0.2)[attempt],
+            max_tokens=(12000, 8000, 4000)[attempt],
         )
         parsed = _extract_json(raw or "") or {}
         logger.info("ARTIST attempt=%d raw_len=%d keys=%s files=%d",
@@ -238,9 +391,17 @@ async def artist_step(teacher_spec: dict, assignment: Optional[dict] = None) -> 
             break
         if not parsed:
             try:
-                Path("/tmp/artist_raw.txt").write_text(raw or "")
+                Path(f"/tmp/artist_raw_attempt{attempt}.txt").write_text(raw or "")
             except Exception:
                 pass
+
+    if not parsed.get("files"):
+        raise ArtistFailedError(
+            f"Artist produced no usable files after 3 attempts. "
+            f"Last response was {len(raw or '')} chars — likely truncated or "
+            f"model refused. Try a shorter target prompt or a different Artist model."
+        )
+
     # ensure required fields exist
     parsed.setdefault("name", f"Product-{teacher_spec.get('target','app')[:20]}")
     parsed.setdefault("tagline", "an app built by CapCode")
@@ -344,9 +505,11 @@ async def evolve_chain_with_callback(
     on_done,
     assignments: Optional[dict] = None,
     exemplars: Optional[list[dict]] = None,
+    exemplar_files: Optional[list[dict]] = None,
 ) -> dict:
     """One chain = one product build:
        Human target -> Teacher spec -> Artist product -> Executor (+ 1 correction) -> Rater.
+    Raises ArtistFailedError if the Artist can't produce real files after retries.
     """
     a = dict(_providers.DEFAULT_ASSIGNMENTS)
     for role in ("teacher", "artist", "rater"):
@@ -359,8 +522,9 @@ async def evolve_chain_with_callback(
     # 1) TEACHER
     teacher_spec = await teacher_step(target_prompt, exemplars, assignment=a["teacher"])
 
-    # 2) ARTIST
-    artist_spec = await artist_step(teacher_spec, assignment=a["artist"])
+    # 2) ARTIST — writes the real source files. Raises if all attempts truncate.
+    artist_spec = await artist_step(teacher_spec, exemplar_files=exemplar_files,
+                                    assignment=a["artist"])
 
     # 3) BUILD PRODUCT (deterministic template render, driven by artist_spec + teacher.stack)
     product = dict(artist_spec)

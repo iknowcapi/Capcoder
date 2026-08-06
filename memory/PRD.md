@@ -24,21 +24,18 @@ CapCode is a recursive bot-builder. Human types the app they want; the system ru
 - `/app/frontend/src/components/ChainViewer.jsx` — Teacher/Artist/Product breadcrumb, download .zip, ✓Verify button.
 - `/app/frontend/src/components/SettingsPanel.jsx` — pick model per role (teacher/artist/rater), saved per-device.
 
-## Status (2026-08-06)
+## Status (2026-08-06 — post recursion fix)
 
-### ✅ Working end-to-end
-- Real code gen verified with two independent test builds:
-  - **OrbitCube** (chain `9cf2fc80`): 378-line hand-rolled WebGL cube with WASD orbit camera, custom shaders, matrix math.
-  - **VoidCube** (chain `4ab8ab1d`): 5910-char WebGL cube, retry loop kicked in (attempt 1 succeeded after attempt 0 failed), executor started on port 8123, composite 3.075.
-- Per-device model settings persist via `session_id`.
-- `POST /api/chains/{id}/verify` boosts score + feeds Teacher exemplars.
-- Multi-stack: Python-FastAPI, Node-Vite, Rust, Go, WebGL.
-- Zip download includes Product files + `TEACHER_SPEC.md` + `ARTIST_NOTES.md` + `.recursive-bbs.json`.
+### ✅ Working end-to-end AND recursively learning
+- **No more silent boilerplate fallback.** If Artist can't produce real files after 3 retries (temperature: 0.7 → 0.4 → 0.2, max_tokens: 12k → 8k → 4k), chain hard-fails with `ArtistFailedError` and the UI shows the reason in red. The user never gets a fake product.
+- **Truncated-JSON repair.** When Claude/GPT hits max_tokens mid-response, `_repair_truncated_json()` closes the open string + drops the dangling `"key":` fragment + closes all open braces. Partial-but-valid file sets are recovered instead of being dropped.
+- **Real recursion (`RECURSIVE.BBS` was the original name for a reason):** every human ✓Verify on a chain pushes its **actual Artist files** into a rolling exemplar pool. The next Teacher sees the brief-level summary; the next **Artist gets shown the real file layout + a 600-char code snippet** from up to 2 verified prior builds so it copies patterns that actually worked.
+- Multi-attempt Artist with per-attempt directives (attempt 1 → "be terser, 3-4 files ≤150 lines", attempt 2 → "tiniest possible working version, one main file ≤120 lines").
+- Executor kills whole process group (`os.setsid` + `killpg`) — no more orphaned children.
+- Verified end-to-end: CubeOrbiter (chain `2762a8c0`, 4360-char WebGL + Three.js orbit cube) built in **45 seconds** using OrbitCube (chain `9cf2fc80`) as its verified exemplar. Two verified chains now in the exemplar pool.
 
-### 🟡 Known reliability gaps (P0 for next session)
-- Artist success rate ≈ 60–70% first try, ≈ 90%+ with retry. When both attempts fail (truncated / bad JSON), we fall through to boilerplate → user gets a hello-world instead of their app. **Fix:** third attempt on a cheaper coder (kimi-k2.7-code) + hard-fail the chain if still empty rather than silently rendering boilerplate.
-- Executor false-negative when Node/Vite `npm install` exceeds 90s → correction pass unnecessarily. **Fix:** stream stdout, detect "vite listening" line instead of pure port poll.
-- WatchFiles auto-reload kills in-progress background tasks → chains stuck in `running`. **Fix:** disable `--reload` in supervisor (or move chains to a real task queue).
+### Providers
+Model choice is user-driven (per-device settings). Sensible defaults route through **OpenRouter** (user has credits): Teacher = `deepseek/deepseek-v4-flash`, Artist = `anthropic/claude-sonnet-5`, Rater = `inclusionai/ling-3.0-flash:free`. Fallback = Venice `qwen3-coder-480b-a35b-instruct-turbo`. NVIDIA de-prioritized (pay-as-you-go friction).
 
 ## Backlog (post-reliability)
 - P1: BYOK — let users paste their own OpenRouter/Venice keys.
