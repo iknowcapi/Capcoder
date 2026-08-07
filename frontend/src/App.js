@@ -1,12 +1,13 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import "@/App.css";
 import { Toaster, toast } from "sonner";
-import { Settings } from "lucide-react";
+import { LogIn, LogOut, Settings } from "lucide-react";
 import { api, API } from "@/lib/api";
 import { TerminalHero } from "@/components/TerminalHero";
 import { EvolveButton } from "@/components/EvolveButton";
 import { ChainViewer } from "@/components/ChainViewer";
 import { SettingsPanel } from "@/components/SettingsPanel";
+import { AuthCallback } from "@/components/AuthCallback";
 
 function getSessionId() {
   const KEY = "capcode.session_id";
@@ -21,6 +22,14 @@ function getSessionId() {
 }
 
 function App() {
+  // If the URL fragment contains session_id=, render AuthCallback first — this
+  // handshake must complete BEFORE anything hits /auth/me. We check
+  // window.location.hash synchronously at initial render (not in useEffect)
+  // to avoid a race with the /auth/me call below.
+  const [needAuthCallback, setNeedAuthCallback] = useState(
+    typeof window !== "undefined" && (window.location.hash || "").includes("session_id=")
+  );
+
   const [sessionId] = useState(getSessionId);
   const [status, setStatus] = useState(null);
   const [chains, setChains] = useState([]);
@@ -32,6 +41,39 @@ function App() {
   const [historyFilter, setHistoryFilter] = useState("all"); // "all" | "verified"
   const [streamBuf, setStreamBuf] = useState({ teacher: "", artist: "" });
   const esRef = useRef(null);
+  const [user, setUser] = useState(null);          // logged-in AuthUser or null
+  const [checkingAuth, setCheckingAuth] = useState(!needAuthCallback);
+
+  // Check for an existing session cookie on load — but skip if we're about to
+  // process an auth callback (that path will populate user itself).
+  useEffect(() => {
+    if (needAuthCallback) return;
+    let alive = true;
+    (async () => {
+      try {
+        const me = await api.authMe();
+        if (alive) setUser(me);
+      } catch (_) {
+        if (alive) setUser(null);
+      } finally {
+        if (alive) setCheckingAuth(false);
+      }
+    })();
+    return () => { alive = false; };
+  }, [needAuthCallback]);
+
+  const handleSignIn = () => {
+    // REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
+    const redirectUrl = window.location.origin + "/";
+    window.location.href =
+      `https://auth.emergentagent.com/?redirect=${encodeURIComponent(redirectUrl)}`;
+  };
+
+  const handleSignOut = async () => {
+    try { await api.authLogout(); } catch (_) { /* noop */ }
+    setUser(null);
+    toast.success("SIGNED OUT");
+  };
 
   const refresh = useCallback(async () => {
     try {
@@ -123,6 +165,18 @@ function App() {
     }
   };
 
+  if (needAuthCallback) {
+    return (
+      <AuthCallback
+        onDone={(u) => {
+          setUser(u);
+          setNeedAuthCallback(false);
+          toast.success(`WELCOME ${u.name || u.email}`);
+        }}
+      />
+    );
+  }
+
   return (
     <div className="App relative crt-scanlines crt-vignette grain" data-testid="app-root">
       <div className="scan-drift" aria-hidden />
@@ -139,6 +193,34 @@ function App() {
         <TerminalHero status={status} />
 
         <div className="flex items-center justify-end gap-2">
+          {user ? (
+            <div className="flex items-center gap-2" data-testid="auth-user">
+              {user.picture && (
+                <img src={user.picture} alt={user.name}
+                     className="w-6 h-6 rounded-full border border-phosphor/40" />
+              )}
+              <span className="text-xs font-mono text-phosphor2 hidden sm:inline">
+                {user.name || user.email}
+              </span>
+              <button
+                data-testid="sign-out"
+                onClick={handleSignOut}
+                className="flex items-center gap-2 border border-phosphor/40 text-phosphor2 px-3 py-2 hover:bg-phosphor/10 transition-colors label-xs"
+              >
+                <LogOut size={14} /> sign out
+              </button>
+            </div>
+          ) : (
+            !checkingAuth && (
+              <button
+                data-testid="sign-in"
+                onClick={handleSignIn}
+                className="flex items-center gap-2 border border-neon_cyan/60 text-neon_cyan px-3 py-2 hover:bg-neon_cyan hover:text-black transition-colors label-xs neon-cyan"
+              >
+                <LogIn size={14} /> sign in with google
+              </button>
+            )
+          )}
           <button
             data-testid="open-settings"
             onClick={() => setSettingsOpen(true)}
