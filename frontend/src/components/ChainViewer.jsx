@@ -28,7 +28,8 @@ const GenerationCard = ({ gen, chainId }) => {
   const files = gen.files || [];
   const selected = files.find((f) => f.path === openFile) || files[0];
   const r = gen.reward || {};
-  const downloadHref = `${API}/chains/${chainId}/download/${gen.gen}`;
+  const _anonSid = (typeof window !== "undefined" && localStorage.getItem("capcode.session_id")) || "";
+  const downloadHref = `${API}/chains/${chainId}/download/${gen.gen}?session_id=${encodeURIComponent(_anonSid)}`;
 
   return (
     <article
@@ -179,7 +180,8 @@ export const ChainViewer = ({ chain, onVerify, onPush, streamBuf }) => {
     );
   }
 
-  const downloadAll = `${API}/chains/${chain.id}/download`;
+  const anonSid = (typeof window !== "undefined" && localStorage.getItem("capcode.session_id")) || "";
+  const downloadAll = `${API}/chains/${chain.id}/download?session_id=${encodeURIComponent(anonSid)}`;
   const isComplete = chain.status === "complete";
   const isRunning = chain.status === "running";
   const buf = streamBuf || { teacher: "", artist: "" };

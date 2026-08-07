@@ -266,11 +266,11 @@ DEFAULT_ASSIGNMENTS = {
     # by default because pay-as-you-go is unreliable.
     "teacher": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash"},
     "artist":  {"provider": "openrouter", "model": "anthropic/claude-sonnet-5"},
-    "rater":   {"provider": "openrouter", "model": "inclusionai/ling-3.0-flash:free"},
-    # Fallbacks route through Venice, then OpenRouter free.
+    "rater":   {"provider": "openrouter", "model": "openai/gpt-3.5-turbo"},
+    # Fallbacks route through Venice, then OpenRouter.
     "teacher_fallback": {"provider": "venice",     "model": "qwen3-coder-480b-a35b-instruct-turbo"},
     "artist_fallback":  {"provider": "venice",     "model": "qwen3-coder-480b-a35b-instruct-turbo"},
-    "rater_fallback":   {"provider": "openrouter", "model": "openai/gpt-oss-20b:free"},
+    "rater_fallback":   {"provider": "openrouter", "model": "openai/gpt-4o-mini"},
 }
 
 

@@ -97,7 +97,9 @@ function App() {
       setChain(stub);
       // Open SSE stream so we can render Teacher/Artist tokens live.
       try { esRef.current && esRef.current.close(); } catch { /* noop */ }
-      const es = new EventSource(`${API}/chains/${stub.id}/stream`);
+      const anonSid = (typeof window !== "undefined" && localStorage.getItem("capcode.session_id")) || "";
+      const streamUrl = `${API}/chains/${stub.id}/stream?session_id=${encodeURIComponent(anonSid)}`;
+      const es = new EventSource(streamUrl, { withCredentials: true });
       esRef.current = es;
       es.addEventListener("teacher_delta", (ev) => {
         setStreamBuf((b) => ({ ...b, teacher: b.teacher + ev.data + (ev.data.endsWith(" ") ? "" : "") }));

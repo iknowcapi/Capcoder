@@ -17,6 +17,8 @@ BASE_URL = (os.environ.get("REACT_APP_BACKEND_URL")
             or frontend_env["REACT_APP_BACKEND_URL"]).rstrip("/")
 
 TARGET = "a simple webgl page that draws a black background with a red rotating cube"
+SESSION = "regression-test"
+HDRS = {"X-Capcode-Session": SESSION}
 
 _state = {}
 
@@ -24,7 +26,7 @@ _state = {}
 def _sse_collect(chain_id, seconds, out):
     proc = subprocess.Popen(
         ["curl", "-sN", "-H", "Accept: text/event-stream",
-         f"{BASE_URL}/api/chains/{chain_id}/stream"],
+         f"{BASE_URL}/api/chains/{chain_id}/stream?session_id={SESSION}"],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     deadline = time.time() + seconds
     try:
@@ -39,8 +41,8 @@ def _sse_collect(chain_id, seconds, out):
 class TestEndToEndBuild:
     def test_start_build(self):
         r = requests.post(f"{BASE_URL}/api/evolve",
-                          json={"target_prompt": TARGET, "session_id": "regression-test"},
-                          timeout=60)
+                          json={"target_prompt": TARGET, "session_id": SESSION},
+                          headers=HDRS, timeout=60)
         assert r.status_code == 200, r.text
         d = r.json()
         assert d["status"] == "running"
@@ -74,7 +76,7 @@ class TestEndToEndBuild:
         deadline = time.time() + 240
         doc = None
         while time.time() < deadline:
-            r = requests.get(f"{BASE_URL}/api/chains/{cid}", timeout=30)
+            r = requests.get(f"{BASE_URL}/api/chains/{cid}", headers=HDRS, timeout=30)
             assert r.status_code == 200, r.text
             doc = r.json()
             if doc["status"] in ("complete", "failed"):
@@ -111,6 +113,6 @@ class TestEndToEndBuild:
         cid = _state.get("complete_chain")
         if not cid:
             pytest.skip("no completed chain")
-        r = requests.get(f"{BASE_URL}/api/chains/{cid}/download", timeout=60)
+        r = requests.get(f"{BASE_URL}/api/chains/{cid}/download", headers=HDRS, timeout=60)
         assert r.status_code == 200, r.text
         assert r.content[:2] == b"PK", "not a zip"

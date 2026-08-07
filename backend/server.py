@@ -476,8 +476,43 @@ async def _load_user_keys(session_id: Optional[str]) -> dict:
     return (doc or {}).get("keys") or {}
 
 
+# ---------------------------------------------------------------------------
+# Ownership — every chain is owned by either a signed-in user (`user_id`) or
+# an anonymous browser (`anon_session_id`). All read/write endpoints filter
+# by the caller's identity so nobody sees anyone else's prompts.
+# ---------------------------------------------------------------------------
+async def _owner_from_request(request: Request) -> dict:
+    """Return {user_id, anon} identifying the caller. `anon` comes from the
+    `X-Capcode-Session` header (set by the frontend axios interceptor) or a
+    `session_id` query param. `user_id` comes from the auth cookie/bearer."""
+    user = await get_current_user(request)
+    anon = (request.headers.get("x-capcode-session")
+            or request.query_params.get("session_id")
+            or "").strip() or None
+    return {"user_id": (user.user_id if user else None), "anon": anon}
+
+
+def _owner_filter(owner: dict) -> dict:
+    """Mongo query fragment restricting docs to this caller."""
+    if owner.get("user_id"):
+        return {"user_id": owner["user_id"]}
+    if owner.get("anon"):
+        return {"anon_session_id": owner["anon"]}
+    # No identity at all -> match nothing.
+    return {"_id": "__no_owner__"}
+
+
+def _stamp_owner(doc: dict, owner: dict) -> dict:
+    doc = {**doc}
+    if owner.get("user_id"):
+        doc["user_id"] = owner["user_id"]
+    if owner.get("anon"):
+        doc["anon_session_id"] = owner["anon"]
+    return doc
+
+
 @api.post("/evolve", response_model=Chain)
-async def evolve(req: EvolveRequest, background_tasks: BackgroundTasks):
+async def evolve(req: EvolveRequest, background_tasks: BackgroundTasks, request: Request):
     """Human types a target. Teacher -> Artist -> Product -> Rater runs in background.
     Returns the chain stub immediately; poll GET /api/chains/{id} until status == 'complete'."""
     if not chain_generator.ENABLED:
@@ -486,6 +521,15 @@ async def evolve(req: EvolveRequest, background_tasks: BackgroundTasks):
     target = (req.target_prompt or "").strip()
     if not target:
         raise HTTPException(400, "target_prompt is required — tell CapCode what app to build.")
+
+    # Identify the caller — signed-in user_id OR anonymous session id from
+    # the X-Capcode-Session header (fallback: the legacy `session_id` field).
+    owner = await _owner_from_request(request)
+    if not owner.get("user_id") and not owner.get("anon"):
+        # Fall back to the body-level session_id so old clients keep working.
+        owner["anon"] = (req.session_id or "").strip() or None
+    if not owner.get("user_id") and not owner.get("anon"):
+        raise HTTPException(400, "no session identity — sign in or send X-Capcode-Session header")
 
     # resolve assignments from saved settings (or defaults)
     assignments = None
@@ -524,7 +568,7 @@ async def evolve(req: EvolveRequest, background_tasks: BackgroundTasks):
 
     import uuid as _uuid
     chain_id = str(_uuid.uuid4())
-    stub = {
+    stub = _stamp_owner({
         "id": chain_id,
         "target_prompt": target,
         "depth": 1,
@@ -534,7 +578,7 @@ async def evolve(req: EvolveRequest, background_tasks: BackgroundTasks):
         "generations": [],
         "created_at": datetime.now(timezone.utc).isoformat(),
         "completed_at": None,
-    }
+    }, owner)
     await db.chains.insert_one({**stub})
 
     async def on_gen(cid: str, gen: dict, fallback: bool):
@@ -589,11 +633,13 @@ async def evolve(req: EvolveRequest, background_tasks: BackgroundTasks):
 
 
 @api.get("/chains", response_model=List[Chain])
-async def list_chains(limit: int = 30):
+async def list_chains(request: Request, limit: int = 30):
+    owner = await _owner_from_request(request)
+    query = _owner_filter(owner)
     # exclude heavy file payloads in list view
     docs = (
         await db.chains.find(
-            {},
+            query,
             {
                 "_id": 0,
                 "generations.files": 0,
@@ -614,8 +660,10 @@ async def list_chains(limit: int = 30):
 
 
 @api.get("/chains/{chain_id}", response_model=Chain)
-async def get_chain(chain_id: str):
-    doc = await db.chains.find_one({"id": chain_id}, {"_id": 0})
+async def get_chain(chain_id: str, request: Request):
+    owner = await _owner_from_request(request)
+    q = {"id": chain_id, **_owner_filter(owner)}
+    doc = await db.chains.find_one(q, {"_id": 0})
     if not doc:
         raise HTTPException(404, "chain not found")
     for field in ("created_at", "completed_at"):
@@ -625,8 +673,10 @@ async def get_chain(chain_id: str):
 
 
 @api.get("/chains/{chain_id}/download")
-async def download_chain(chain_id: str):
-    doc = await db.chains.find_one({"id": chain_id}, {"_id": 0})
+async def download_chain(chain_id: str, request: Request):
+    owner = await _owner_from_request(request)
+    q = {"id": chain_id, **_owner_filter(owner)}
+    doc = await db.chains.find_one(q, {"_id": 0})
     if not doc:
         raise HTTPException(404, "chain not found")
     if doc.get("status") != "complete":
@@ -640,8 +690,10 @@ async def download_chain(chain_id: str):
 
 
 @api.get("/chains/{chain_id}/download/{gen}")
-async def download_gen(chain_id: str, gen: int):
-    doc = await db.chains.find_one({"id": chain_id}, {"_id": 0})
+async def download_gen(chain_id: str, gen: int, request: Request):
+    owner = await _owner_from_request(request)
+    q = {"id": chain_id, **_owner_filter(owner)}
+    doc = await db.chains.find_one(q, {"_id": 0})
     if not doc:
         raise HTTPException(404, "chain not found")
     buf, fname = _build_zip(doc, single_gen=gen)
@@ -696,10 +748,12 @@ async def open_in_vscode(chain_id: str, gen: int):
 
 
 @api.post("/chains/{chain_id}/verify")
-async def verify_chain(chain_id: str):
+async def verify_chain(chain_id: str, request: Request):
     """Human marks a completed chain as 'works'. Boosts its composite_score so
     it is more likely to be shown as a Teacher exemplar for future builds."""
-    doc = await db.chains.find_one({"id": chain_id}, {"_id": 0})
+    owner = await _owner_from_request(request)
+    q = {"id": chain_id, **_owner_filter(owner)}
+    doc = await db.chains.find_one(q, {"_id": 0})
     if not doc:
         raise HTTPException(404, "chain not found")
     if doc.get("status") != "complete":
@@ -721,18 +775,23 @@ async def verify_chain(chain_id: str):
 
 
 @api.get("/chains/{chain_id}/stream")
-async def stream_chain(chain_id: str):
+async def stream_chain(chain_id: str, request: Request):
     """Server-Sent Events feed for a running chain. Emits Teacher/Artist token
     deltas and stage transitions. Closes when the chain completes."""
+    owner = await _owner_from_request(request)
+    q = {"id": chain_id, **_owner_filter(owner)}
+    ok = await db.chains.find_one(q, {"_id": 0, "id": 1})
+    if not ok:
+        raise HTTPException(404, "chain not found")
     import asyncio as _asyncio
-    q = chain_generator.get_stream_queue(chain_id)
+    q_stream = chain_generator.get_stream_queue(chain_id)
 
     async def gen():
         # initial ping so proxies flush headers
         yield "event: open\ndata: connected\n\n"
         while True:
             try:
-                item = await _asyncio.wait_for(q.get(), timeout=90)
+                item = await _asyncio.wait_for(q_stream.get(), timeout=90)
             except _asyncio.TimeoutError:
                 # keep-alive
                 yield ": ping\n\n"
@@ -768,10 +827,12 @@ class GithubPushRequest(BaseModel):
 
 
 @api.post("/chains/{chain_id}/push")
-async def push_to_github(chain_id: str, req: GithubPushRequest):
+async def push_to_github(chain_id: str, req: GithubPushRequest, request: Request):
     """Push a completed chain's Product folder to the user's GitHub as a new repo.
     Requires the user to have saved a PAT + username under /api/settings."""
-    doc = await db.chains.find_one({"id": chain_id}, {"_id": 0})
+    owner = await _owner_from_request(request)
+    q = {"id": chain_id, **_owner_filter(owner)}
+    doc = await db.chains.find_one(q, {"_id": 0})
     if not doc:
         raise HTTPException(404, "chain not found")
     if doc.get("status") != "complete":
@@ -908,6 +969,33 @@ else:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+
+@app.on_event("startup")
+async def _validate_default_rater():
+    """Ping the default rater model with a tiny prompt so we catch bad slugs
+    (like the previous `inclusionai/ling-3.0-flash:free` -> 404) at boot, not
+    on the first user build."""
+    try:
+        r = _providers.DEFAULT_ASSIGNMENTS["rater"]
+        client = _providers.openai_client_for(r["provider"])
+        if client is None:
+            logger.warning("rater validation skipped: no key for provider %s", r["provider"])
+            return
+        try:
+            resp = await client.chat.completions.create(
+                model=r["model"],
+                messages=[{"role": "user", "content": "ok"}],
+                max_tokens=2, temperature=0,
+            )
+            if not resp.choices:
+                raise RuntimeError("no choices in response")
+            logger.info("rater validation ok: %s/%s", r["provider"], r["model"])
+        except Exception as exc:
+            logger.error("rater validation FAILED: %s/%s -> %s (falling back at runtime)",
+                         r["provider"], r["model"], exc)
+    except Exception as exc:
+        logger.warning("rater validation raised: %s", exc)
 
 
 @app.on_event("startup")

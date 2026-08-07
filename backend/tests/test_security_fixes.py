@@ -143,20 +143,23 @@ class TestSec002PathTraversal:
 class TestSec004PushEndpointContract:
     def test_push_unknown_chain_404(self):
         r = requests.post(f"{BASE_URL}/api/chains/{uuid.uuid4()}/push",
-                          json={"session_id": "sec004-test", "repo": "TEST_repo"}, timeout=30)
+                          json={"session_id": "sec004-test", "repo": "TEST_repo"},
+                          headers={"X-Capcode-Session": "sec004-test"}, timeout=30)
         assert r.status_code == 404, r.text
         assert "not found" in r.text.lower()
 
     def test_push_incomplete_chain_409(self, incomplete_chain_id):
         r = requests.post(f"{BASE_URL}/api/chains/{incomplete_chain_id}/push",
-                          json={"session_id": "sec004-test", "repo": "TEST_repo"}, timeout=30)
+                          json={"session_id": "sec004-test", "repo": "TEST_repo"},
+                          headers={"X-Capcode-Session": "sec004-test"}, timeout=30)
         assert r.status_code == 409, r.text
         assert "not complete" in r.text.lower()
 
     def test_push_without_credentials_400(self, complete_chain_id):
         sid = f"sec004-nocreds-{uuid.uuid4().hex[:8]}"
         r = requests.post(f"{BASE_URL}/api/chains/{complete_chain_id}/push",
-                          json={"session_id": sid, "repo": "TEST_repo"}, timeout=30)
+                          json={"session_id": sid, "repo": "TEST_repo"},
+                          headers={"X-Capcode-Session": "sec004-test"}, timeout=30)
         assert r.status_code == 400, r.text
         assert "github credentials missing" in r.text.lower()
 
@@ -216,7 +219,8 @@ def mongo_db():
 def incomplete_chain_id(mongo_db):
     cid = str(uuid.uuid4())
     mongo_db.chains.insert_one({
-        "id": cid, "session_id": "sec004-test", "target_prompt": "TEST_incomplete",
+        "id": cid, "session_id": "sec004-test", "anon_session_id": "sec004-test",
+        "target_prompt": "TEST_incomplete",
         "status": "running", "generations": [],
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     })
@@ -226,12 +230,14 @@ def incomplete_chain_id(mongo_db):
 
 @pytest.fixture(scope="session")
 def complete_chain_id(mongo_db):
-    doc = mongo_db.chains.find_one({"status": "complete"}, {"_id": 0, "id": 1})
+    doc = mongo_db.chains.find_one(
+        {"status": "complete", "anon_session_id": "sec004-test"}, {"_id": 0, "id": 1})
     if doc:
         return doc["id"]
     cid = str(uuid.uuid4())
     mongo_db.chains.insert_one({
-        "id": cid, "session_id": "sec004-test", "target_prompt": "TEST_complete",
+        "id": cid, "session_id": "sec004-test", "anon_session_id": "sec004-test",
+        "target_prompt": "TEST_complete",
         "status": "complete",
         "generations": [{"gen": 0, "name": "TEST", "files": [{"path": "run.sh", "content": "echo hi"}]}],
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
