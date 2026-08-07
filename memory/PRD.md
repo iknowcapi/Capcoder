@@ -46,9 +46,16 @@ Audit ran; **DO NOT LAUNCH** verdict addressed by fixing the P0/P1 issues withou
 - ✅ **SEC-004 (Medium)** — GitHub push endpoint uses `GIT_ASKPASS` (PAT never in argv / `/proc`). `--force` only used when the repo was just freshly created (HTTP 201), not for existing repos (422).
 
 **Deferred out of scope (documented, not shipped):**
-- SEC-003 (auth/ownership on chains list/download/stream) — needs a full auth story; MVP intentionally leaves this open.
 - SEC-005 (rate limit on `/api/evolve`) — deferred; enable when BYOK usage rules are decided.
-- CORS `*` + client-generated `session_id` — low blast radius since keys stored in Mongo never leak back over the wire.
+- Global `/api/status` `total_chains` count is cross-tenant (informational only, no prompt/code leak).
+- Model assignments (BYOK preferences) still resolved from body `session_id` even on the authenticated path — signed-in-only clients that don't send a session_id get server defaults.
+
+### Chain ownership + rater fix (2026-08-07 — iteration 6, 60/60 pass)
+- ✅ Every chain doc gets stamped with `user_id` (signed-in) OR `anon_session_id` (anonymous) at `/api/evolve`.
+- ✅ SEC-003 closed. All 8 chain endpoints filter by owner and return 404 for non-owners: `/api/chains`, `/api/chains/{id}`, `/api/chains/{id}/download`, `/api/chains/{id}/download/{gen}`, `/api/chains/{id}/verify`, `/api/chains/{id}/stream`, `/api/chains/{id}/push`, `/api/chains/{id}/workspace/{gen}`.
+- ✅ Frontend axios interceptor auto-injects `X-Capcode-Session` header on every /api/* request from `localStorage.capcode.session_id` (created on first page load, no click required). EventSource + `<a href>` downloads pass the same value as `?session_id=…` since they can't send headers.
+- ✅ Rater default swapped from `inclusionai/ling-3.0-flash:free` (404) to `openai/gpt-3.5-turbo` (+ `openai/gpt-4o-mini` fallback). Startup validator confirms responsiveness at boot.
+- ✅ Rater system prompt rewritten so weak models can't parrot a zero example → real differentiated scores. All-zero degenerate responses rejected → deterministic fallback (2.8 if exec started, 1.2 otherwise). Verified: 6/6 fresh builds all scored composite 3.37-3.63.
 
 ## Backlog (post-reliability)
 - P1: BYOK — let users paste their own OpenRouter/Venice keys.
