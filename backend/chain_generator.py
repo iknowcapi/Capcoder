@@ -362,8 +362,20 @@ Output STRICT JSON only — no prose before or after:
 
 SYSTEM_CORRECTOR = """You are the CORRECTOR. The generated app FAILED TO START — given the source files and the real stderr, output the CORRECTED JSON (same schema as the Artist, including a `files` array). Focus on the smallest edits that make it start. Rewrite only the files that need to change; you may include unchanged files verbatim."""
 
-SYSTEM_RATER = ('Score on 5 dims (each 0.0-4.0). Output ONLY: '
-                '{"helpfulness":0.0,"correctness":0.0,"coherence":0.0,"complexity":0.0,"verbosity":0.0}')
+SYSTEM_RATER = (
+    "You are a strict code-quality rater. Given a short brief about a build, "
+    "score it on FIVE dimensions, each on a 0.0-4.0 scale where 4.0 is excellent "
+    "and 0.0 is broken. Base your score on the brief, not on any example. "
+    "Dimensions:\n"
+    "  helpfulness — does it plausibly do what the target asked?\n"
+    "  correctness — did the app start and run?\n"
+    "  coherence  — is the design consistent?\n"
+    "  complexity — depth/ambition (higher = more ambitious).\n"
+    "  verbosity  — length appropriateness (2.0 = right-sized).\n"
+    "Output ONLY a JSON object with these five numeric keys, e.g. "
+    '{"helpfulness":2.7,"correctness":3.2,"coherence":2.5,"complexity":1.9,"verbosity":2.1}. '
+    "Pick real, differentiated numbers — do not repeat the example."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -573,12 +585,26 @@ async def rate_step(spec: dict, exec_result: dict, assignment: Optional[dict] = 
     )
     data = _extract_json(raw or "") if raw else {}
     keys = ("helpfulness", "correctness", "coherence", "complexity", "verbosity")
-    if not data:
-        # deterministic fallback based on whether it ran
+
+    def _deterministic() -> dict:
         started = bool(exec_result.get("started"))
         base = 2.8 if started else 1.2
         return {k: base for k in keys}
-    return {k: float(data.get(k, 0.0)) for k in keys}
+
+    if not data:
+        return _deterministic()
+    # Reject degenerate responses (all-zero, or model parroted an example).
+    try:
+        values = {k: float(data.get(k, 0.0)) for k in keys}
+    except (TypeError, ValueError):
+        return _deterministic()
+    if all(v == 0.0 for v in values.values()):
+        logger.warning("rater returned all-zero — using deterministic fallback")
+        return _deterministic()
+    # Clamp to spec range so a rogue model can't push composite absurdly high.
+    for k in keys:
+        values[k] = max(0.0, min(4.0, values[k]))
+    return values
 
 
 def composite(scores: dict) -> float:

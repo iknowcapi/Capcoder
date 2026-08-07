@@ -705,10 +705,12 @@ async def download_gen(chain_id: str, gen: int, request: Request):
 
 
 @api.post("/chains/{chain_id}/workspace/{gen}")
-async def open_in_vscode(chain_id: str, gen: int):
+async def open_in_vscode(chain_id: str, gen: int, request: Request):
     """Materialize a generation's files to /workspaces so the local code-server
     (Emergent's built-in VSCode-in-browser) can open the folder."""
-    doc = await db.chains.find_one({"id": chain_id}, {"_id": 0})
+    owner = await _owner_from_request(request)
+    q = {"id": chain_id, **_owner_filter(owner)}
+    doc = await db.chains.find_one(q, {"_id": 0})
     if not doc:
         raise HTTPException(404, "chain not found")
     gens = doc.get("generations", [])
