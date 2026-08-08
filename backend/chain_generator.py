@@ -27,6 +27,7 @@ load_dotenv(Path(__file__).parent / ".env")
 import seed_template
 import executor as _exec
 import providers as _providers
+import coverage as _coverage
 
 logger = logging.getLogger("chain")
 
@@ -700,7 +701,19 @@ async def evolve_chain_with_callback(
         await _emit(chain_id, "stage", "rater")
         scores = await rate_step(product, exec_result, assignment=a["rater"], user_keys=user_keys)
         product["reward"] = scores
-        product["composite_score"] = composite(scores)
+
+        # 6b) Deterministic feature-coverage — parses the code and target prompt
+        # to check hard signals (list lengths, routes, UI verbs, network calls).
+        cov = _coverage.score(target_prompt, product.get("files") or [])
+        product["coverage"] = cov
+        # Blend coverage into the composite when it's available so the final
+        # score reflects real behaviour, not just the LLM rater's opinion.
+        base = composite(scores)
+        if cov.get("coverage") is not None:
+            # Coverage scales 0..1 -> weight ~40% of the final score.
+            product["composite_score"] = round(base * 0.6 + (cov["coverage"] * 4.0) * 0.4, 3)
+        else:
+            product["composite_score"] = base
         product["gen"] = 1
         product["critic_notes"] = (
             f"Ran: {exec_result.get('started')}. "
