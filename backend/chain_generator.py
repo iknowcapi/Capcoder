@@ -437,16 +437,29 @@ async def artist_step(teacher_spec: dict, exemplar_files: Optional[list[dict]] =
     raw = ""
     exemplar_block = ""
     if exemplar_files:
+        # For each exemplar we send the FULL content of its SMALLEST file
+        # (usually the main entry — most instructive) plus the full file layout.
+        # Total per exemplar is capped so the prompt stays sane.
+        MAX_PER_EXEMPLAR = 6000
         parts = []
         for i, ex in enumerate(exemplar_files[:2], 1):
-            paths = ", ".join(f["path"] for f in ex.get("files", [])[:6])
-            first_file = (ex.get("files") or [{}])[0]
-            snippet = (first_file.get("content", "") or "")[:600]
+            files_by_size = sorted(
+                [f for f in (ex.get("files") or []) if isinstance(f, dict) and f.get("content")],
+                key=lambda f: len(f.get("content", "")),
+            )
+            if not files_by_size:
+                continue
+            layout = "\n".join(f"  - {f['path']} ({len(f.get('content',''))} chars)"
+                               for f in ex.get("files", [])[:15])
+            main = files_by_size[0]  # smallest = usually the entry point
+            main_content = main.get("content", "")[:MAX_PER_EXEMPLAR]
             parts.append(
-                f"### Verified exemplar {i} — target: {ex.get('target','?')}\n"
-                f"file layout: {paths}\n"
-                f"first-file snippet ({first_file.get('path','?')}):\n"
-                f"{snippet}"
+                f"### Verified exemplar {i}\n"
+                f"target: {ex.get('target','?')}\n"
+                f"stack: {ex.get('stack','?')}\n"
+                f"file layout:\n{layout}\n"
+                f"full content of {main['path']} (copy patterns, adapt to the new target):\n"
+                f"```\n{main_content}\n```"
             )
         exemplar_block = "\n\n".join(parts)
 
