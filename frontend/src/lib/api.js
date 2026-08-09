@@ -52,4 +52,7 @@ export const api = {
   authMe: () => axios.get(`${API}/auth/me`).then((r) => r.data),
   authLogout: () => axios.post(`${API}/auth/logout`).then((r) => r.data),
   authConfig: () => axios.get(`${API}/auth/config`).then((r) => r.data),
+  // ---- Venice / uncensored consent waiver ----
+  veniceConsent: (chain_id = null) =>
+    axios.post(`${API}/venice/consent`, { chain_id }).then((r) => r.data),
 };

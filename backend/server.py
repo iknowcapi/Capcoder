@@ -491,6 +491,68 @@ def _stamp_owner(doc: dict, owner: dict) -> dict:
     return doc
 
 
+# ---------------------------------------------------------------------------
+# Venice / uncensored-mode consent waiver
+# ---------------------------------------------------------------------------
+# Every time the user toggles uncensored mode ON, the frontend intercepts with
+# a waiver modal and — on explicit "I agree" — hits POST /api/venice/consent.
+# We store a fresh record every call (no dedup, no "always accepted" flag).
+# The /api/evolve gate uses `_has_recent_venice_consent` to require a fresh
+# record for the exact same owner before it will route any role to Venice.
+VENICE_CONSENT_WINDOW = timedelta(minutes=30)
+
+
+class VeniceConsentRequest(BaseModel):
+    chain_id: Optional[str] = None  # optional at consent time — often no chain yet
+
+
+@api.post("/venice/consent")
+async def venice_consent(req: VeniceConsentRequest, request: Request):
+    """Record a fresh consent-waiver acceptance for uncensored/Venice routing.
+    Every toggle-on posts a new record — the backend never reuses a prior one.
+    """
+    owner = await _owner_from_request(request)
+    if not owner.get("user_id") and not owner.get("anon"):
+        raise HTTPException(400, "no session identity — sign in or send X-Capcode-Session header")
+    consent_id = str(uuid.uuid4())
+    now_iso = datetime.now(timezone.utc).isoformat()
+    doc = _stamp_owner({
+        "consent_id": consent_id,
+        "accepted_at": now_iso,
+        "chain_id": (req.chain_id or "").strip() or None,
+    }, owner)
+    await db.venice_consent.insert_one(doc)
+    return {
+        "consent_id": consent_id,
+        "accepted_at": now_iso,
+        "chain_id": doc.get("chain_id"),
+        "expires_at": (datetime.now(timezone.utc) + VENICE_CONSENT_WINDOW).isoformat(),
+    }
+
+
+async def _has_recent_venice_consent(owner: dict) -> bool:
+    """True iff a consent record exists for this owner within the freshness
+    window. Consent is owner-scoped: a record from a different user_id or
+    anon_session_id NEVER counts."""
+    q = _owner_filter(owner)
+    if q.get("_id") == "__no_owner__":
+        return False
+    # Fetch the most recent consent doc for this owner.
+    docs = await db.venice_consent.find(q).sort("accepted_at", -1).limit(1).to_list(1)
+    if not docs:
+        return False
+    accepted_at = docs[0].get("accepted_at")
+    if not accepted_at:
+        return False
+    try:
+        ts = datetime.fromisoformat(accepted_at)
+    except Exception:
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - ts) <= VENICE_CONSENT_WINDOW
+
+
 @api.post("/evolve", response_model=Chain)
 async def evolve(req: EvolveRequest, background_tasks: BackgroundTasks, request: Request):
     """Human types a target. Teacher -> Artist -> Product -> Rater runs in background.
@@ -518,6 +580,21 @@ async def evolve(req: EvolveRequest, background_tasks: BackgroundTasks, request:
         if s:
             roles = ("teacher", "artist", "rater")
             assignments = {r: s[r] for r in roles if s.get(r)}
+
+    # SEC — server-side consent gate for Venice/uncensored routing. Any role
+    # resolved to provider == "venice" requires a *recent* consent record for
+    # this exact owner (user_id OR anon session). We never trust the frontend
+    # gate alone.
+    _resolved = assignments or {}
+    _effective_roles = [(_resolved.get(r) or _providers.DEFAULT_ASSIGNMENTS.get(r) or {})
+                        for r in ("teacher", "artist", "rater")]
+    if any((a.get("provider") == "venice") for a in _effective_roles):
+        if not await _has_recent_venice_consent(owner):
+            raise HTTPException(
+                403,
+                "venice/uncensored routing requires a fresh consent record — toggle "
+                "uncensored on in Settings and accept the waiver before this build.",
+            )
 
     # gather top-verified prior chains as exemplars for the Teacher (brief)
     # AND for the Artist (real file structures) — this is the recursive loop.

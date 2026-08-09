@@ -1,7 +1,8 @@
 import React, { useEffect, useMemo, useState } from "react";
 import axios from "axios";
-import { API } from "@/lib/api";
+import { api, API } from "@/lib/api";
 import { Search, Save, RefreshCw, X, Zap, DollarSign } from "lucide-react";
+import { VeniceConsentModal } from "@/components/VeniceConsentModal";
 
 const ROLES = [
   { key: "teacher", label: "TEACHER", desc: "rigid, strict; writes the Artist's brief from your target" },
@@ -32,6 +33,9 @@ export const SettingsPanel = ({ sessionId, open, onClose, onSaved }) => {
   const [query, setQuery] = useState("");
   const [providerFilter, setProviderFilter] = useState("all");
   const [uncensoredOnly, setUncensoredOnly] = useState(false);
+  // Consent-waiver flow — every toggle-on of uncensored mode requires a fresh
+  // POST /api/venice/consent. The toggle DOES NOT flip until that call succeeds.
+  const [consentOpen, setConsentOpen] = useState(false);
   const [tierFilter, setTierFilter] = useState("all");
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -226,7 +230,15 @@ export const SettingsPanel = ({ sessionId, open, onClose, onSaved }) => {
                 data-testid="filter-uncensored"
                 type="checkbox"
                 checked={uncensoredOnly}
-                onChange={(e) => setUncensoredOnly(e.target.checked)}
+                onChange={(e) => {
+                  // Toggling OFF is free; toggling ON requires a fresh consent waiver
+                  // acceptance BEFORE the checkbox flips.
+                  if (!e.target.checked) {
+                    setUncensoredOnly(false);
+                    return;
+                  }
+                  setConsentOpen(true);
+                }}
               />
               <span className="label-xs text-neon_magenta neon-magenta">UNCENSORED ONLY</span>
             </label>
@@ -393,6 +405,25 @@ export const SettingsPanel = ({ sessionId, open, onClose, onSaved }) => {
           </div>
         </div>
       </div>
+
+      <VeniceConsentModal
+        open={consentOpen}
+        onAgree={async () => {
+          try {
+            await api.veniceConsent(null);
+            setUncensoredOnly(true);
+            setConsentOpen(false);
+          } catch (e) {
+            // Bubble the error up to the modal's own error UI.
+            throw e;
+          }
+        }}
+        onCancel={() => {
+          setConsentOpen(false);
+          // Toggle stays OFF — the checkbox's `checked` prop is bound to
+          // `uncensoredOnly` which we never touched, so the UI reflects "off".
+        }}
+      />
     </div>
   );
 };

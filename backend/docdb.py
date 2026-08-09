@@ -29,6 +29,7 @@ COLLECTION_ID_FIELDS: dict[str, str] = {
     "settings": "session_id",
     "users": "user_id",
     "user_sessions": "session_token",
+    "venice_consent": "consent_id",
 }
 
 _pool: Optional[asyncpg.Pool] = None
