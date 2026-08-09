@@ -85,6 +85,7 @@ class Chain(BaseModel):
     generations: list[Generation] = Field(default_factory=list)
     created_at: datetime
     completed_at: Optional[datetime] = None
+    venice_consent: Optional[dict] = None
 
 
 class EvolveRequest(BaseModel):
@@ -530,27 +531,32 @@ async def venice_consent(req: VeniceConsentRequest, request: Request):
     }
 
 
-async def _has_recent_venice_consent(owner: dict) -> bool:
-    """True iff a consent record exists for this owner within the freshness
-    window. Consent is owner-scoped: a record from a different user_id or
-    anon_session_id NEVER counts."""
+async def _get_recent_venice_consent(owner: dict) -> Optional[dict]:
+    """Return the freshest in-window consent record for this owner, or None.
+    Consent is owner-scoped: a record from a different user_id or anon
+    session id NEVER counts."""
     q = _owner_filter(owner)
     if q.get("_id") == "__no_owner__":
-        return False
-    # Fetch the most recent consent doc for this owner.
+        return None
     docs = await db.venice_consent.find(q).sort("accepted_at", -1).limit(1).to_list(1)
     if not docs:
-        return False
+        return None
     accepted_at = docs[0].get("accepted_at")
     if not accepted_at:
-        return False
+        return None
     try:
         ts = datetime.fromisoformat(accepted_at)
     except Exception:
-        return False
+        return None
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
-    return (datetime.now(timezone.utc) - ts) <= VENICE_CONSENT_WINDOW
+    if (datetime.now(timezone.utc) - ts) > VENICE_CONSENT_WINDOW:
+        return None
+    return docs[0]
+
+
+async def _has_recent_venice_consent(owner: dict) -> bool:
+    return (await _get_recent_venice_consent(owner)) is not None
 
 
 @api.post("/evolve", response_model=Chain)
@@ -584,17 +590,25 @@ async def evolve(req: EvolveRequest, background_tasks: BackgroundTasks, request:
     # SEC — server-side consent gate for Venice/uncensored routing. Any role
     # resolved to provider == "venice" requires a *recent* consent record for
     # this exact owner (user_id OR anon session). We never trust the frontend
-    # gate alone.
+    # gate alone. On success we stamp the consent record's id/timestamp onto
+    # the chain doc for a permanent audit trail.
     _resolved = assignments or {}
     _effective_roles = [(_resolved.get(r) or _providers.DEFAULT_ASSIGNMENTS.get(r) or {})
                         for r in ("teacher", "artist", "rater")]
-    if any((a.get("provider") == "venice") for a in _effective_roles):
-        if not await _has_recent_venice_consent(owner):
+    _venice_used = any((a.get("provider") == "venice") for a in _effective_roles)
+    _venice_consent_stamp: Optional[dict] = None
+    if _venice_used:
+        _consent_doc = await _get_recent_venice_consent(owner)
+        if not _consent_doc:
             raise HTTPException(
                 403,
                 "venice/uncensored routing requires a fresh consent record — toggle "
                 "uncensored on in Settings and accept the waiver before this build.",
             )
+        _venice_consent_stamp = {
+            "consent_id": _consent_doc.get("consent_id"),
+            "accepted_at": _consent_doc.get("accepted_at"),
+        }
 
     # gather top-verified prior chains as exemplars for the Teacher (brief)
     # AND for the Artist (real file structures) — this is the recursive loop.
@@ -636,6 +650,18 @@ async def evolve(req: EvolveRequest, background_tasks: BackgroundTasks, request:
         "created_at": datetime.now(timezone.utc).isoformat(),
         "completed_at": None,
     }, owner)
+    # Stamp the exact consent record onto the chain doc when uncensored/Venice
+    # routing was used. Also back-fill the consent doc's `chain_id` so audit
+    # walks both directions.
+    if _venice_consent_stamp:
+        stub["venice_consent"] = _venice_consent_stamp
+        try:
+            await db.venice_consent.update_one(
+                {"consent_id": _venice_consent_stamp["consent_id"]},
+                {"$set": {"chain_id": chain_id}},
+            )
+        except Exception as exc:  # audit best-effort; never block the build
+            logger.warning("failed to back-fill consent.chain_id: %s", exc)
     await db.chains.insert_one({**stub})
 
     async def on_gen(cid: str, gen: dict, fallback: bool):
