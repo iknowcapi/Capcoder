@@ -21,11 +21,12 @@ from typing import List, Optional
 from dotenv import load_dotenv
 from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
-from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.cors import CORSMiddleware
 
 import chain_generator
+import docdb
+import executor as _exec
 import providers as _providers
 
 ROOT_DIR = Path(__file__).parent
@@ -35,12 +36,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("recursive-bbs")
 
 # ---------------------------------------------------------------------------
-# Mongo
+# Postgres (Neon) via docdb — a small Mongo-look-alike adapter over JSONB.
 # ---------------------------------------------------------------------------
-mongo_url = os.environ["MONGO_URL"]
-db_name = os.environ["DB_NAME"]
-mongo_client = AsyncIOMotorClient(mongo_url)
-db = mongo_client[db_name]
+POSTGRES_URL = os.environ["POSTGRES_URL"]
+db = docdb.db
 
 
 # ---------------------------------------------------------------------------
@@ -974,6 +973,12 @@ else:
 
 
 @app.on_event("startup")
+async def _connect_docdb():
+    """MUST run before any other startup handler that touches `db`."""
+    await docdb.connect(POSTGRES_URL)
+
+
+@app.on_event("startup")
 async def _validate_default_rater():
     """Ping the default rater model with a tiny prompt so we catch bad slugs
     (like the previous `inclusionai/ling-3.0-flash:free` -> 404) at boot, not
@@ -1022,4 +1027,4 @@ async def _sweep_orphans():
 
 @app.on_event("shutdown")
 async def shutdown_db():
-    mongo_client.close()
+    await docdb.close()
