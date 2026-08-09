@@ -3,11 +3,11 @@ import "@/App.css";
 import { Toaster, toast } from "sonner";
 import { LogIn, LogOut, Settings } from "lucide-react";
 import { api, API } from "@/lib/api";
+import { signInWithGoogle, signOut as neonSignOut } from "@/lib/authClient";
 import { TerminalHero } from "@/components/TerminalHero";
 import { EvolveButton } from "@/components/EvolveButton";
 import { ChainViewer } from "@/components/ChainViewer";
 import { SettingsPanel } from "@/components/SettingsPanel";
-import { AuthCallback } from "@/components/AuthCallback";
 
 function getSessionId() {
   const KEY = "capcode.session_id";
@@ -22,14 +22,6 @@ function getSessionId() {
 }
 
 function App() {
-  // If the URL fragment contains session_id=, render AuthCallback first — this
-  // handshake must complete BEFORE anything hits /auth/me. We check
-  // window.location.hash synchronously at initial render (not in useEffect)
-  // to avoid a race with the /auth/me call below.
-  const [needAuthCallback, setNeedAuthCallback] = useState(
-    typeof window !== "undefined" && (window.location.hash || "").includes("session_id=")
-  );
-
   const [sessionId] = useState(getSessionId);
   const [status, setStatus] = useState(null);
   const [chains, setChains] = useState([]);
@@ -42,14 +34,13 @@ function App() {
   const [streamBuf, setStreamBuf] = useState({ teacher: "", artist: "" });
   const esRef = useRef(null);
   const [user, setUser] = useState(null);          // logged-in AuthUser or null
-  const [checkingAuth, setCheckingAuth] = useState(!needAuthCallback);
+  const [checkingAuth, setCheckingAuth] = useState(true);
 
-  // Check for an existing session cookie on load — but skip if we're about to
-  // process an auth callback (that path will populate user itself).
+  // Watch Neon Better Auth session state — fires on sign-in/out & OAuth
+  // redirect back from Google.
   useEffect(() => {
-    if (needAuthCallback) return;
     let alive = true;
-    (async () => {
+    const load = async () => {
       try {
         const me = await api.authMe();
         if (alive) setUser(me);
@@ -58,18 +49,21 @@ function App() {
       } finally {
         if (alive) setCheckingAuth(false);
       }
-    })();
-    return () => { alive = false; };
-  }, [needAuthCallback]);
+    };
+    load();
+    // Re-check auth every 60s to keep the JWT fresh (Neon JWTs expire in 15m
+    // but authClient.token() auto-refreshes from the session cookie).
+    const iv = setInterval(load, 60_000);
+    return () => { alive = false; clearInterval(iv); };
+  }, []);
 
-  const handleSignIn = () => {
-    // REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
-    const redirectUrl = window.location.origin + "/";
-    window.location.href =
-      `https://auth.emergentagent.com/?redirect=${encodeURIComponent(redirectUrl)}`;
+  const handleSignIn = async () => {
+    try { await signInWithGoogle(); }
+    catch (e) { toast.error(e?.message || "sign-in failed"); }
   };
 
   const handleSignOut = async () => {
+    try { await neonSignOut(); } catch (_) { /* noop */ }
     try { await api.authLogout(); } catch (_) { /* noop */ }
     setUser(null);
     toast.success("SIGNED OUT");
@@ -166,18 +160,6 @@ function App() {
       throw e;
     }
   };
-
-  if (needAuthCallback) {
-    return (
-      <AuthCallback
-        onDone={(u) => {
-          setUser(u);
-          setNeedAuthCallback(false);
-          toast.success(`WELCOME ${u.name || u.email}`);
-        }}
-      />
-    );
-  }
 
   return (
     <div className="App relative crt-scanlines crt-vignette grain" data-testid="app-root">

@@ -25,7 +25,7 @@ if not base:
 BASE_URL = base.rstrip("/")
 
 backend_env = dotenv_values("/app/backend/.env")
-FORBIDDEN = ["NVIDIA_API_KEY", "OPENROUTER_API_KEY", "VENICE_API_KEY", "MONGO_URL", "DB_NAME"]
+FORBIDDEN = ["NVIDIA_API_KEY", "OPENROUTER_API_KEY", "VENICE_API_KEY", "POSTGRES_URL", "NEON_AUTH_URL"]
 
 
 # ---------------------------------------------------------------- SEC-001

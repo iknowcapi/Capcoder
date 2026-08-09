@@ -1,4 +1,5 @@
 import axios from "axios";
+import { getJwt } from "@/lib/authClient";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 export const API = `${BACKEND_URL}/api`;
@@ -19,13 +20,18 @@ function _getAnonSessionId() {
   return s;
 }
 
-// Attach the header + credentials to every /api/* request globally.
-axios.interceptors.request.use((config) => {
+// Attach the anon session header + Neon Auth JWT bearer + credentials to
+// every /api/* request globally.
+axios.interceptors.request.use(async (config) => {
   const url = config.url || "";
   if (url.startsWith(API) || url.includes("/api/")) {
     config.headers = config.headers || {};
     config.headers["X-Capcode-Session"] = _getAnonSessionId();
-    // send cookies for auth endpoints too
+    // Neon Better Auth JWT (only present when the user is signed in).
+    try {
+      const jwt = await getJwt();
+      if (jwt) config.headers["Authorization"] = `Bearer ${jwt}`;
+    } catch (_) { /* noop */ }
     config.withCredentials = true;
   }
   return config;
@@ -42,9 +48,8 @@ export const api = {
   verifyChain: (id) => axios.post(`${API}/chains/${id}/verify`).then((r) => r.data),
   pushChain: (id, session_id, repo, isPrivate = true) =>
     axios.post(`${API}/chains/${id}/push`, { session_id, repo, private: isPrivate }).then((r) => r.data),
-  // ---- Emergent-managed Google Auth ----
-  authExchange: (session_id) =>
-    axios.post(`${API}/auth/session`, { session_id }).then((r) => r.data),
+  // ---- Neon Managed Better Auth ----
   authMe: () => axios.get(`${API}/auth/me`).then((r) => r.data),
   authLogout: () => axios.post(`${API}/auth/logout`).then((r) => r.data),
+  authConfig: () => axios.get(`${API}/auth/config`).then((r) => r.data),
 };

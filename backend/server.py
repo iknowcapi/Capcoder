@@ -242,8 +242,19 @@ api = APIRouter(prefix="/api")
 # ---------------------------------------------------------------------------
 # Emergent-managed Google Auth (optional identity — anonymous still works)
 # ---------------------------------------------------------------------------
-EMERGENT_AUTH_URL = "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data"
-_SESSION_COOKIE = "session_token"
+# ---------------------------------------------------------------------------
+# Neon Managed Better Auth
+# ---------------------------------------------------------------------------
+# Frontend logs in through Neon Auth directly (Google OAuth handled by Neon).
+# Frontend then sends the resulting JWT as `Authorization: Bearer <jwt>` to
+# our backend. We verify the JWT against Neon Auth's JWKS (EdDSA / Ed25519).
+NEON_AUTH_URL = os.environ["NEON_AUTH_URL"].rstrip("/")
+NEON_JWKS_URL = f"{NEON_AUTH_URL}/.well-known/jwks.json"
+
+import jwt as _pyjwt  # PyJWT
+from jwt import PyJWKClient
+
+_jwks_client = PyJWKClient(NEON_JWKS_URL, cache_keys=True, lifespan=300)
 
 
 class AuthUser(BaseModel):
@@ -254,14 +265,28 @@ class AuthUser(BaseModel):
 
 
 async def _read_bearer(request: Request) -> Optional[str]:
-    """Return session_token from cookie first, then Authorization: Bearer."""
-    tok = request.cookies.get(_SESSION_COOKIE)
-    if tok:
-        return tok
+    """Return the JWT from Authorization: Bearer header (preferred) or cookie."""
     auth = request.headers.get("authorization") or ""
     if auth.lower().startswith("bearer "):
         return auth[7:].strip()
-    return None
+    return request.cookies.get("neon_auth_jwt")
+
+
+def _verify_neon_jwt(token: str) -> Optional[dict]:
+    """Verify a Neon Better Auth JWT and return the claims dict, or None on failure."""
+    try:
+        signing_key = _jwks_client.get_signing_key_from_jwt(token)
+        # Neon Managed Better Auth signs with EdDSA (Ed25519).
+        claims = _pyjwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["EdDSA"],
+            options={"require": ["sub", "exp"]},
+        )
+        return claims
+    except Exception as exc:
+        logger.debug("neon jwt verify failed: %s", exc)
+        return None
 
 
 async def get_current_user(request: Request) -> Optional[AuthUser]:
@@ -269,107 +294,63 @@ async def get_current_user(request: Request) -> Optional[AuthUser]:
     tok = await _read_bearer(request)
     if not tok:
         return None
-    sess = await db.user_sessions.find_one({"session_token": tok}, {"_id": 0})
-    if not sess:
+    claims = _verify_neon_jwt(tok)
+    if not claims:
         return None
-    exp = sess.get("expires_at")
-    if isinstance(exp, str):
-        try:
-            exp = datetime.fromisoformat(exp)
-        except Exception:
-            return None
-    if hasattr(exp, "tzinfo") and exp.tzinfo is None:
-        exp = exp.replace(tzinfo=timezone.utc)
-    if exp is None or exp < datetime.now(timezone.utc):
+
+    user_id = str(claims.get("sub") or "")
+    if not user_id:
         return None
-    user = await db.users.find_one({"user_id": sess["user_id"]}, {"_id": 0})
-    if not user:
-        return None
-    return AuthUser(**user)
+    email = claims.get("email") or ""
+    name = claims.get("name") or (email.split("@")[0] if email else user_id[:8])
+    picture = claims.get("image") or claims.get("picture")
 
-
-@api.post("/auth/session")
-async def auth_session(request: Request, response: Response):
-    """Exchange the ?session_id fragment for a persistent session_token cookie.
-    Called by the frontend AuthCallback after Google Auth redirects back."""
-    session_id = request.headers.get("x-session-id") or ""
-    if not session_id:
-        # Also accept a JSON body {session_id: "..."} for browsers that
-        # can't easily set custom headers.
-        try:
-            body = await request.json()
-            session_id = (body or {}).get("session_id", "")
-        except Exception:
-            pass
-    if not session_id:
-        raise HTTPException(400, "session_id required")
-
-    import httpx as _httpx
-    async with _httpx.AsyncClient(timeout=15) as http:
-        r = await http.get(EMERGENT_AUTH_URL, headers={"X-Session-ID": session_id})
-    if r.status_code != 200:
-        raise HTTPException(401, f"emergent auth exchange failed: {r.status_code}")
-    data = r.json() or {}
-
-    email = data.get("email")
-    name = data.get("name") or (email or "").split("@")[0]
-    picture = data.get("picture")
-    session_token = data.get("session_token")
-    if not email or not session_token:
-        raise HTTPException(502, "emergent auth returned no email or session_token")
-
-    # Upsert user — keyed by email so cross-device sign-ins hit the same user_id.
-    existing = await db.users.find_one({"email": email}, {"_id": 0})
+    # Upsert into our own users collection so we can attach chains, settings,
+    # etc. to a stable user_id even across future auth changes.
+    existing = await db.users.find_one({"user_id": user_id})
     now_iso = datetime.now(timezone.utc).isoformat()
-    if existing:
-        user_id = existing["user_id"]
-        await db.users.update_one(
-            {"user_id": user_id},
-            {"$set": {"name": name, "picture": picture, "last_login_at": now_iso}},
-        )
-    else:
-        user_id = f"user_{uuid.uuid4().hex[:12]}"
+    if existing is None:
         await db.users.insert_one({
             "user_id": user_id,
             "email": email,
             "name": name,
             "picture": picture,
             "created_at": now_iso,
+            "last_login_at": now_iso,
         })
+    else:
+        # Refresh mutable fields (email/name/picture) in case Google profile changed.
+        await db.users.update_one(
+            {"user_id": user_id},
+            {"$set": {"email": email, "name": name, "picture": picture,
+                      "last_login_at": now_iso}},
+        )
 
-    expires_at = datetime.now(timezone.utc) + timedelta(days=7)
-    await db.user_sessions.update_one(
-        {"session_token": session_token},
-        {"$set": {
-            "session_token": session_token,
-            "user_id": user_id,
-            "expires_at": expires_at.isoformat(),
-            "created_at": now_iso,
-        }},
-        upsert=True,
-    )
-    response.set_cookie(
-        key=_SESSION_COOKIE, value=session_token,
-        httponly=True, secure=True, samesite="none",
-        path="/", max_age=7 * 24 * 3600,
-    )
-    return {"user_id": user_id, "email": email, "name": name, "picture": picture}
+    return AuthUser(user_id=user_id, email=email, name=name, picture=picture)
 
 
 @api.get("/auth/me")
 async def auth_me(request: Request):
+    """Return the current signed-in user or 401.
+    Frontend calls this after acquiring a JWT from Neon Auth."""
     user = await get_current_user(request)
     if not user:
         raise HTTPException(401, "not authenticated")
     return user.model_dump()
 
 
+@api.get("/auth/config")
+async def auth_config():
+    """Expose the Neon Auth base URL so the frontend can point its Better Auth
+    client at the right server without hard-coding the URL in bundle output."""
+    return {"neon_auth_url": NEON_AUTH_URL}
+
+
 @api.post("/auth/logout")
-async def auth_logout(request: Request, response: Response):
-    tok = await _read_bearer(request)
-    if tok:
-        await db.user_sessions.delete_one({"session_token": tok})
-    response.delete_cookie(_SESSION_COOKIE, path="/", samesite="none", secure=True)
+async def auth_logout(response: Response):
+    """Best-effort logout — Better Auth sign-out is handled client-side; this
+    endpoint just clears any local server-side artifacts."""
+    response.delete_cookie("neon_auth_jwt", path="/")
     return {"ok": True}
 
 
