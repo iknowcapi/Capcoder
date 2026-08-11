@@ -28,8 +28,32 @@ import seed_template
 import executor as _exec
 import providers as _providers
 import coverage as _coverage
+import usage as _usage
 
 logger = logging.getLogger("chain")
+
+
+class ProviderRateLimitedError(Exception):
+    """Raised when a provider call is rate-limited (HTTP 429) and there's no
+    fallback to try (free/trial tiers on Groq intentionally have none — see
+    _call_role's tier="free" fallback suppression). server.py's /advance
+    catches this specifically and surfaces usage.THROTTLE_MESSAGE instead of
+    a generic failure, and — importantly — does NOT mark the chain failed or
+    delete its progress, so the same stage can just be retried later."""
+    pass
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    # openai-python's RateLimitError (used for every provider here, since
+    # Groq/NVIDIA/OpenRouter/Venice are all OpenAI-compatible endpoints).
+    try:
+        from openai import RateLimitError
+        if isinstance(exc, RateLimitError):
+            return True
+    except ImportError:
+        pass
+    # Fallback duck-typing in case of a wrapped/different exception shape.
+    return getattr(exc, "status_code", None) == 429
 
 # Any provider having a key means we can evolve.
 ENABLED = any(_providers.provider_available(p) for p in ("openrouter", "nvidia", "venice"))
@@ -128,6 +152,13 @@ async def _chat(model: str, messages: list[dict], provider: str = "nvidia",
         return out
     except Exception as exc:
         logger.error("%s/%s call failed: %s", provider, model, exc)
+        if _is_rate_limited(exc):
+            if fallback:
+                return await _chat(fallback[1], messages, provider=fallback[0],
+                                   user_keys=user_keys,
+                                   stream_chain_id=stream_chain_id,
+                                   stream_event=stream_event, **kwargs)
+            raise ProviderRateLimitedError(f"{provider}/{model} rate-limited") from exc
         if fallback:
             return await _chat(fallback[1], messages, provider=fallback[0],
                                user_keys=user_keys,
@@ -361,7 +392,11 @@ Output STRICT JSON only — no prose before or after:
 }
 """
 
-SYSTEM_CORRECTOR = """You are the CORRECTOR. The generated app FAILED TO START — given the source files and the real stderr, output the CORRECTED JSON (same schema as the Artist, including a `files` array). Focus on the smallest edits that make it start. Rewrite only the files that need to change; you may include unchanged files verbatim."""
+SYSTEM_ARCHITECT = """You are the ARCHITECT — runs BEFORE the Artist in CapCode's extended (trial/paid) pipeline. Given the Teacher's spec, add concrete structural guidance the Artist should follow: file/module layout, how components should talk to each other, and one or two specific implementation choices that would make this build more novel or interesting than the obvious default — WITHOUT sacrificing that it must actually run. Output ONLY a JSON object: {"architecture_notes": "<2-4 sentences of concrete guidance>"}"""
+
+SYSTEM_REVIEWER = """You are the REVIEWER — runs AFTER the first execution attempt in CapCode's extended pipeline, before the Corrector. Given the product summary and execution result, decide whether this needs a correction pass even if it technically started (e.g. an obviously broken UI, a route that's a stub, missing the core feature asked for). Output ONLY JSON: {"needs_fix": true|false, "review_notes": "<1-3 sentences, specific>"}"""
+
+SYSTEM_CORRECTOR = """You are the CORRECTOR. The generated app FAILED TO START, or the Reviewer flagged it as incomplete — given the source files, the real stderr (if any), and any reviewer notes, output the CORRECTED JSON (same schema as the Artist, including a `files` array). Focus on the smallest edits that make it start and address the reviewer's concerns. Rewrite only the files that need to change; you may include unchanged files verbatim."""
 
 SYSTEM_RATER = (
     "You are a strict code-quality rater. Given a short brief about a build, "
@@ -382,35 +417,63 @@ SYSTEM_RATER = (
 # ---------------------------------------------------------------------------
 # Bot steps
 # ---------------------------------------------------------------------------
+def _estimate_tokens(*texts: str) -> int:
+    """Rough token estimate (chars/4) for usage-budget purposes. Not billing-
+    grade — real provider usage varies by tokenizer — but good enough to
+    gate free/trial pools without threading provider-specific usage objects
+    through the streaming and non-streaming _chat paths."""
+    total_chars = sum(len(t or "") for t in texts)
+    return max(1, total_chars // 4)
+
+
 async def _call_role(role: str, messages: list[dict], assignment: Optional[dict],
                      user_keys: Optional[dict] = None,
                      stream_chain_id: Optional[str] = None,
                      stream_event: Optional[str] = None,
-                     **kwargs) -> Optional[str]:
+                     tier: Optional[str] = None,
+                     **kwargs) -> tuple[Optional[str], int]:
+    """Returns (text, estimated_tokens). estimated_tokens covers input+output
+    for this single call and is meant to be summed by the caller into a
+    per-chain running total for usage.log_usage().
+
+    tier="free" suppresses the NVIDIA/Venice/OpenRouter fallback entirely —
+    free tier is Groq-only by spec; if the Groq call fails (rate limit, key
+    pool exhausted mid-call, etc.) it should surface as a failure the caller
+    can turn into the throttle message, not silently spend paid credits on a
+    free user by falling through to another provider.
+    """
     a = assignment or _providers.DEFAULT_ASSIGNMENTS[role]
-    fb = _providers.DEFAULT_ASSIGNMENTS.get(f"{role}_fallback", {"provider": "nvidia", "model": "z-ai/glm-5.1"})
-    return await _chat(a["model"], messages, provider=a["provider"],
-                       fallback=(fb["provider"], fb["model"]),
+    if tier == "free":
+        fb = None
+    else:
+        fbd = _providers.DEFAULT_ASSIGNMENTS.get(f"{role}_fallback", {"provider": "nvidia", "model": "z-ai/glm-5.1"})
+        fb = (fbd["provider"], fbd["model"])
+    out = await _chat(a["model"], messages, provider=a["provider"],
+                       fallback=fb,
                        user_keys=user_keys,
                        stream_chain_id=stream_chain_id,
                        stream_event=stream_event, **kwargs)
+    input_text = "\n".join(m.get("content", "") for m in messages if isinstance(m, dict))
+    tokens = _estimate_tokens(input_text, out or "")
+    return out, tokens
 
 
 async def teacher_step(target: str, exemplars: list[dict], assignment: Optional[dict] = None,
-                       user_keys: Optional[dict] = None, chain_id: Optional[str] = None) -> dict:
+                       user_keys: Optional[dict] = None, chain_id: Optional[str] = None,
+                       tier: Optional[str] = None) -> dict:
     exemplar_block = "\n\n".join(
         f"[verified — target: {e.get('target','?')} — product: {e.get('name','?')}]\n"
         f"artist_brief was: {e.get('artist_brief','?')}"
         for e in exemplars[:3]
     ) or "(no verified exemplars yet — apply first principles)"
     await _emit(chain_id, "stage", "teacher")
-    raw = await _call_role(
+    raw, tokens = await _call_role(
         "teacher",
         [{"role": "system", "content": SYSTEM_TEACHER},
          {"role": "user", "content":
              f"HUMAN TARGET:\n{target}\n\nTOP-VERIFIED PRIOR CHAINS:\n{exemplar_block}\n\n"
              f"Design the Teacher spec as strict JSON."}],
-        assignment, user_keys=user_keys,
+        assignment, user_keys=user_keys, tier=tier,
         stream_chain_id=chain_id, stream_event="teacher_delta",
         temperature=0.4, max_tokens=800,
     )
@@ -423,7 +486,298 @@ async def teacher_step(target: str, exemplars: list[dict], assignment: Optional[
     parsed.setdefault("should_avoid", ["over-engineering"])
     parsed.setdefault("accent_hex", "#7cffb2")
     parsed.setdefault("accent2_hex", "#ff79c6")
+    parsed["_tokens"] = tokens
     return parsed
+
+
+async def architect_step(target: str, teacher_spec: dict, assignment: Optional[dict] = None,
+                         user_keys: Optional[dict] = None, chain_id: Optional[str] = None,
+                         tier: Optional[str] = None) -> dict:
+    """Trial/paid-tier only. Runs between Teacher and Artist — adds structural
+    guidance and nudges the Artist toward a less obvious (but still working)
+    approach. Skipped entirely on the free tier's 2-role pipeline."""
+    await _emit(chain_id, "stage", "architect")
+    raw, tokens = await _call_role(
+        "architect",
+        [{"role": "system", "content": SYSTEM_ARCHITECT},
+         {"role": "user", "content":
+             f"HUMAN TARGET:\n{target}\n\nTEACHER SPEC:\n{json.dumps(teacher_spec, indent=2)}"}],
+        assignment, user_keys=user_keys, tier=tier,
+        stream_chain_id=chain_id, stream_event="architect_delta",
+        temperature=0.6, max_tokens=400,
+    )
+    parsed = _extract_json(raw or "") or {}
+    parsed.setdefault("architecture_notes", "")
+    parsed["_tokens"] = tokens
+    return parsed
+
+
+async def reviewer_step(product: dict, exec_result: dict, assignment: Optional[dict] = None,
+                        user_keys: Optional[dict] = None, chain_id: Optional[str] = None,
+                        tier: Optional[str] = None) -> dict:
+    """Trial/paid-tier only. Runs after the first execution attempt, before
+    the Corrector — can flag a correction pass even on a build that
+    technically started but doesn't actually satisfy the target."""
+    await _emit(chain_id, "stage", "reviewer")
+    brief = json.dumps({
+        "name": product.get("name"), "target": product.get("target_prompt"),
+        "exec_started": exec_result.get("started"),
+        "exec_error_tail": (exec_result.get("stderr") or "")[-300:],
+        "file_paths": [f.get("path") for f in (product.get("files") or [])[:20]],
+    }, indent=2)
+    raw, tokens = await _call_role(
+        "reviewer",
+        [{"role": "system", "content": SYSTEM_REVIEWER},
+         {"role": "user", "content": brief}],
+        assignment, user_keys=user_keys, tier=tier, temperature=0.2, max_tokens=400,
+    )
+    parsed = _extract_json(raw or "") or {}
+    parsed.setdefault("needs_fix", not bool(exec_result.get("started")))
+    parsed.setdefault("review_notes", "")
+    parsed["_tokens"] = tokens
+    return parsed
+
+
+# ---------------------------------------------------------------------------
+# Checkpointed pipeline — one stage per HTTP call, no long-running function.
+# Each call to run_stage() executes exactly ONE stage, persists nowhere
+# itself (server.py owns writing `progress` back to db.chain_progress
+# between calls), and returns a human-readable report the frontend can show
+# immediately while the NEXT stage's call is already in flight. Solves the
+# serverless-timeout problem architecturally — no single request ever runs
+# more than one LLM call's worth of work.
+# ---------------------------------------------------------------------------
+STAGE_SEQUENCE = {
+    "free":  ["teacher", "artist", "execute", "correct", "rate", "score"],
+    "trial": ["teacher", "architect", "artist", "execute", "reviewer", "correct", "rate", "score"],
+    "paid":  ["teacher", "architect", "artist", "execute", "reviewer", "correct", "rate", "score"],
+}
+
+
+def new_progress(chain_id: str, target_prompt: str, tier: str,
+                 assignments: Optional[dict] = None,
+                 exemplars: Optional[list[dict]] = None,
+                 exemplar_files: Optional[list[dict]] = None) -> dict:
+    """Initial checkpoint state for a fresh chain. server.py writes this to
+    db.chain_progress right after budget-checking, BEFORE any stage runs."""
+    role_sequence = _providers.role_sequence_for_tier(tier)
+    a = dict(_providers.assignments_for_tier(tier))
+    for role in role_sequence:
+        if assignments and assignments.get(role):
+            a[role] = assignments[role]
+    return {
+        "id": chain_id,
+        "target_prompt": target_prompt,
+        "tier": tier,
+        "role_sequence": role_sequence,
+        "stage_sequence": STAGE_SEQUENCE.get(tier, STAGE_SEQUENCE["free"]),
+        "stage_index": 0,
+        "assignments": a,
+        "exemplars": exemplars or [],
+        "exemplar_files": exemplar_files or [],
+        "tokens_used": 0,
+        "fallback_used": False,
+        "needs_fix": False,
+        "review_notes": "",
+        # accumulated pipeline outputs, filled in as stages run:
+        "teacher_spec": None,
+        "artist_spec": None,
+        "product": None,
+        "exec_result": None,
+        "scores": None,
+    }
+
+
+def _report(stage: str, progress: dict) -> str:
+    """Deterministic, no-extra-LLM-call human-readable summary of what a
+    stage just did — shown to the user immediately, while the next stage's
+    call is already starting in the background."""
+    if stage == "teacher":
+        ts = progress["teacher_spec"] or {}
+        return (f"Teacher reviewed your request and designed a build spec — "
+                f"targeting a {ts.get('stack', 'app')} build named "
+                f"\u201c{ts.get('name', 'this project')}\u201d. "
+                f"Handing the brief to the {'Architect' if 'architect' in progress['role_sequence'] else 'Artist'} next.")
+    if stage == "architect":
+        notes = (progress.get("_architect_notes") or "").strip()
+        return (f"Architect added structural guidance"
+                + (f": {notes}" if notes else ".")
+                + " Passing the refined brief to the Artist to write the actual code.")
+    if stage == "artist":
+        n_files = len((progress["artist_spec"] or {}).get("files") or [])
+        return f"Artist wrote {n_files} file(s). Moving on to run it and see if it actually works."
+    if stage == "execute":
+        er = progress["exec_result"] or {}
+        ok = er.get("started")
+        return (f"Build {'started successfully' if ok else 'failed to start'} "
+                f"(exit code {er.get('exit_code')}). "
+                + ("Sending it to Reviewer for a second look." if "reviewer" in progress["role_sequence"]
+                   else ("Needs a correction pass." if not ok else "Looking clean — on to scoring.")))
+    if stage == "reviewer":
+        flagged = progress.get("needs_fix")
+        return (f"Reviewer {'flagged issues' if flagged else 'signed off — no issues found'}"
+                + (f": {progress.get('review_notes', '')}" if flagged and progress.get("review_notes") else ".")
+                + (" Sending to Corrector." if flagged else " Skipping correction, moving to scoring."))
+    if stage == "correct":
+        if progress.get("_correction_ran"):
+            return "Corrector patched the build and re-ran it to confirm the fix took."
+        return "No correction needed — build was already working."
+    if stage == "rate":
+        return "Rater scored the build against your original request."
+    if stage == "score":
+        cs = (progress["product"] or {}).get("composite_score")
+        gated = (progress["product"] or {}).get("composite_gated")
+        if gated:
+            return "Final score: build didn't clear the minimum coverage bar — flagged as incomplete rather than scored on style alone."
+        return f"Done. Final score: {cs}. Build complete."
+    return f"{stage} complete."
+
+
+async def run_stage(progress: dict) -> dict:
+    """Executes exactly the stage at progress['stage_index'], mutates and
+    returns `progress` with that stage's outputs filled in, plus `_report`
+    (string) and `_done` (bool) for the caller to surface to the user.
+    Does NOT advance stage_index for the caller automatically on error —
+    raises on unrecoverable failure so server.py can mark the chain failed
+    rather than silently getting stuck."""
+    seq = progress["stage_sequence"]
+    idx = progress["stage_index"]
+    stage = seq[idx]
+    a = progress["assignments"]
+    tier = progress["tier"]
+    chain_id = progress["id"]
+    user_keys = progress.get("_user_keys")  # injected by server.py per-call (never persisted)
+
+    uses_groq = tier in ("free", "trial") and any(
+        v.get("provider") == "groq" for v in a.values() if isinstance(v, dict))
+    max_attempts = max(1, _usage.pool_size(tier)) if uses_groq else 1
+    last_exc = None
+    for attempt in range(max_attempts):
+        if uses_groq:
+            user_keys = dict(progress.get("_user_keys") or {})
+            rotated = _usage.next_groq_key(tier)
+            if rotated:
+                user_keys["groq"] = rotated
+        try:
+            if stage == "teacher":
+                ts = await teacher_step(progress["target_prompt"], progress["exemplars"],
+                                        assignment=a["teacher"], user_keys=user_keys,
+                                        chain_id=chain_id, tier=tier)
+                progress["tokens_used"] += ts.pop("_tokens", 0)
+                progress["teacher_spec"] = ts
+
+            elif stage == "architect":
+                arch = await architect_step(progress["target_prompt"], progress["teacher_spec"],
+                                            assignment=a["architect"], user_keys=user_keys,
+                                            chain_id=chain_id, tier=tier)
+                progress["tokens_used"] += arch.pop("_tokens", 0)
+                notes = arch.get("architecture_notes", "")
+                progress["_architect_notes"] = notes
+                if notes:
+                    ts = progress["teacher_spec"]
+                    ts["artist_brief"] = f"{ts.get('artist_brief', '')}\n\nARCHITECT GUIDANCE: {notes}".strip()
+
+            elif stage == "artist":
+                spec = await artist_step(progress["teacher_spec"], exemplar_files=progress["exemplar_files"],
+                                         assignment=a["artist"], user_keys=user_keys,
+                                         chain_id=chain_id, tier=tier)
+                progress["tokens_used"] += spec.pop("_tokens", 0)
+                progress["artist_spec"] = spec
+
+            elif stage == "execute":
+                await _emit(chain_id, "stage", "materialize")
+                product = dict(progress["artist_spec"])
+                product["target_prompt"] = progress["target_prompt"]
+                product["teacher_spec"] = progress["teacher_spec"]
+                product["artist_spec"] = {k: v for k, v in progress["artist_spec"].items() if k != "files"}
+                product["files"] = seed_template.render(product, stack=product.get("stack") or progress["teacher_spec"].get("stack"))
+                stack_l = (product.get("stack") or "").lower()
+                exec_timeout = 90 if any(k in stack_l for k in ("node", "vite", "react", "rust", "go")) else 25
+                workspace = _exec.materialize(chain_id, product)
+                exec_result = await _exec.run_workspace(workspace, timeout=exec_timeout, port_to_check=8123)
+                product["exec"] = exec_result
+                progress["product"] = product
+                progress["exec_result"] = exec_result
+                progress["needs_fix"] = not exec_result.get("started")
+
+            elif stage == "reviewer":
+                review = await reviewer_step(progress["product"], progress["exec_result"],
+                                             assignment=a["reviewer"], user_keys=user_keys,
+                                             chain_id=chain_id, tier=tier)
+                progress["tokens_used"] += review.pop("_tokens", 0)
+                progress["needs_fix"] = progress["needs_fix"] or bool(review.get("needs_fix"))
+                progress["review_notes"] = review.get("review_notes", "")
+                progress["product"]["reviewer"] = review
+
+            elif stage == "correct":
+                if progress["needs_fix"] and (progress["exec_result"].get("stderr") or progress["review_notes"]):
+                    progress["fallback_used"] = True
+                    progress["_correction_ran"] = True
+                    corrector_role_key = "corrector" if "corrector" in progress["role_sequence"] else "artist"
+                    corrector_assignment = a.get("corrector") if "corrector" in progress["role_sequence"] else a["artist"]
+                    product = await correct_step(progress["product"], progress["exec_result"].get("stderr", ""),
+                                                 assignment=corrector_assignment, user_keys=user_keys,
+                                                 role_key=corrector_role_key, review_notes=progress["review_notes"],
+                                                 tier=tier)
+                    progress["tokens_used"] += product.pop("_tokens", 0)
+                    product["files"] = seed_template.render(product, stack=product.get("stack"))
+                    stack_l = (product.get("stack") or "").lower()
+                    exec_timeout = 90 if any(k in stack_l for k in ("node", "vite", "react", "rust", "go")) else 25
+                    workspace = _exec.materialize(chain_id, product)
+                    exec_result = await _exec.run_workspace(workspace, timeout=exec_timeout, port_to_check=8124)
+                    product["exec"] = exec_result
+                    progress["product"] = product
+                    progress["exec_result"] = exec_result
+                else:
+                    progress["_correction_ran"] = False
+
+            elif stage == "rate":
+                scores = await rate_step(progress["product"], progress["exec_result"],
+                                         assignment=a["rater"], user_keys=user_keys, tier=tier)
+                progress["tokens_used"] += scores.pop("_tokens", 0)
+                progress["scores"] = scores
+                progress["product"]["reward"] = scores
+
+            elif stage == "score":
+                product = progress["product"]
+                cov = _coverage.score(progress["target_prompt"], product.get("files") or [])
+                product["coverage"] = cov
+                if "corrector" in progress["role_sequence"] or "architect" in progress["role_sequence"]:
+                    nov = novelty_score(product.get("files") or [], progress["exemplar_files"])
+                    result = composite_v2(cov.get("coverage"), progress["scores"], nov)
+                    product["novelty"] = nov
+                    product["composite_gated"] = result["gated"]
+                    product["composite_score"] = result["score"]
+                else:
+                    base = composite(progress["scores"])
+                    product["composite_score"] = (round(base * 0.6 + (cov["coverage"] * 4.0) * 0.4, 3)
+                                                  if cov.get("coverage") is not None else base)
+                product["gen"] = 1
+                product["tier"] = tier
+                product["tokens_used"] = progress["tokens_used"]
+                product["critic_notes"] = (
+                    f"Ran: {progress['exec_result'].get('started')}. "
+                    f"Exit: {progress['exec_result'].get('exit_code')}. "
+                    f"Port listening: {progress['exec_result'].get('port_listening')}."
+                )
+                product["assignments"] = {k: a[k] for k in progress["role_sequence"] if k in a}
+                progress["product"] = product
+                await _emit(chain_id, "stage", "complete")
+
+            last_exc = None
+            break
+        except ProviderRateLimitedError as exc:
+            last_exc = exc
+            logger.warning("chain %s stage %s rate-limited on attempt %d/%d — rotating key",
+                           chain_id, stage, attempt + 1, max_attempts)
+            continue
+    if last_exc is not None:
+        raise last_exc
+    progress["_report"] = _report(stage, progress)
+    progress["_done"] = (idx + 1) >= len(seq)
+    if not progress["_done"]:
+        progress["stage_index"] = idx + 1
+    return progress
 
 
 class ArtistFailedError(Exception):
@@ -433,7 +787,8 @@ class ArtistFailedError(Exception):
 async def artist_step(teacher_spec: dict, exemplar_files: Optional[list[dict]] = None,
                       assignment: Optional[dict] = None,
                       user_keys: Optional[dict] = None,
-                      chain_id: Optional[str] = None) -> dict:
+                      chain_id: Optional[str] = None,
+                      tier: Optional[str] = None) -> dict:
     parsed: dict = {}
     raw = ""
     exemplar_block = ""
@@ -465,6 +820,7 @@ async def artist_step(teacher_spec: dict, exemplar_files: Optional[list[dict]] =
         exemplar_block = "\n\n".join(parts)
 
     await _emit(chain_id, "stage", "artist")
+    artist_tokens = 0
     for attempt in range(3):
         directive = ("Write the source files as strict JSON. Include the FULL content of every "
                      "file — no ellipsis, no TODOs.")
@@ -483,16 +839,17 @@ async def artist_step(teacher_spec: dict, exemplar_files: Optional[list[dict]] =
         user_msg += directive
         if attempt > 0:
             await _emit(chain_id, "stage", f"artist-retry-{attempt}")
-        raw = await _call_role(
+        raw, call_tokens = await _call_role(
             "artist",
             [{"role": "system", "content": SYSTEM_ARTIST},
              {"role": "user", "content": user_msg}],
             assignment,
-            user_keys=user_keys,
+            user_keys=user_keys, tier=tier,
             stream_chain_id=chain_id, stream_event="artist_delta",
             temperature=(0.7, 0.4, 0.2)[attempt],
             max_tokens=(12000, 8000, 4000)[attempt],
         )
+        artist_tokens += call_tokens
         parsed = _extract_json(raw or "") or {}
         logger.info("ARTIST attempt=%d raw_len=%d keys=%s files=%d",
                     attempt, len(raw or ""), list(parsed.keys()),
@@ -522,6 +879,7 @@ async def artist_step(teacher_spec: dict, exemplar_files: Optional[list[dict]] =
     parsed.setdefault("accent2_hex", teacher_spec.get("accent2_hex", "#ff79c6"))
     parsed.setdefault("weights", {"helpfulness": 0.35, "correctness": 0.30,
                                   "coherence": 0.20, "complexity": 0.10, "verbosity": -0.05})
+    parsed["_tokens"] = artist_tokens
     # Sanitize files array — reject entries missing path or content, drop obvious
     # placeholders, and REJECT any path that tries to escape the workspace via
     # `..`, absolute paths, or backslashes / null bytes (SEC-002). Reuse the
@@ -545,7 +903,11 @@ async def artist_step(teacher_spec: dict, exemplar_files: Optional[list[dict]] =
 
 
 async def correct_step(spec: dict, stderr: str, assignment: Optional[dict] = None,
-                       user_keys: Optional[dict] = None) -> dict:
+                       user_keys: Optional[dict] = None, role_key: str = "artist",
+                       review_notes: str = "", tier: Optional[str] = None) -> dict:
+    """role_key: which assignment slot to route through. Free tier reuses the
+    Artist's own model ("artist"); trial/paid tiers can route through a
+    dedicated "corrector" assignment instead."""
     file_dump = "\n\n".join(
         f"### {f['path']}\n```\n{f['content'][:2000]}\n```"
         for f in (spec.get("files") or [])[:10]
@@ -554,16 +916,18 @@ async def correct_step(spec: dict, stderr: str, assignment: Optional[dict] = Non
         f"Stack: {spec.get('stack')}\nName: {spec.get('name')}\n\n"
         f"CURRENT FILES:\n{file_dump}\n\n"
         f"STDERR (tail):\n{stderr[-1500:]}\n\n"
-        f"Output the corrected JSON (Artist schema, including the full `files` array)."
+        + (f"REVIEWER NOTES:\n{review_notes}\n\n" if review_notes else "")
+        + "Output the corrected JSON (Artist schema, including the full `files` array)."
     )
-    raw = await _call_role(
-        "artist",  # corrector reuses the artist's model
+    raw, corrector_tokens = await _call_role(
+        role_key,
         [{"role": "system", "content": SYSTEM_CORRECTOR},
          {"role": "user", "content": prompt}],
-        assignment, user_keys=user_keys, temperature=0.3, max_tokens=6000,
+        assignment, user_keys=user_keys, tier=tier, temperature=0.3, max_tokens=6000,
     )
     fixed = _extract_json(raw or "") if raw else {}
     if not fixed:
+        spec["_tokens"] = spec.get("_tokens", 0) + corrector_tokens
         return spec
     # merge: corrector's non-file fields overlay spec, corrector's files replace spec's files if present
     merged = {**spec, **{k: v for k, v in fixed.items() if k != "files"}}
@@ -580,22 +944,23 @@ async def correct_step(spec: dict, stderr: str, assignment: Optional[dict] = Non
             clean.append({"path": path, "content": f["content"]})
         if clean:
             merged["files"] = clean
+    merged["_tokens"] = spec.get("_tokens", 0) + corrector_tokens
     return merged
 
 
 async def rate_step(spec: dict, exec_result: dict, assignment: Optional[dict] = None,
-                    user_keys: Optional[dict] = None) -> dict:
+                    user_keys: Optional[dict] = None, tier: Optional[str] = None) -> dict:
     brief = json.dumps({
         "name": spec.get("name"), "philosophy": spec.get("philosophy"),
         "improvement_note": spec.get("improvement_note"),
         "exec_started": exec_result.get("started"),
         "exec_error_tail": (exec_result.get("stderr") or "")[-300:],
     }, indent=2)
-    raw = await _call_role(
+    raw, rater_tokens = await _call_role(
         "rater",
         [{"role": "system", "content": SYSTEM_RATER},
          {"role": "user", "content": brief}],
-        assignment, user_keys=user_keys, temperature=0.1, max_tokens=2000,
+        assignment, user_keys=user_keys, tier=tier, temperature=0.1, max_tokens=2000,
     )
     data = _extract_json(raw or "") if raw else {}
     keys = ("helpfulness", "correctness", "coherence", "complexity", "verbosity")
@@ -603,7 +968,9 @@ async def rate_step(spec: dict, exec_result: dict, assignment: Optional[dict] = 
     def _deterministic() -> dict:
         started = bool(exec_result.get("started"))
         base = 2.8 if started else 1.2
-        return {k: base for k in keys}
+        out = {k: base for k in keys}
+        out["_tokens"] = rater_tokens
+        return out
 
     if not data:
         return _deterministic()
@@ -618,6 +985,7 @@ async def rate_step(spec: dict, exec_result: dict, assignment: Optional[dict] = 
     # Clamp to spec range so a rogue model can't push composite absurdly high.
     for k in keys:
         values[k] = max(0.0, min(4.0, values[k]))
+    values["_tokens"] = rater_tokens
     return values
 
 
@@ -633,6 +1001,62 @@ def composite(scores: dict) -> float:
 
 
 # ---------------------------------------------------------------------------
+# composite_v2 — coverage-gated score with a novelty bonus for the 6-role
+# (trial/paid) pipeline. Does NOT replace composite() above, which is still
+# used for the free-tier 2-role pipeline's rater-only scoring.
+#
+#   composite_v2 = coverage*0.4 + rater*0.4 + novelty*0.2
+#   HARD GATE: if coverage < COVERAGE_GATE_THRESHOLD, score is 0 before the
+#   weighted formula ever runs — a creative-but-broken build cannot pass on
+#   novelty alone.
+# ---------------------------------------------------------------------------
+COVERAGE_GATE_THRESHOLD = 0.5
+
+
+def _word_set(text: str) -> set:
+    return set(re.findall(r"[a-zA-Z_][a-zA-Z0-9_]{2,}", (text or "").lower()))
+
+
+def novelty_score(files: list[dict], exemplar_files: Optional[list[dict]]) -> float:
+    """Novelty relative to the 'expected' solution — approximated here as the
+    nearest prior verified exemplar for a similar target (already loaded by
+    the caller, no extra LLM call needed). 1.0 = maximally different from
+    what's been built before for similar prompts, 0.0 = near-identical.
+    Falls back to a neutral 0.5 when there's nothing to compare against
+    (first-ever build in a category shouldn't be penalized OR rewarded)."""
+    if not exemplar_files:
+        return 0.5
+    new_words = _word_set("\n".join(f.get("content", "") for f in files if isinstance(f, dict)))
+    if not new_words:
+        return 0.5
+    best_similarity = 0.0
+    for ex in exemplar_files[:3]:
+        ex_words = _word_set("\n".join(f.get("content", "") for f in (ex.get("files") or [])
+                                        if isinstance(f, dict)))
+        if not ex_words:
+            continue
+        inter = len(new_words & ex_words)
+        union = len(new_words | ex_words)
+        similarity = (inter / union) if union else 0.0
+        best_similarity = max(best_similarity, similarity)
+    return round(max(0.0, min(1.0, 1.0 - best_similarity)), 3)
+
+
+def composite_v2(coverage: Optional[float], rater_scores: dict, novelty: float) -> dict:
+    """Returns {"score": float 0-4ish, "gated": bool, "coverage": float, "novelty": float}.
+    rater_scores is the same dict rate_step() returns (helpfulness/correctness/etc) —
+    we normalize its composite() output (roughly 0-4 scale) down to 0-1 to combine
+    with coverage/novelty, then scale the final blended score back to 0-4 for
+    consistency with the existing composite()'s range."""
+    rater_norm = max(0.0, min(1.0, composite(rater_scores) / 4.0))
+    cov = coverage if coverage is not None else 0.5  # neutral when no deterministic signal
+    if cov < COVERAGE_GATE_THRESHOLD:
+        return {"score": 0.0, "gated": True, "coverage": cov, "novelty": novelty}
+    blended = cov * 0.4 + rater_norm * 0.4 + novelty * 0.2
+    return {"score": round(blended * 4.0, 3), "gated": False, "coverage": cov, "novelty": novelty}
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 async def evolve_chain_with_callback(
@@ -644,31 +1068,68 @@ async def evolve_chain_with_callback(
     exemplars: Optional[list[dict]] = None,
     exemplar_files: Optional[list[dict]] = None,
     user_keys: Optional[dict] = None,
+    tier: str = "free",
 ) -> dict:
-    """One chain = one product build:
-       Human target -> Teacher spec -> Artist product -> Executor (+ 1 correction) -> Rater.
+    """One chain = one product build.
+       free tier  (2 roles): Teacher -> Artist -> Executor (+correction) -> Rater.
+       trial/paid (6 roles): Teacher -> Architect -> Artist -> Executor ->
+                              Reviewer -> (Corrector if flagged) -> Rater -> novelty.
     Raises ArtistFailedError if the Artist can't produce real files after retries.
+
+    Caller (server.py) is expected to have already run usage.check_budget()
+    for this tier/user BEFORE calling this — this function does not itself
+    gate on budget, it just reports tokens_used back in `final` so the caller
+    can log it to the usage ledger after the fact.
     """
-    a = dict(_providers.DEFAULT_ASSIGNMENTS)
-    for role in ("teacher", "artist", "rater"):
+    role_sequence = _providers.role_sequence_for_tier(tier)
+    a = dict(_providers.assignments_for_tier(tier))
+    for role in role_sequence:
         if assignments and assignments.get(role):
             a[role] = assignments[role]
 
+    # GROQ KEY ROTATION — free/trial tiers route through our own rotating
+    # Groq key pools (kept separate so trial traffic never starves the free
+    # pool). Reuses the existing BYOK plumbing: _client_for always builds a
+    # fresh client when user_keys has an entry for the provider, so injecting
+    # a rotated key here transparently swaps the key used for every Groq
+    # call in this chain without touching _call_role/_chat/_client_for.
+    if tier in ("free", "trial") and any(v.get("provider") == "groq" for v in a.values() if isinstance(v, dict)):
+        user_keys = dict(user_keys or {})
+        rotated = _usage.next_groq_key(tier)
+        if rotated:
+            user_keys["groq"] = rotated
+
     exemplars = exemplars or []
     fallback_used = False
+    tokens_used = 0
 
     try:
-        # 1) TEACHER
+        # 1) TEACHER (always runs)
         teacher_spec = await teacher_step(target_prompt, exemplars,
                                           assignment=a["teacher"],
                                           user_keys=user_keys,
-                                          chain_id=chain_id)
+                                          chain_id=chain_id, tier=tier)
+        tokens_used += teacher_spec.pop("_tokens", 0)
+
+        # 1b) ARCHITECT (trial/paid only) — folds structural guidance into the
+        # Artist's brief before the Artist ever runs.
+        if "architect" in role_sequence:
+            arch = await architect_step(target_prompt, teacher_spec,
+                                        assignment=a["architect"],
+                                        user_keys=user_keys, chain_id=chain_id, tier=tier)
+            tokens_used += arch.pop("_tokens", 0)
+            if arch.get("architecture_notes"):
+                teacher_spec["artist_brief"] = (
+                    f"{teacher_spec.get('artist_brief', '')}\n\n"
+                    f"ARCHITECT GUIDANCE: {arch['architecture_notes']}"
+                ).strip()
 
         # 2) ARTIST — writes the real source files. Raises if all attempts truncate.
         artist_spec = await artist_step(teacher_spec, exemplar_files=exemplar_files,
                                         assignment=a["artist"],
                                         user_keys=user_keys,
-                                        chain_id=chain_id)
+                                        chain_id=chain_id, tier=tier)
+        tokens_used += artist_spec.pop("_tokens", 0)
 
         # 3) BUILD PRODUCT
         await _emit(chain_id, "stage", "materialize")
@@ -686,41 +1147,68 @@ async def evolve_chain_with_callback(
         exec_result = await _exec.run_workspace(workspace, timeout=exec_timeout, port_to_check=8123)
         product["exec"] = exec_result
 
-        # 5) ONE correction pass if it failed to start
-        if not exec_result.get("started") and exec_result.get("stderr"):
+        # 4b) REVIEWER (trial/paid only) — can flag a correction pass even on
+        # a build that technically started but doesn't satisfy the target.
+        needs_fix = not exec_result.get("started")
+        review_notes = ""
+        if "reviewer" in role_sequence:
+            review = await reviewer_step(product, exec_result, assignment=a["reviewer"],
+                                         user_keys=user_keys, chain_id=chain_id, tier=tier)
+            tokens_used += review.pop("_tokens", 0)
+            needs_fix = needs_fix or bool(review.get("needs_fix"))
+            review_notes = review.get("review_notes", "")
+            product["reviewer"] = review
+
+        # 5) CORRECTION pass if execution failed OR reviewer flagged it
+        if needs_fix and (exec_result.get("stderr") or review_notes):
             fallback_used = True
             await _emit(chain_id, "stage", "corrector")
-            product = await correct_step(product, exec_result["stderr"],
-                                         assignment=a["artist"], user_keys=user_keys)
+            corrector_role_key = "corrector" if "corrector" in role_sequence else "artist"
+            corrector_assignment = a.get("corrector") if "corrector" in role_sequence else a["artist"]
+            product = await correct_step(product, exec_result.get("stderr", ""),
+                                         assignment=corrector_assignment, user_keys=user_keys,
+                                         role_key=corrector_role_key, review_notes=review_notes,
+                                         tier=tier)
+            tokens_used += product.pop("_tokens", 0)
             product["files"] = seed_template.render(product, stack=product.get("stack"))
             workspace = _exec.materialize(chain_id, product)
             exec_result = await _exec.run_workspace(workspace, timeout=exec_timeout, port_to_check=8124)
             product["exec"] = exec_result
 
-        # 6) RATER
+        # 6) RATER (always runs)
         await _emit(chain_id, "stage", "rater")
-        scores = await rate_step(product, exec_result, assignment=a["rater"], user_keys=user_keys)
+        scores = await rate_step(product, exec_result, assignment=a["rater"], user_keys=user_keys, tier=tier)
+        tokens_used += scores.pop("_tokens", 0)
         product["reward"] = scores
 
-        # 6b) Deterministic feature-coverage — parses the code and target prompt
-        # to check hard signals (list lengths, routes, UI verbs, network calls).
+        # 6b) Deterministic feature-coverage — no LLM call, regex-based.
         cov = _coverage.score(target_prompt, product.get("files") or [])
         product["coverage"] = cov
-        # Blend coverage into the composite when it's available so the final
-        # score reflects real behaviour, not just the LLM rater's opinion.
-        base = composite(scores)
-        if cov.get("coverage") is not None:
-            # Coverage scales 0..1 -> weight ~40% of the final score.
-            product["composite_score"] = round(base * 0.6 + (cov["coverage"] * 4.0) * 0.4, 3)
+
+        if "corrector" in role_sequence or "architect" in role_sequence:
+            # Full 6-role pipeline: coverage-gated composite_v2 with novelty.
+            nov = novelty_score(product.get("files") or [], exemplar_files)
+            result = composite_v2(cov.get("coverage"), scores, nov)
+            product["novelty"] = nov
+            product["composite_gated"] = result["gated"]
+            product["composite_score"] = result["score"]
         else:
-            product["composite_score"] = base
+            # Free tier: original 2-role blend (unchanged behavior).
+            base = composite(scores)
+            if cov.get("coverage") is not None:
+                product["composite_score"] = round(base * 0.6 + (cov["coverage"] * 4.0) * 0.4, 3)
+            else:
+                product["composite_score"] = base
+
         product["gen"] = 1
+        product["tier"] = tier
+        product["tokens_used"] = tokens_used
         product["critic_notes"] = (
             f"Ran: {exec_result.get('started')}. "
             f"Exit: {exec_result.get('exit_code')}. "
             f"Port listening: {exec_result.get('port_listening')}."
         )
-        product["assignments"] = {k: a[k] for k in ("teacher", "artist", "rater")}
+        product["assignments"] = {k: a[k] for k in role_sequence if k in a}
 
         await on_gen(chain_id, product, fallback_used)
 
@@ -730,6 +1218,8 @@ async def evolve_chain_with_callback(
             "depth": 1,
             "fallback_used": fallback_used,
             "generations": [product],
+            "tier": tier,
+            "tokens_used": tokens_used,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         await on_done(chain_id, final)

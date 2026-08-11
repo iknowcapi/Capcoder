@@ -32,6 +32,18 @@ logger = logging.getLogger("providers")
 # Provider registry
 # ---------------------------------------------------------------------------
 PROVIDERS = {
+    "groq": {
+        "label": "Groq",
+        "base_url": "https://api.groq.com/openai/v1",
+        # Primary key env var. Rotation pool (free-tier + trial-tier) is
+        # handled separately in usage.py via GROQ_API_KEY_1..N / GROQ_TRIAL_KEY_1..N.
+        "api_key_env": "GROQ_API_KEY",
+        "models_url": "https://api.groq.com/openai/v1/models",
+        "static_models": [
+            {"id": "llama-3.3-70b-versatile", "coding": True, "uncensored": False, "roles": ["teacher", "artist"]},
+            {"id": "llama-3.1-8b-instant", "coding": True, "uncensored": False, "roles": ["rater", "corrector"]},
+        ],
+    },
     "nvidia": {
         "label": "NVIDIA NIM",
         "base_url": "https://integrate.api.nvidia.com/v1",
@@ -63,6 +75,47 @@ PROVIDERS = {
 def provider_key(name: str) -> Optional[str]:
     env = PROVIDERS.get(name, {}).get("api_key_env", "")
     return (os.environ.get(env, "") or "").strip() or None
+
+
+# ---------------------------------------------------------------------------
+# Groq key rotation pools
+# ---------------------------------------------------------------------------
+# Free-tier pool: GROQ_API_KEY_1, GROQ_API_KEY_2, ... (set as many as you have
+# in Vercel env vars). Trial-tier pool: GROQ_TRIAL_KEY_1, GROQ_TRIAL_KEY_2, ...
+# Kept as SEPARATE pools so trial traffic can never starve free-tier capacity.
+_groq_pool_idx = {"free": 0, "trial": 0}
+
+
+def _load_key_pool(prefix: str) -> list[str]:
+    keys = []
+    i = 1
+    while True:
+        v = (os.environ.get(f"{prefix}_{i}", "") or "").strip()
+        if not v:
+            break
+        keys.append(v)
+        i += 1
+    return keys
+
+
+def groq_key_pool(pool: str = "free") -> list[str]:
+    prefix = "GROQ_API_KEY" if pool == "free" else "GROQ_TRIAL_KEY"
+    keys = _load_key_pool(prefix)
+    if keys:
+        return keys
+    # Fall back to a single GROQ_API_KEY if no numbered pool is configured.
+    single = provider_key("groq")
+    return [single] if single else []
+
+
+def next_groq_key(pool: str = "free") -> Optional[str]:
+    """Round-robin the next key in the given pool ('free' or 'trial')."""
+    keys = groq_key_pool(pool)
+    if not keys:
+        return None
+    idx = _groq_pool_idx[pool] % len(keys)
+    _groq_pool_idx[pool] = (_groq_pool_idx[pool] + 1) % len(keys)
+    return keys[idx]
 
 
 def provider_available(name: str) -> bool:
@@ -216,6 +269,27 @@ async def _fetch_venice() -> list[dict]:
     return [m for m in out if m["uncensored"] or m["coding"]] or out
 
 
+async def _fetch_groq() -> list[dict]:
+    # Groq doesn't need a live /models fetch for our purposes — pin the
+    # known-good free-tier models, same pattern as NVIDIA's static set.
+    out = []
+    for spec in PROVIDERS["groq"]["static_models"]:
+        out.append({
+            "id": spec["id"],
+            "provider": "groq",
+            "display_name": spec["id"],
+            "description": "",
+            "coding": spec["coding"],
+            "uncensored": spec["uncensored"],
+            "context_len": 0,
+            "price_per_1m": 0.0,
+            "price_tier": "free",
+            "free": True,
+            "roles": spec["roles"],
+        })
+    return out
+
+
 async def _fetch_nvidia() -> list[dict]:
     # NVIDIA doesn't expose pricing/coding tags cleanly. Return our known-good static set.
     out = []
@@ -250,11 +324,11 @@ async def get_catalog(force: bool = False) -> list[dict]:
     if not force and _CACHE["models"] is not None and (now - _CACHE["loaded_at"] < _CACHE_TTL_SEC):
         return _CACHE["models"]
 
-    nv, orr, ve = await asyncio.gather(
-        _fetch_nvidia(), _fetch_openrouter(), _fetch_venice(),
+    gq, nv, orr, ve = await asyncio.gather(
+        _fetch_groq(), _fetch_nvidia(), _fetch_openrouter(), _fetch_venice(),
         return_exceptions=False,
     )
-    catalog = [*nv, *orr, *ve]
+    catalog = [*gq, *nv, *orr, *ve]
     _CACHE["models"] = catalog
     _CACHE["loaded_at"] = now
     return catalog
@@ -267,11 +341,58 @@ DEFAULT_ASSIGNMENTS = {
     "teacher": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash"},
     "artist":  {"provider": "openrouter", "model": "anthropic/claude-sonnet-5"},
     "rater":   {"provider": "openrouter", "model": "openai/gpt-3.5-turbo"},
+    "architect": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash"},
+    "reviewer":  {"provider": "openrouter", "model": "openai/gpt-4o-mini"},
+    "corrector": {"provider": "openrouter", "model": "anthropic/claude-sonnet-5"},
     # Fallbacks route through Venice, then OpenRouter.
-    "teacher_fallback": {"provider": "venice",     "model": "qwen3-coder-480b-a35b-instruct-turbo"},
-    "artist_fallback":  {"provider": "venice",     "model": "qwen3-coder-480b-a35b-instruct-turbo"},
-    "rater_fallback":   {"provider": "openrouter", "model": "openai/gpt-4o-mini"},
+    "teacher_fallback":   {"provider": "venice",     "model": "qwen3-coder-480b-a35b-instruct-turbo"},
+    "artist_fallback":    {"provider": "venice",     "model": "qwen3-coder-480b-a35b-instruct-turbo"},
+    "rater_fallback":     {"provider": "openrouter", "model": "openai/gpt-4o-mini"},
+    "architect_fallback": {"provider": "venice",     "model": "qwen3-coder-480b-a35b-instruct-turbo"},
+    "reviewer_fallback":  {"provider": "openrouter", "model": "openai/gpt-4o-mini"},
+    "corrector_fallback": {"provider": "venice",     "model": "qwen3-coder-480b-a35b-instruct-turbo"},
 }
+
+# ---------------------------------------------------------------------------
+# Tier -> role pipeline + provider routing
+# ---------------------------------------------------------------------------
+# Free: only teacher+artist ever run, pinned to Groq, no NVIDIA per spec.
+# Trial: full 6-role team, token-capped, Groq+NVIDIA+OpenRouter.
+# Paid: full 6-role team, OpenRouter/Venice primary (unlimited within plan tokens).
+TIER_ROLE_SEQUENCE = {
+    "free":  ["teacher", "artist"],
+    "trial": ["teacher", "architect", "artist", "reviewer", "rater", "corrector"],
+    "paid":  ["teacher", "architect", "artist", "reviewer", "rater", "corrector"],
+}
+
+TIER_ASSIGNMENTS = {
+    "free": {
+        "teacher": {"provider": "groq", "model": "llama-3.3-70b-versatile"},
+        "artist":  {"provider": "groq", "model": "llama-3.3-70b-versatile"},
+        # Rater always runs regardless of tier (needed to score/select the
+        # build) — cheapest Groq model to keep it free-tier friendly.
+        "rater":   {"provider": "groq", "model": "llama-3.1-8b-instant"},
+        # No fallback chain on free — if Groq's pool is exhausted, the
+        # tier/budget check in usage.py stops the call before it ever gets here.
+    },
+    "trial": {
+        "teacher":   {"provider": "groq",   "model": "llama-3.3-70b-versatile"},
+        "architect": {"provider": "nvidia", "model": "z-ai/glm-5.2"},
+        "artist":    {"provider": "groq",   "model": "llama-3.3-70b-versatile"},
+        "reviewer":  {"provider": "nvidia", "model": "nvidia/llama-3.3-nemotron-super-49b-v1.5"},
+        "rater":     {"provider": "groq",   "model": "llama-3.1-8b-instant"},
+        "corrector": {"provider": "openrouter", "model": "openai/gpt-4o-mini"},
+    },
+    "paid": DEFAULT_ASSIGNMENTS,  # full OpenRouter/Venice routing as already defined above
+}
+
+
+def assignments_for_tier(tier: str) -> dict:
+    return TIER_ASSIGNMENTS.get(tier, TIER_ASSIGNMENTS["free"])
+
+
+def role_sequence_for_tier(tier: str) -> list[str]:
+    return TIER_ROLE_SEQUENCE.get(tier, TIER_ROLE_SEQUENCE["free"])
 
 
 def openai_client_for(provider: str, api_key: Optional[str] = None):

@@ -28,6 +28,8 @@ import chain_generator
 import docdb
 import executor as _exec
 import providers as _providers
+import usage as _usage
+import tiers as _tiers
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -579,13 +581,37 @@ async def evolve(req: EvolveRequest, background_tasks: BackgroundTasks, request:
     if not owner.get("user_id") and not owner.get("anon"):
         raise HTTPException(400, "no session identity — sign in or send X-Capcode-Session header")
 
-    # resolve assignments from saved settings (or defaults)
+    # TIER — signed-in users carry a `tier` field on their user doc
+    # (free/trial/paid). Anonymous sessions are always free-tier: trial and
+    # paid both require an account so the 7-day clock and token ledger can
+    # actually be tracked per-user.
+    tier = "free"
+    user_doc = None
+    if owner.get("user_id"):
+        user_doc = await db.users.find_one({"user_id": owner["user_id"]})
+        tier = (user_doc or {}).get("tier", "free")
+        if tier == "trial" and not (user_doc or {}).get("trial_started_at"):
+            # First trial use starts the 7-day clock.
+            await db.users.update_one(
+                {"user_id": owner["user_id"]},
+                {"$set": {"trial_started_at": datetime.now(timezone.utc).isoformat()}},
+            )
+
+    # BUDGET — check BEFORE doing any work or spending any tokens. Free tier
+    # throttle is a soft message with an upgrade nudge, per spec; trial/paid
+    # throttles are similar but reflect their own reason codes.
+    budget = await _usage.check_budget(db, owner.get("user_id") or owner.get("anon"), tier)
+    if not budget["ok"]:
+        raise HTTPException(429, _usage.THROTTLE_MESSAGE)
+
+    # resolve assignments from saved settings (or defaults) — only for roles
+    # that are actually part of this tier's pipeline.
+    role_sequence = _providers.role_sequence_for_tier(tier)
     assignments = None
     if req.session_id:
         s = await db.settings.find_one({"session_id": req.session_id}, {"_id": 0})
         if s:
-            roles = ("teacher", "artist", "rater")
-            assignments = {r: s[r] for r in roles if s.get(r)}
+            assignments = {r: s[r] for r in role_sequence if s.get(r)}
 
     # SEC — server-side consent gate for Venice/uncensored routing. Any role
     # resolved to provider == "venice" requires a *recent* consent record for
@@ -593,8 +619,10 @@ async def evolve(req: EvolveRequest, background_tasks: BackgroundTasks, request:
     # gate alone. On success we stamp the consent record's id/timestamp onto
     # the chain doc for a permanent audit trail.
     _resolved = assignments or {}
-    _effective_roles = [(_resolved.get(r) or _providers.DEFAULT_ASSIGNMENTS.get(r) or {})
-                        for r in ("teacher", "artist", "rater")]
+    _tier_defaults = _providers.assignments_for_tier(tier)
+    _effective_roles = [(_resolved.get(r) or _tier_defaults.get(r)
+                          or _providers.DEFAULT_ASSIGNMENTS.get(r) or {})
+                        for r in role_sequence]
     _venice_used = any((a.get("provider") == "venice") for a in _effective_roles)
     _venice_consent_stamp: Optional[dict] = None
     if _venice_used:
@@ -664,55 +692,91 @@ async def evolve(req: EvolveRequest, background_tasks: BackgroundTasks, request:
             logger.warning("failed to back-fill consent.chain_id: %s", exc)
     await db.chains.insert_one({**stub})
 
-    async def on_gen(cid: str, gen: dict, fallback: bool):
-        await db.chains.update_one(
-            {"id": cid},
-            {"$push": {"generations": gen}, "$set": {"fallback_used": fallback}},
-        )
+    # CHECKPOINTED PIPELINE — /evolve only initializes state and returns
+    # immediately. Nothing runs here. The frontend drives progress by
+    # calling /advance repeatedly, once per stage, showing each stage's
+    # report while the next call is already in flight. No single request
+    # ever does more than one LLM call's worth of work, so there's no long-
+    # running function for any serverless timeout to kill.
+    progress = chain_generator.new_progress(
+        chain_id, target, tier,
+        assignments=assignments, exemplars=exemplars, exemplar_files=exemplar_files,
+    )
+    # SEC: never persist decrypted BYOK keys to the DB. Store only the
+    # session_id so /advance can re-derive keys fresh on each stage call.
+    progress["_session_id"] = req.session_id
+    await db.chain_progress.insert_one(_stamp_owner(progress, owner))
 
-    async def on_done(cid: str, final: dict):
-        await db.chains.update_one(
-            {"id": cid},
-            {"$set": {
-                "status": "complete",
-                "fallback_used": final["fallback_used"],
-                "completed_at": datetime.now(timezone.utc).isoformat(),
-            }},
-        )
-
-    async def _runner():
-        try:
-            user_keys = await _load_user_keys(req.session_id)
-            await chain_generator.evolve_chain_with_callback(
-                chain_id, target, on_gen, on_done,
-                assignments=assignments, exemplars=exemplars,
-                exemplar_files=exemplar_files, user_keys=user_keys,
-            )
-        except chain_generator.ArtistFailedError as exc:
-            logger.warning("chain %s: artist failed — %s", chain_id, exc)
-            await db.chains.update_one(
-                {"id": chain_id},
-                {"$set": {
-                    "status": "failed",
-                    "error": str(exc),
-                    "completed_at": datetime.now(timezone.utc).isoformat(),
-                }},
-            )
-        except Exception as exc:
-            logger.exception("chain %s failed: %s", chain_id, exc)
-            await db.chains.update_one(
-                {"id": chain_id},
-                {"$set": {
-                    "status": "failed",
-                    "error": str(exc),
-                    "completed_at": datetime.now(timezone.utc).isoformat(),
-                }},
-            )
-
-    background_tasks.add_task(_runner)
     stub_out = {**stub}
     stub_out["created_at"] = datetime.fromisoformat(stub_out["created_at"])
+    stub_out["next_stage"] = progress["stage_sequence"][0]
     return stub_out
+
+
+@api.post("/chains/{chain_id}/advance")
+async def advance_chain(chain_id: str, request: Request):
+    """Runs exactly ONE stage of the pipeline and returns a human-readable
+    report of what just happened. Call this repeatedly (frontend can fire
+    the next call immediately after rendering the report) until done=true."""
+    owner = await _owner_from_request(request)
+    q = {"id": chain_id, **_owner_filter(owner)}
+    progress = await db.chain_progress.find_one(q)
+    if not progress:
+        raise HTTPException(404, "chain not found or already finalized")
+
+    # Re-derive BYOK keys fresh each call — never stored in chain_progress.
+    progress["_user_keys"] = await _load_user_keys(progress.get("_session_id"))
+
+    try:
+        progress = await chain_generator.run_stage(progress)
+    except chain_generator.ProviderRateLimitedError:
+        # All keys in the tier's pool are rate-limited right now. Do NOT
+        # fail the chain or delete its progress — leave it exactly where it
+        # is so the same stage can just be retried once capacity frees up.
+        raise HTTPException(429, _usage.THROTTLE_MESSAGE)
+    except chain_generator.ArtistFailedError as exc:
+        await db.chains.update_one(
+            {"id": chain_id},
+            {"$set": {"status": "failed", "error": str(exc),
+                      "completed_at": datetime.now(timezone.utc).isoformat()}},
+        )
+        await db.chain_progress.delete_one({"id": chain_id})
+        raise HTTPException(422, f"build failed: {exc}")
+    except Exception as exc:
+        logger.exception("chain %s stage failed: %s", chain_id, exc)
+        await db.chains.update_one(
+            {"id": chain_id},
+            {"$set": {"status": "failed", "error": str(exc),
+                      "completed_at": datetime.now(timezone.utc).isoformat()}},
+        )
+        await db.chain_progress.delete_one({"id": chain_id})
+        raise HTTPException(500, f"stage failed: {exc}")
+
+    report = progress.pop("_report")
+    done = progress.pop("_done")
+    stage_just_ran = progress["stage_sequence"][progress["stage_index"] if done else progress["stage_index"] - 1]
+
+    if done:
+        product = progress["product"]
+        await db.chains.update_one(
+            {"id": chain_id},
+            {"$push": {"generations": product},
+             "$set": {"status": "complete", "fallback_used": progress["fallback_used"],
+                      "completed_at": datetime.now(timezone.utc).isoformat()}},
+        )
+        await _usage.log_usage(
+            db, owner.get("user_id") or owner.get("anon"), progress["tier"],
+            provider="mixed", role="chain", tokens=progress["tokens_used"], chain_id=chain_id,
+        )
+        await db.chain_progress.delete_one({"id": chain_id})
+        return {"stage": stage_just_ran, "report": report, "done": True,
+                "composite_score": product.get("composite_score"),
+                "composite_gated": product.get("composite_gated", False)}
+
+    progress.pop("_user_keys", None)
+    await db.chain_progress.update_one({"id": chain_id}, {"$set": progress})
+    next_stage = progress["stage_sequence"][progress["stage_index"]]
+    return {"stage": stage_just_ran, "report": report, "done": False, "next_stage": next_stage}
 
 
 @api.get("/chains", response_model=List[Chain])
@@ -1034,6 +1098,8 @@ async def push_to_github(chain_id: str, req: GithubPushRequest, request: Request
 
 
 app.include_router(api)
+_tiers.init(db, _owner_from_request)
+app.include_router(_tiers.router)
 # CORS: cookies require an explicit origin (browsers reject wildcard + credentials).
 # We echo the caller's Origin back via allow_origin_regex so any preview URL and
 # localhost dev can auth without hard-coding the frontend host.
