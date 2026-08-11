@@ -5,8 +5,7 @@
       "src": "frontend/package.json",
       "use": "@vercel/static-build",
       "config": {
-        "distDir": "build",
-        "installCommand": "yarn install --ignore-engines --frozen-lockfile=false"
+        "distDir": "build"
       }
     },
     {
@@ -19,7 +18,7 @@
   ],
   "routes": [
     { "src": "/api/(.*)", "dest": "/backend/server.py" },
-    { "src": "/(.*\\.(?:css|js|json|ico|png|jpg|jpeg|svg|webp|txt|map|woff|woff2|ttf))", "dest": "/frontend/build/$1" },
-    { "src": "/(.*)", "dest": "/frontend/build/index.html" }
+    { "handle": "filesystem" },
+    { "src": "/(.*)", "dest": "/index.html" }
   ]
 }
