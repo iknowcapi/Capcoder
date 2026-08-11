@@ -65,6 +65,7 @@ export const SettingsPanel = ({ sessionId, open, onClose, onSaved }) => {
 
   useEffect(() => {
     if (open && sessionId) loadAll();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, sessionId]);
 
   const filtered = useMemo(() => {
