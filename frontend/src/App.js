@@ -8,6 +8,8 @@ import { TerminalHero } from "@/components/TerminalHero";
 import { EvolveButton } from "@/components/EvolveButton";
 import { ChainViewer } from "@/components/ChainViewer";
 import { SettingsPanel } from "@/components/SettingsPanel";
+import { LandingPage } from "@/components/LandingPage";
+import { AmbientBackground } from "@/components/AmbientBackground";
 
 function getSessionId() {
   const KEY = "capcode.session_id";
@@ -35,6 +37,7 @@ function App() {
   const esRef = useRef(null);
   const [user, setUser] = useState(null);          // logged-in AuthUser or null
   const [checkingAuth, setCheckingAuth] = useState(true);
+  const [view, setView] = useState("landing");      // "landing" | "build"
 
   // Watch Neon Better Auth session state — fires on sign-in/out & OAuth
   // redirect back from Google.
@@ -161,35 +164,50 @@ function App() {
     }
   };
 
+  if (view === "landing") {
+    return (
+      <div className="App relative" data-testid="app-root">
+        <Toaster position="bottom-right" toastOptions={{
+          style: {
+            background: "#15171D", border: "1px solid #2A2E38",
+            color: "#EDEDF0", borderRadius: "8px",
+            fontFamily: "'IBM Plex Mono', monospace", fontSize: "13px",
+          },
+        }} />
+        <LandingPage onStart={() => setView("build")} />
+      </div>
+    );
+  }
+
   return (
-    <div className="App relative crt-scanlines crt-vignette grain" data-testid="app-root">
-      <div className="scan-drift" aria-hidden />
+    <div className="App relative" data-testid="app-root">
       <Toaster position="bottom-right" toastOptions={{
         style: {
-          background: "#080c08", border: "1px solid rgba(57,255,20,0.5)",
-          color: "#39FF14", borderRadius: 0,
-          fontFamily: "'IBM Plex Mono', monospace",
-          fontSize: "12px", textTransform: "uppercase", letterSpacing: "0.08em",
+          background: "#15171D", border: "1px solid #2A2E38",
+          color: "#EDEDF0", borderRadius: "8px",
+          fontFamily: "'IBM Plex Mono', monospace", fontSize: "13px",
         },
       }} />
 
-      <main className="relative z-10 max-w-7xl mx-auto p-3 sm:p-6 lg:p-8 space-y-4 sm:space-y-6">
-        <TerminalHero status={status} />
+      <AmbientBackground />
+
+      <main className="relative z-10 max-w-5xl mx-auto p-4 sm:p-6 lg:p-8 space-y-5 sm:space-y-6">
+        <TerminalHero status={status} onBack={() => setView("landing")} />
 
         <div className="flex items-center justify-end gap-2">
           {user ? (
             <div className="flex items-center gap-2" data-testid="auth-user">
               {user.picture && (
                 <img src={user.picture} alt={user.name}
-                     className="w-6 h-6 rounded-full border border-phosphor/40" />
+                     className="w-6 h-6 rounded-full border border-line" />
               )}
-              <span className="text-xs font-mono text-phosphor2 hidden sm:inline">
+              <span className="text-xs font-mono text-text2 hidden sm:inline">
                 {user.name || user.email}
               </span>
               <button
                 data-testid="sign-out"
                 onClick={handleSignOut}
-                className="flex items-center gap-2 border border-phosphor/40 text-phosphor2 px-3 py-2 hover:bg-phosphor/10 transition-colors label-xs"
+                className="flex items-center gap-2 border border-line rounded-md text-text2 px-3 py-2 hover:border-text3 transition-colors text-xs"
               >
                 <LogOut size={14} /> sign out
               </button>
@@ -199,7 +217,7 @@ function App() {
               <button
                 data-testid="sign-in"
                 onClick={handleSignIn}
-                className="flex items-center gap-2 border border-neon_cyan/60 text-neon_cyan px-3 py-2 hover:bg-neon_cyan hover:text-black transition-colors label-xs neon-cyan"
+                className="flex items-center gap-2 border border-line rounded-md text-text2 px-3 py-2 hover:border-text3 transition-colors text-xs"
               >
                 <LogIn size={14} /> sign in with google
               </button>
@@ -208,7 +226,7 @@ function App() {
           <button
             data-testid="open-settings"
             onClick={() => setSettingsOpen(true)}
-            className="flex items-center gap-2 border border-neon_cyan/60 text-neon_cyan px-3 py-2 hover:bg-neon_cyan hover:text-black transition-colors label-xs neon-cyan"
+            className="flex items-center gap-2 border border-line rounded-md text-text2 px-3 py-2 hover:border-text3 transition-colors text-xs"
           >
             <Settings size={14} /> model settings
           </button>
@@ -227,28 +245,27 @@ function App() {
         />
 
         {chains.length > 0 && (
-          <section className="panel p-4" data-testid="chain-history"
-                   style={{ borderColor: "rgba(255,234,0,0.35)" }}>
+          <section className="panel p-4" data-testid="chain-history">
             <div className="flex items-center justify-between mb-3">
-              <div className="label-xs text-neon_yellow">=== [ ARCHIVE :: PRIOR CHAINS ] ===</div>
-              <div className="flex gap-1 text-[11px] font-mono">
+              <div className="text-text2 text-sm">Prior builds</div>
+              <div className="flex gap-1 text-xs">
                 <button
                   data-testid="filter-all"
                   onClick={() => setHistoryFilter("all")}
-                  className={`px-2 py-1 border ${historyFilter === "all"
-                    ? "border-phosphor bg-phosphor/15 text-phosphor neon-text"
-                    : "border-phosphor/40 text-phosphor2 hover:border-phosphor"}`}
+                  className={`px-2.5 py-1 rounded-md border ${historyFilter === "all"
+                    ? "border-pink bg-pink/10 text-pink"
+                    : "border-line text-text2 hover:border-text3"}`}
                 >all</button>
                 <button
                   data-testid="filter-verified"
                   onClick={() => setHistoryFilter("verified")}
-                  className={`px-2 py-1 border ${historyFilter === "verified"
-                    ? "border-neon_yellow bg-neon_yellow/15 text-neon_yellow"
-                    : "border-phosphor/40 text-phosphor2 hover:border-neon_yellow"}`}
+                  className={`px-2.5 py-1 rounded-md border ${historyFilter === "verified"
+                    ? "border-canary bg-canary/10 text-canary"
+                    : "border-line text-text2 hover:border-text3"}`}
                 >✓ verified</button>
               </div>
             </div>
-            <ul className="divide-y divide-phosphor/10 max-h-72 overflow-y-auto">
+            <ul className="divide-y divide-line max-h-72 overflow-y-auto">
               {chains
                 .filter((c) => historyFilter === "all" || c.verified)
                 .map((c) => (
@@ -256,18 +273,17 @@ function App() {
                   <button
                     data-testid={`history-chain-${c.id.slice(0, 8)}`}
                     onClick={() => openChain(c.id)}
-                    className={`w-full text-left py-2 px-1 font-mono text-xs hover:bg-phosphor/5 transition-colors ${
-                      chain?.id === c.id ? "bg-phosphor/10" : ""
+                    className={`w-full text-left py-2.5 px-2 rounded-md text-xs hover:bg-slate2 transition-colors ${
+                      chain?.id === c.id ? "bg-slate2" : ""
                     }`}
                   >
                     <div className="flex justify-between items-center gap-2">
-                      <span className="text-phosphor truncate">
-                        {c.verified && <span className="text-neon_yellow">✓ </span>}
-                        chain://{c.id.slice(0, 12)}
-                        {c.target_prompt && <span className="text-phosphor2"> — {c.target_prompt.slice(0, 50)}</span>}
+                      <span className="text-text truncate">
+                        {c.verified && <span className="text-canary">✓ </span>}
+                        {c.target_prompt ? c.target_prompt.slice(0, 60) : c.id.slice(0, 12)}
                       </span>
-                      <span className="text-phosphor3 shrink-0">
-                        {c.status === "failed" ? "▲ failed" : `${c.generations?.length || 0} gen`}
+                      <span className="text-text3 shrink-0">
+                        {c.status === "failed" ? "failed" : `${c.generations?.length || 0} gen`}
                       </span>
                     </div>
                   </button>
@@ -277,8 +293,8 @@ function App() {
           </section>
         )}
 
-        <footer className="text-center text-phosphor3 font-mono text-[10px] sm:text-xs py-6 border-t border-phosphor/20" data-testid="footer">
-          ▒▓█ CAPCODE // node-self-improving // session {sessionId.slice(0, 8)} // © {new Date().getFullYear()} █▓▒
+        <footer className="text-center text-text3 font-mono text-xs py-6 border-t border-line" data-testid="footer">
+          capcode · session {sessionId.slice(0, 8)} · © {new Date().getFullYear()}
         </footer>
       </main>
 

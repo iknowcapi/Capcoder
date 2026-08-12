@@ -5,7 +5,7 @@ module.exports = {
   theme: {
     extend: {
       fontFamily: {
-        bbs: ["'VT323'", "monospace"],
+        display: ["'Inter'", "ui-sans-serif", "sans-serif"],
         mono: ["'IBM Plex Mono'", "ui-monospace", "monospace"],
       },
       colors: {
@@ -21,33 +21,38 @@ module.exports = {
         border: "hsl(var(--border))",
         input: "hsl(var(--input))",
         ring: "hsl(var(--ring))",
-        phosphor: "#39FF14",
-        phosphor2: "#1F8A0E",
-        phosphor3: "#124B08",
-        neon_magenta: "#FF00FF",
-        neon_cyan: "#00FFFF",
-        neon_yellow: "#FFEA00",
+        /* brand */
+        ink: "#0A0A0C",        /* page background — near black */
+        slate: "#15171D",      /* panel background — dark slate */
+        slate2: "#1D202A",     /* raised/hover slate */
+        line: "#2A2E38",       /* neutral border */
+        text: "#EDEDF0",       /* primary text */
+        text2: "#93969F",      /* muted text */
+        text3: "#54575F",      /* faint text */
+        pink: "#FF1F5E",       /* primary accent — neon pink/red */
+        pinkDim: "#7A0F30",
+        canary: "#F5E600",     /* secondary accent — neon canary yellow */
+        canaryDim: "#7A7000",
+        warn: "#FFB000",
+        /* legacy aliases kept so existing components resolve without a full rewrite */
+        phosphor: "#FF1F5E",
+        phosphor2: "#93969F",
+        phosphor3: "#54575F",
+        neon_magenta: "#F5E600",
+        neon_cyan: "#93969F",
+        neon_yellow: "#F5E600",
         amber_warn: "#FFB000",
       },
       borderRadius: {
-        lg: "var(--radius)",
-        md: "calc(var(--radius) - 2px)",
-        sm: "calc(var(--radius) - 4px)",
+        lg: "10px",
+        md: "8px",
+        sm: "6px",
       },
       keyframes: {
         blink: { "50%": { opacity: "0" } },
-        flicker: { "0%,100%": { opacity: "1" }, "50%": { opacity: "0.92" } },
-        scanline: { "0%": { transform: "translateY(-100%)" }, "100%": { transform: "translateY(100vh)" } },
-        glitch: {
-          "0%,100%": { textShadow: "2px 0 #FF00FF, -2px 0 #00FFFF" },
-          "50%": { textShadow: "-2px 0 #FF00FF, 2px 0 #00FFFF" },
-        },
       },
       animation: {
         blink: "blink 1s steps(2) infinite",
-        flicker: "flicker 3s infinite",
-        scanline: "scanline 8s linear infinite",
-        glitch: "glitch 1.4s infinite",
       },
     },
   },
