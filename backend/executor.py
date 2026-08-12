@@ -14,7 +14,7 @@ import re
 import socket
 from typing import Optional
 
-WORKSPACE_ROOT = pathlib.Path("/workspaces")
+WORKSPACE_ROOT = pathlib.Path(os.environ.get("WORKSPACE_ROOT", "/tmp/capcode_workspaces"))
 WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
 
 

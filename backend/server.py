@@ -869,7 +869,8 @@ async def open_in_vscode(chain_id: str, gen: int, request: Request):
     import pathlib
 
     slug = _re.sub(r"[^A-Za-z0-9]+", "-", g.get("name") or f"gen-{gen}").strip("-") or f"gen-{gen}"
-    workspace_dir = pathlib.Path(f"/workspaces/{chain_id[:8]}/{slug}")
+    workspace_root = pathlib.Path(os.environ.get("WORKSPACE_ROOT", "/tmp/capcode_workspaces"))
+    workspace_dir = workspace_root / chain_id[:8] / slug
     workspace_dir.mkdir(parents=True, exist_ok=True)
 
     written = []
