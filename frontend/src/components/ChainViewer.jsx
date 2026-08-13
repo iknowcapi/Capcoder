@@ -146,6 +146,35 @@ const GenerationCard = ({ gen, chainId }) => {
         </div>
       </div>
 
+      {gen.refinement && (
+        <div
+          className="pt-2 border-t border-phosphor/10 font-mono text-[11px]"
+          data-testid={`refinement-report-${gen.gen}`}
+        >
+          <div className="label-xs text-neon_yellow mb-1">TRANSPARENCY REPORT</div>
+          {gen.refinement.ran ? (
+            <p className="text-phosphor2 leading-relaxed">
+              initial grade <span className="text-phosphor neon-text">{gen.refinement.initial_grade}/100</span>
+              {gen.refinement.refined_grade !== null && (
+                <> → refined grade <span className="text-phosphor neon-text">{gen.refinement.refined_grade}/100</span></>
+              )}
+              {" — "}
+              {gen.refinement.water_tank_replenished ? (
+                <span className="text-neon_cyan neon-cyan">
+                  water tank replenished{gen.refinement.knowledge_module ? ` (${gen.refinement.knowledge_module.tag})` : ""}
+                </span>
+              ) : (
+                <span className="text-phosphor3">no knowledge module saved this run</span>
+              )}
+            </p>
+          ) : (
+            <p className="text-phosphor2">
+              grade <span className="text-phosphor neon-text">{gen.refinement.initial_grade}/100</span> — cleared the 80 bar on the first pass, delivered immediately.
+            </p>
+          )}
+        </div>
+      )}
+
       {gen.exec?.root && (
         <div className="pt-2 border-t border-phosphor/10 font-mono text-[10px] text-phosphor3">
           <span className="label-xs">workspace ::</span>{" "}

@@ -755,7 +755,7 @@ async def advance_chain(chain_id: str, request: Request):
 
     report = progress.pop("_report")
     done = progress.pop("_done")
-    stage_just_ran = progress["stage_sequence"][progress["stage_index"] if done else progress["stage_index"] - 1]
+    stage_just_ran = progress.pop("_stage_ran")
 
     if done:
         product = progress["product"]
@@ -765,6 +765,17 @@ async def advance_chain(chain_id: str, request: Request):
              "$set": {"status": "complete", "fallback_used": progress["fallback_used"],
                       "completed_at": datetime.now(timezone.utc).isoformat()}},
         )
+        km = (product.get("refinement") or {}).get("knowledge_module")
+        if km:
+            await db.knowledge_modules.insert_one({
+                "id": str(uuid.uuid4()),
+                "chain_id": chain_id,
+                "tag": km["tag"],
+                "source_path": km["source_path"],
+                "code": km["code"],
+                "target_prompt": km["target_prompt"],
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            })
         await _usage.log_usage(
             db, owner.get("user_id") or owner.get("anon"), progress["tier"],
             provider="mixed", role="chain", tokens=progress["tokens_used"], chain_id=chain_id,
@@ -772,7 +783,8 @@ async def advance_chain(chain_id: str, request: Request):
         await db.chain_progress.delete_one({"id": chain_id})
         return {"stage": stage_just_ran, "report": report, "done": True,
                 "composite_score": product.get("composite_score"),
-                "composite_gated": product.get("composite_gated", False)}
+                "composite_gated": product.get("composite_gated", False),
+                "refinement": product.get("refinement")}
 
     progress.pop("_user_keys", None)
     await db.chain_progress.update_one({"id": chain_id}, {"$set": progress})

@@ -32,6 +32,7 @@ COLLECTION_ID_FIELDS: dict[str, str] = {
     "venice_consent": "consent_id",
     "usage_ledger": "id",
     "chain_progress": "id",
+    "knowledge_modules": "id",
 }
 
 _pool: Optional[asyncpg.Pool] = None

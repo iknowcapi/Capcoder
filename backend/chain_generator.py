@@ -627,9 +627,17 @@ def _report(stage: str, progress: dict) -> str:
     if stage == "score":
         cs = (progress["product"] or {}).get("composite_score")
         gated = (progress["product"] or {}).get("composite_gated")
-        if gated:
+        ref = (progress["product"] or {}).get("refinement") or {}
+        if gated and not ref.get("ran"):
             return "Final score: build didn't clear the minimum coverage bar — flagged as incomplete rather than scored on style alone."
-        return f"Done. Final score: {cs}. Build complete."
+        if ref.get("refined_grade") is not None:
+            tank = (f" Knowledge module {ref['knowledge_module']['tag']} saved to the knowledge base — water tank replenished."
+                    if ref.get("water_tank_replenished") else " Refinement didn't beat the original — delivering as-is, no knowledge module saved.")
+            return (f"Initial grade: {ref['initial_grade']}/100 (below the 80 bar) — ran the one free refinement loop. "
+                    f"Refined grade: {ref['refined_grade']}/100.{tank} Build complete.")
+        if ref.get("ran") and ref.get("refined_grade") is None:
+            return f"Grade: {ref.get('initial_grade')}/100 (below 80) — starting the one free refinement loop now."
+        return f"Done. Final score: {cs} (grade {ref.get('initial_grade')}/100 — cleared the 80 bar first try). Build complete."
     return f"{stage} complete."
 
 
@@ -762,6 +770,60 @@ async def run_stage(progress: dict) -> dict:
                 )
                 product["assignments"] = {k: a[k] for k in progress["role_sequence"] if k in a}
                 progress["product"] = product
+
+                # --- Recursive Refinement Loop -------------------------------
+                # Pass-fail grade on a 0-100 scale (rescaled from the 0-4
+                # composite). >=80 delivers immediately. <80 triggers exactly
+                # ONE free refinement loop (re-run artist->execute->correct->
+                # rate->score with the weak spots called out), then delivers
+                # whatever comes out of that — never more than one extra pass.
+                grade = 0 if product.get("composite_gated") else round(max(0.0, min(4.0, product["composite_score"])) / 4.0 * 100)
+                if not progress.get("_refinement_ran"):
+                    progress["_gen1_grade"] = grade
+                    if grade < 80:
+                        progress["_gen1_product"] = json.loads(json.dumps(product))
+                        progress["_refinement_ran"] = True
+                        progress["_loop_back_to"] = "artist"
+                        weak = []
+                        if not progress["exec_result"].get("started"):
+                            weak.append("the build did not run/start at all")
+                        s = progress.get("scores") or {}
+                        for dim in ("correctness", "helpfulness", "coherence"):
+                            if s.get(dim, 4.0) < 2.5:
+                                weak.append(f"low {dim} score")
+                        if cov.get("coverage") is not None and cov["coverage"] < 0.6:
+                            weak.append("missing several features from the original request")
+                        weak_txt = "; ".join(weak) or "general code quality and polish"
+                        ts = progress["teacher_spec"]
+                        ts["artist_brief"] = (
+                            f"{ts.get('artist_brief', '')}\n\nREFINEMENT PASS (scored {grade}/100, "
+                            f"below the 80 quality bar — this is your one free retry): fix {weak_txt}. "
+                            f"Keep everything that already works; only change what's broken or missing."
+                        ).strip()
+                        product["refinement"] = {
+                            "ran": True, "initial_grade": grade, "refined_grade": None,
+                            "knowledge_module": None, "water_tank_replenished": False,
+                        }
+                    else:
+                        product["refinement"] = {
+                            "ran": False, "initial_grade": grade, "refined_grade": None,
+                            "knowledge_module": None, "water_tank_replenished": False,
+                        }
+                else:
+                    # Second (and final) score pass after the one refinement loop.
+                    gen1_grade = progress.get("_gen1_grade", 0)
+                    improved = grade > gen1_grade
+                    knowledge_module = None
+                    if improved:
+                        knowledge_module = _extract_knowledge_module(
+                            progress.get("_gen1_product") or {}, product, progress["target_prompt"],
+                        )
+                    product["refinement"] = {
+                        "ran": True, "initial_grade": gen1_grade, "refined_grade": grade,
+                        "knowledge_module": knowledge_module,
+                        "water_tank_replenished": bool(knowledge_module),
+                    }
+                progress["product"] = product
                 await _emit(chain_id, "stage", "complete")
 
             last_exc = None
@@ -774,9 +836,15 @@ async def run_stage(progress: dict) -> dict:
     if last_exc is not None:
         raise last_exc
     progress["_report"] = _report(stage, progress)
-    progress["_done"] = (idx + 1) >= len(seq)
-    if not progress["_done"]:
-        progress["stage_index"] = idx + 1
+    progress["_stage_ran"] = stage
+    loop_back = progress.pop("_loop_back_to", None)
+    if loop_back:
+        progress["_done"] = False
+        progress["stage_index"] = seq.index(loop_back)
+    else:
+        progress["_done"] = (idx + 1) >= len(seq)
+        if not progress["_done"]:
+            progress["stage_index"] = idx + 1
     return progress
 
 
@@ -987,6 +1055,40 @@ async def rate_step(spec: dict, exec_result: dict, assignment: Optional[dict] = 
         values[k] = max(0.0, min(4.0, values[k]))
     values["_tokens"] = rater_tokens
     return values
+
+
+_KNOWLEDGE_TAG_KEYWORDS = {
+    "auth_optimization": ["auth", "login", "jwt", "session", "password", "oauth"],
+    "api_throttling": ["rate limit", "throttl", "quota", "429", "backoff"],
+    "error_handling": ["error", "exception", "try:", "except", "traceback"],
+    "database_access": ["database", "db.", "query", "sql", "mongo", "postgres", "schema"],
+    "validation": ["validate", "sanitiz", "pydantic", "required field"],
+    "performance": ["cache", "async", "performance", "optimi", "concurren"],
+    "security": ["secure", "csrf", "xss", "injection", "encrypt"],
+}
+
+
+def _extract_knowledge_module(gen1_product: dict, gen2_product: dict, target_prompt: str) -> Optional[dict]:
+    """'The Tank' — when the one free refinement loop measurably improved the
+    build, pull out the file that changed the most between gen1 and gen2 as a
+    reusable 'Global Logic Module', tagged by function so future chains can
+    draw on it as an exemplar. No extra LLM call — this is a diff over files
+    the pipeline already produced, kept cheap on purpose."""
+    gen1_files = {f.get("path"): f.get("content", "") for f in (gen1_product.get("files") or []) if isinstance(f, dict)}
+    gen2_files = {f.get("path"): f.get("content", "") for f in (gen2_product.get("files") or []) if isinstance(f, dict)}
+    changed = [p for p, content in gen2_files.items() if gen1_files.get(p, "") != content]
+    if not changed:
+        return None
+    best_path = max(changed, key=lambda p: len(gen2_files.get(p, "")))
+    snippet = gen2_files.get(best_path, "")
+    haystack = f"{target_prompt} {best_path} {snippet}".lower()
+    tag = next((t for t, kws in _KNOWLEDGE_TAG_KEYWORDS.items() if any(kw in haystack for kw in kws)), "general_fix")
+    return {
+        "tag": f"#{tag}",
+        "source_path": best_path,
+        "code": snippet[:4000],
+        "target_prompt": target_prompt,
+    }
 
 
 def composite(scores: dict) -> float:
