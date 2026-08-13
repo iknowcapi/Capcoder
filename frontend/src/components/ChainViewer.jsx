@@ -158,7 +158,7 @@ const GenerationCard = ({ gen, chainId }) => {
   );
 };
 
-export const ChainViewer = ({ chain, onVerify, onPush, streamBuf }) => {
+export const ChainViewer = ({ chain, onVerify, onPush, streamBuf, advanceLog }) => {
   const [pushOpen, setPushOpen] = useState(false);
   const [repoName, setRepoName] = useState("");
   const [pushPrivate, setPushPrivate] = useState(true);
@@ -302,6 +302,19 @@ export const ChainViewer = ({ chain, onVerify, onPush, streamBuf }) => {
             requires your github username + a personal access token (scope:{" "}
             <code className="text-neon_cyan">repo</code>) saved under model settings.
           </p>
+        </div>
+      )}
+
+      {advanceLog?.length > 0 && (
+        <div className="panel p-3 space-y-2" data-testid="advance-log"
+             style={{ borderColor: "rgba(0,255,255,0.35)" }}>
+          <div className="label-xs text-neon_cyan neon-cyan mb-1">LIVE PROGRESS</div>
+          {advanceLog.map((entry, i) => (
+            <div key={i} className="text-[11px] font-mono text-phosphor2 leading-relaxed border-l-2 border-phosphor/30 pl-2"
+                 data-testid={`advance-log-${entry.stage}`}>
+              <span className="text-phosphor uppercase">{entry.stage}</span> :: {entry.report}
+            </div>
+          ))}
         </div>
       )}
 

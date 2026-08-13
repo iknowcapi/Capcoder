@@ -45,6 +45,7 @@ export const api = {
       .then((r) => r.data),
   listChains: () => axios.get(`${API}/chains`).then((r) => r.data),
   getChain: (id) => axios.get(`${API}/chains/${id}`).then((r) => r.data),
+  advanceChain: (id) => axios.post(`${API}/chains/${id}/advance`).then((r) => r.data),
   verifyChain: (id) => axios.post(`${API}/chains/${id}/verify`).then((r) => r.data),
   pushChain: (id, session_id, repo, isPrivate = true) =>
     axios.post(`${API}/chains/${id}/push`, { session_id, repo, private: isPrivate }).then((r) => r.data),

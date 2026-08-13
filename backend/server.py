@@ -88,6 +88,7 @@ class Chain(BaseModel):
     created_at: datetime
     completed_at: Optional[datetime] = None
     venice_consent: Optional[dict] = None
+    error: Optional[str] = None
 
 
 class EvolveRequest(BaseModel):

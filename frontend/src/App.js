@@ -34,6 +34,7 @@ function App() {
   const [assignments, setAssignments] = useState(null);
   const [historyFilter, setHistoryFilter] = useState("all"); // "all" | "verified"
   const [streamBuf, setStreamBuf] = useState({ teacher: "", artist: "" });
+  const [advanceLog, setAdvanceLog] = useState([]);
   const esRef = useRef(null);
   const [user, setUser] = useState(null);          // logged-in AuthUser or null
   const [checkingAuth, setCheckingAuth] = useState(true);
@@ -88,11 +89,13 @@ function App() {
     setBusy(true);
     setStage("kicking off…");
     setStreamBuf({ teacher: "", artist: "" });
-    let pollId = null;
+    setAdvanceLog([]);
+    let stub = null;
     try {
-      const stub = await api.evolve(targetPrompt, sessionId);
+      stub = await api.evolve(targetPrompt, sessionId);
       setChain(stub);
-      // Open SSE stream so we can render Teacher/Artist tokens live.
+      // Open SSE stream so we can render Teacher/Artist tokens live while
+      // the advance loop below drives each stage forward.
       try { esRef.current && esRef.current.close(); } catch { /* noop */ }
       const anonSid = (typeof window !== "undefined" && localStorage.getItem("capcode.session_id")) || "";
       const streamUrl = `${API}/chains/${stub.id}/stream?session_id=${encodeURIComponent(anonSid)}`;
@@ -104,31 +107,42 @@ function App() {
       es.addEventListener("artist_delta", (ev) => {
         setStreamBuf((b) => ({ ...b, artist: b.artist + ev.data }));
       });
-      es.addEventListener("stage", (ev) => setStage(String(ev.data || "").trim()));
-      es.addEventListener("done", () => { try { es.close(); } catch { /* noop */ } });
       es.onerror = () => { try { es.close(); } catch { /* noop */ } };
 
-      await new Promise((resolve, reject) => {
-        pollId = setInterval(async () => {
-          try {
-            const c = await api.getChain(stub.id);
-            setChain(c);
-            if (c.status === "complete") { clearInterval(pollId); resolve(); }
-            else if (c.status === "failed") {
-              clearInterval(pollId);
-              reject(new Error(c.error || "build failed"));
-            }
-          } catch (e) { clearInterval(pollId); reject(e); }
-        }, 3000);
-      });
+      // CHECKPOINTED PIPELINE — /evolve only initializes state. Each stage
+      // runs on its own /advance call; we keep calling it (surfacing the
+      // human-readable report each time) until the backend says done.
+      let done = false;
+      let guard = 0;
+      while (!done && guard < 40) {
+        guard += 1;
+        let resp;
+        try {
+          resp = await api.advanceChain(stub.id);
+        } catch (e) {
+          if (e?.response?.status === 429) {
+            await new Promise((r) => setTimeout(r, 3000));
+            continue; // capacity freed up — retry the same stage
+          }
+          throw e;
+        }
+        setStage(resp.stage);
+        setAdvanceLog((log) => [...log, { stage: resp.stage, report: resp.report }]);
+        done = resp.done;
+      }
+      try { es.close(); } catch { /* noop */ }
+      const finalChain = await api.getChain(stub.id);
+      setChain(finalChain);
       toast.success("PRODUCT BUILT");
       refresh();
     } catch (e) {
       console.error(e);
       const msg = e?.response?.data?.detail || e?.message || "build failed";
       toast.error(msg);
+      if (stub?.id) {
+        try { const c = await api.getChain(stub.id); setChain(c); } catch { /* noop */ }
+      }
     } finally {
-      if (pollId) clearInterval(pollId);
       try { esRef.current && esRef.current.close(); } catch { /* noop */ }
       esRef.current = null;
       setBusy(false);
@@ -242,6 +256,7 @@ function App() {
           onVerify={handleVerify}
           onPush={handlePush}
           streamBuf={streamBuf}
+          advanceLog={advanceLog}
         />
 
         {chains.length > 0 && (

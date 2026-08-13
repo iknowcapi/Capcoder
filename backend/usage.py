@@ -93,6 +93,14 @@ def next_groq_key(tier: str) -> Optional[str]:
     return None
 
 
+def pool_size(tier: str) -> int:
+    """Number of Groq keys available in the tier's pool — bounds how many
+    times run_stage retries a rate-limited stage by rotating to the next key."""
+    if tier == "trial":
+        return len(_TRIAL_POOL) or 1
+    return len(_FREE_POOL) or 1
+
+
 # ---------------------------------------------------------------------------
 # Usage ledger (backed by docdb's generic `docs` table via db.usage_ledger)
 # ---------------------------------------------------------------------------
