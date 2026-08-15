@@ -23,7 +23,7 @@ const Bar = ({ label, value, max = 4, color = "phosphor" }) => {
   );
 };
 
-const GenerationCard = ({ gen, chainId }) => {
+const GenerationCard = ({ gen, chainId, billing }) => {
   const [openFile, setOpenFile] = useState(gen.files?.[0]?.path || null);
   const files = gen.files || [];
   const selected = files.find((f) => f.path === openFile) || files[0];
@@ -170,6 +170,25 @@ const GenerationCard = ({ gen, chainId }) => {
           ) : (
             <p className="text-phosphor2">
               grade <span className="text-phosphor neon-text">{gen.refinement.initial_grade}/100</span> — cleared the 80 bar on the first pass, delivered immediately.
+            </p>
+          )}
+        </div>
+      )}
+
+      {billing && (
+        <div
+          className="pt-2 border-t border-phosphor/10 font-mono text-[11px]"
+          data-testid={`billing-report-${gen.gen}`}
+        >
+          <div className="label-xs text-neon_yellow mb-1">BILLING SUMMARY</div>
+          <p className="text-phosphor2 leading-relaxed">
+            sub ${billing.billing_summary.sub_cost.toFixed(2)} · fund applied ${billing.billing_summary.fund_applied.toFixed(2)} ·
+            {" "}user billed <span className={billing.billing_summary.user_billed > 0 ? "text-neon_magenta" : "text-phosphor2"}>${billing.billing_summary.user_billed.toFixed(2)}</span> ·
+            {" "}profit ${billing.billing_summary.net_profit.toFixed(2)}
+          </p>
+          {billing.knowledge_audit.seval_found && (
+            <p className="text-neon_cyan neon-cyan mt-1">
+              SEVAL found — ${billing.knowledge_audit.credit_refunded.toFixed(2)} credited back
             </p>
           )}
         </div>
@@ -395,7 +414,7 @@ export const ChainViewer = ({ chain, onVerify, onPush, streamBuf, advanceLog }) 
       </div>
 
       {chain.generations?.map((g) => (
-        <GenerationCard key={g.gen} gen={g} chainId={chain.id} />
+        <GenerationCard key={g.gen} gen={g} chainId={chain.id} billing={chain.billing} />
       ))}
     </section>
   );

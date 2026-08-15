@@ -56,4 +56,7 @@ export const api = {
   // ---- Venice / uncensored consent waiver ----
   veniceConsent: (chain_id = null) =>
     axios.post(`${API}/venice/consent`, { chain_id }).then((r) => r.data),
+  // ---- $16/mo credit subscription ----
+  billingStatus: () => axios.get(`${API}/billing/status`).then((r) => r.data),
+  checkout: () => axios.post(`${API}/tier/checkout`).then((r) => r.data),
 };

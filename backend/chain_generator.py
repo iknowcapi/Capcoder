@@ -780,6 +780,7 @@ async def run_stage(progress: dict) -> dict:
                 grade = 0 if product.get("composite_gated") else round(max(0.0, min(4.0, product["composite_score"])) / 4.0 * 100)
                 if not progress.get("_refinement_ran"):
                     progress["_gen1_grade"] = grade
+                    progress["_gen1_tokens"] = progress["tokens_used"]
                     if grade < 80:
                         progress["_gen1_product"] = json.loads(json.dumps(product))
                         progress["_refinement_ran"] = True
@@ -803,15 +804,19 @@ async def run_stage(progress: dict) -> dict:
                         product["refinement"] = {
                             "ran": True, "initial_grade": grade, "refined_grade": None,
                             "knowledge_module": None, "water_tank_replenished": False,
+                            "base_tokens": progress["_gen1_tokens"], "refinement_tokens": 0,
                         }
                     else:
                         product["refinement"] = {
                             "ran": False, "initial_grade": grade, "refined_grade": None,
                             "knowledge_module": None, "water_tank_replenished": False,
+                            "base_tokens": progress["_gen1_tokens"], "refinement_tokens": 0,
                         }
                 else:
                     # Second (and final) score pass after the one refinement loop.
                     gen1_grade = progress.get("_gen1_grade", 0)
+                    gen1_tokens = progress.get("_gen1_tokens", 0)
+                    refinement_tokens = max(0, progress["tokens_used"] - gen1_tokens)
                     improved = grade > gen1_grade
                     knowledge_module = None
                     if improved:
@@ -822,6 +827,7 @@ async def run_stage(progress: dict) -> dict:
                         "ran": True, "initial_grade": gen1_grade, "refined_grade": grade,
                         "knowledge_module": knowledge_module,
                         "water_tank_replenished": bool(knowledge_module),
+                        "base_tokens": gen1_tokens, "refinement_tokens": refinement_tokens,
                     }
                 progress["product"] = product
                 await _emit(chain_id, "stage", "complete")

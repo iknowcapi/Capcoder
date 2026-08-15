@@ -24,6 +24,8 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Request
 
+import billing as _billing
+
 logger = logging.getLogger("tiers")
 
 router = APIRouter(prefix="/api/tier")
@@ -114,6 +116,18 @@ def _stripe():
 @router.post("/checkout")
 async def create_checkout_session(request: Request):
     user_id = await _require_signed_in(request)
+    key = os.environ.get("STRIPE_SECRET_KEY", "").strip()
+
+    if not key:
+        # No Stripe keys yet — grant paid tier + open the $16/mo credit cycle
+        # directly so the whole billing flow (fund/profit split, refinement
+        # loop subsidy, Credit Rebirth) can be tested end-to-end. Swap to
+        # real Stripe checkout below the moment STRIPE_SECRET_KEY is set —
+        # no other code changes needed.
+        await _db.users.update_one({"user_id": user_id}, {"$set": {"tier": "paid"}})
+        cycle = await _billing.start_cycle(_db, user_id)
+        return {"checkout_url": None, "mock": True, "tier": "paid", "billing_cycle": cycle}
+
     stripe = _stripe()
     price_id = os.environ.get("STRIPE_PRICE_ID_PAID", "").strip()
     if not price_id:
@@ -135,7 +149,7 @@ async def create_checkout_session(request: Request):
         logger.error("stripe checkout session creation failed: %s", exc)
         raise HTTPException(502, f"stripe error: {exc}")
 
-    return {"checkout_url": session.url}
+    return {"checkout_url": session.url, "mock": False}
 
 
 @router.post("/webhook")
@@ -166,6 +180,7 @@ async def stripe_webhook(request: Request):
                 {"user_id": user_id},
                 {"$set": {"tier": "paid", "stripe_customer_id": obj.get("customer")}},
             )
+            await _billing.start_cycle(_db, user_id)
             logger.info("user %s upgraded to paid via stripe checkout", user_id)
 
     elif etype in ("customer.subscription.deleted", "customer.subscription.updated"):
@@ -179,6 +194,7 @@ async def stripe_webhook(request: Request):
                     {"user_id": user_doc["user_id"]},
                     {"$set": {"tier": "free"}},
                 )
+                await _billing.cancel_cycle(_db, user_doc["user_id"])
                 logger.info("user %s reverted to free — subscription %s", user_doc["user_id"], etype)
 
     return {"received": True}

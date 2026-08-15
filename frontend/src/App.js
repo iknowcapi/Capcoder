@@ -315,6 +315,7 @@ function App() {
 
       <SettingsPanel
         sessionId={sessionId}
+        user={user}
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
         onSaved={(a) => { setAssignments(a); toast.success("agents saved"); }}

@@ -25,7 +25,7 @@ const PriceBadge = ({ tier }) => {
   );
 };
 
-export const SettingsPanel = ({ sessionId, open, onClose, onSaved }) => {
+export const SettingsPanel = ({ sessionId, user, open, onClose, onSaved }) => {
   const [catalog, setCatalog] = useState([]);
   const [defaults, setDefaults] = useState(null);
   const [settings, setSettings] = useState({});
@@ -39,6 +39,27 @@ export const SettingsPanel = ({ sessionId, open, onClose, onSaved }) => {
   const [tierFilter, setTierFilter] = useState("all");
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [billing, setBilling] = useState(null);
+  const [checkingOut, setCheckingOut] = useState(false);
+
+  const loadBilling = async () => {
+    if (!user) { setBilling(null); return; }
+    try { setBilling(await api.billingStatus()); } catch { setBilling(null); }
+  };
+
+  const handleUpgrade = async () => {
+    setCheckingOut(true);
+    try {
+      const res = await api.checkout();
+      if (res.checkout_url) {
+        window.location.href = res.checkout_url;
+      } else {
+        await loadBilling();
+      }
+    } finally {
+      setCheckingOut(false);
+    }
+  };
 
   const loadAll = async () => {
     setLoading(true);
@@ -65,8 +86,9 @@ export const SettingsPanel = ({ sessionId, open, onClose, onSaved }) => {
 
   useEffect(() => {
     if (open && sessionId) loadAll();
+    if (open) loadBilling();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, sessionId]);
+  }, [open, sessionId, user]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -150,6 +172,32 @@ export const SettingsPanel = ({ sessionId, open, onClose, onSaved }) => {
           >
             <X size={16} />
           </button>
+        </div>
+
+        {/* $16/mo credit subscription */}
+        <div className="border-b border-phosphor/30 p-4" data-testid="billing-section">
+          {!user ? (
+            <div className="label-xs text-phosphor3">sign in with google to subscribe for credits</div>
+          ) : billing?.subscribed ? (
+            <div className="flex flex-wrap items-center gap-4">
+              <span className="label-xs text-neon_cyan neon-cyan">[ $16/MO ACTIVE ]</span>
+              <span className="font-mono text-xs text-phosphor2" data-testid="billing-api-budget">
+                api budget: {billing.cycle.api_budget_credits} credits
+              </span>
+              <span className="font-mono text-xs text-phosphor2" data-testid="billing-fund">
+                recursion fund: {billing.cycle.recursion_fund_credits} credits
+              </span>
+            </div>
+          ) : (
+            <button
+              data-testid="upgrade-btn"
+              onClick={handleUpgrade}
+              disabled={checkingOut}
+              className="flex items-center gap-2 border border-neon_yellow text-neon_yellow px-3 py-2 hover:bg-neon_yellow hover:text-black label-xs disabled:opacity-50"
+            >
+              <DollarSign size={14} /> {checkingOut ? "…" : "UPGRADE — $16/MO"}
+            </button>
+          )}
         </div>
 
         {/* role tabs */}

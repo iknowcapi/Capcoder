@@ -33,6 +33,7 @@ COLLECTION_ID_FIELDS: dict[str, str] = {
     "usage_ledger": "id",
     "chain_progress": "id",
     "knowledge_modules": "id",
+    "billing_cycles": "user_id",
 }
 
 _pool: Optional[asyncpg.Pool] = None

@@ -30,6 +30,7 @@ import executor as _exec
 import providers as _providers
 import usage as _usage
 import tiers as _tiers
+import billing as _billing
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -89,6 +90,7 @@ class Chain(BaseModel):
     completed_at: Optional[datetime] = None
     venice_consent: Optional[dict] = None
     error: Optional[str] = None
+    billing: Optional[dict] = None
 
 
 class EvolveRequest(BaseModel):
@@ -381,6 +383,17 @@ async def status():
             for name in _providers.PROVIDERS
         },
     }
+
+
+@api.get("/billing/status")
+async def billing_status(request: Request):
+    """Current $16/mo credit cycle for the signed-in user, or null if they
+    have no active subscription (free/trial/anon builds aren't metered)."""
+    owner = await _owner_from_request(request)
+    if not owner.get("user_id"):
+        return {"subscribed": False, "cycle": None}
+    cycle = await _billing.get_cycle(db, owner["user_id"])
+    return {"subscribed": bool(cycle), "cycle": cycle}
 
 
 @api.get("/providers/models")
@@ -780,11 +793,17 @@ async def advance_chain(chain_id: str, request: Request):
             db, owner.get("user_id") or owner.get("anon"), progress["tier"],
             provider="mixed", role="chain", tokens=progress["tokens_used"], chain_id=chain_id,
         )
+        billing_result = None
+        if owner.get("user_id") and product.get("refinement"):
+            billing_result = await _billing.apply_chain_billing(
+                db, owner["user_id"], chain_id, product["refinement"],
+            )
         await db.chain_progress.delete_one({"id": chain_id})
         return {"stage": stage_just_ran, "report": report, "done": True,
                 "composite_score": product.get("composite_score"),
                 "composite_gated": product.get("composite_gated", False),
-                "refinement": product.get("refinement")}
+                "refinement": product.get("refinement"),
+                "billing": billing_result}
 
     progress.pop("_user_keys", None)
     await db.chain_progress.update_one({"id": chain_id}, {"$set": progress})
