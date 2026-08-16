@@ -12,7 +12,6 @@ const ROLES = [
 
 const PriceBadge = ({ tier }) => {
   const map = {
-    free: { text: "FREE", cls: "border-phosphor text-phosphor" },
     $: { text: "$", cls: "border-neon_cyan text-neon_cyan" },
     $$: { text: "$$", cls: "border-neon_yellow text-neon_yellow" },
     $$$: { text: "$$$", cls: "border-neon_magenta text-neon_magenta" },
@@ -31,7 +30,6 @@ export const SettingsPanel = ({ sessionId, user, open, onClose, onSaved }) => {
   const [settings, setSettings] = useState({});
   const [activeRole, setActiveRole] = useState("teacher");
   const [query, setQuery] = useState("");
-  const [providerFilter, setProviderFilter] = useState("all");
   const [uncensoredOnly, setUncensoredOnly] = useState(false);
   // Consent-waiver flow — every toggle-on of uncensored mode requires a fresh
   // POST /api/venice/consent. The toggle DOES NOT flip until that call succeeds.
@@ -93,14 +91,13 @@ export const SettingsPanel = ({ sessionId, user, open, onClose, onSaved }) => {
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     return catalog.filter((m) => {
-      if (providerFilter !== "all" && m.provider !== providerFilter) return false;
       if (uncensoredOnly && !m.uncensored) return false;
       if (tierFilter !== "all" && m.price_tier !== tierFilter) return false;
       if (q && !`${m.id} ${m.display_name} ${m.description}`.toLowerCase().includes(q))
         return false;
       return true;
     });
-  }, [catalog, query, providerFilter, uncensoredOnly, tierFilter]);
+  }, [catalog, query, uncensoredOnly, tierFilter]);
 
   const pick = (model) => {
     setSettings((s) => ({
@@ -244,23 +241,8 @@ export const SettingsPanel = ({ sessionId, user, open, onClose, onSaved }) => {
             />
           </div>
           <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono">
-            <span className="label-xs text-phosphor3">provider:</span>
-            {["all", "openrouter", "nvidia", "venice"].map((p) => (
-              <button
-                key={p}
-                data-testid={`filter-provider-${p}`}
-                onClick={() => setProviderFilter(p)}
-                className={`border px-2 py-1 transition-colors ${
-                  providerFilter === p
-                    ? "border-phosphor bg-phosphor/15 text-phosphor"
-                    : "border-phosphor/30 text-phosphor2 hover:border-phosphor"
-                }`}
-              >
-                {p}
-              </button>
-            ))}
-            <span className="label-xs text-phosphor3 ml-4">tier:</span>
-            {["all", "free", "$", "$$", "$$$"].map((t) => (
+            <span className="label-xs text-phosphor3">tier:</span>
+            {["all", "$", "$$", "$$$"].map((t) => (
               <button
                 key={t}
                 data-testid={`filter-tier-${t}`}
@@ -338,7 +320,6 @@ export const SettingsPanel = ({ sessionId, user, open, onClose, onSaved }) => {
                       )}
                     </div>
                     <div className="flex items-center gap-2 text-[10px] label-xs shrink-0">
-                      <span className="text-phosphor2">{m.provider}</span>
                       {m.uncensored && (
                         <span className="text-neon_magenta neon-magenta">UNCEN</span>
                       )}

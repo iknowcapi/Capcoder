@@ -155,8 +155,6 @@ def _looks_uncensored(model_id: str, description: str = "") -> bool:
 
 
 def _price_tier(price_per_1m: float) -> str:
-    if price_per_1m <= 0:
-        return "free"
     if price_per_1m < 1.0:
         return "$"
     if price_per_1m < 8.0:
@@ -211,7 +209,7 @@ async def _fetch_openrouter() -> list[dict]:
             "uncensored": _looks_uncensored(mid, m.get("description") or ""),
             "context_len": m.get("context_length") or 0,
             "price_per_1m": round(avg, 4),
-            "price_tier": "free" if is_free else _price_tier(avg),
+            "price_tier": _price_tier(avg),
             "free": is_free,
             "roles": ["gen", "critic", "rater"],
         })
@@ -283,8 +281,8 @@ async def _fetch_groq() -> list[dict]:
             "uncensored": spec["uncensored"],
             "context_len": 0,
             "price_per_1m": 0.0,
-            "price_tier": "free",
-            "free": True,
+            "price_tier": "$",
+            "free": False,
             "roles": spec["roles"],
         })
     return out
@@ -303,8 +301,8 @@ async def _fetch_nvidia() -> list[dict]:
             "uncensored": spec["uncensored"],
             "context_len": 0,
             "price_per_1m": 0.0,
-            "price_tier": "free",  # NVIDIA's public tier is effectively free for these
-            "free": True,
+            "price_tier": "$",  # NVIDIA's public tier is effectively free for these, but no "free" badge is shown
+            "free": False,
             "roles": spec["roles"],
         })
     return out
