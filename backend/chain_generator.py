@@ -470,19 +470,24 @@ class TeacherFailedError(Exception):
 
 async def teacher_step(target: str, exemplars: list[dict], assignment: Optional[dict] = None,
                        user_keys: Optional[dict] = None, chain_id: Optional[str] = None,
-                       tier: Optional[str] = None) -> dict:
+                       tier: Optional[str] = None, corrections: str = "") -> dict:
     exemplar_block = "\n\n".join(
         f"[verified — target: {e.get('target','?')} — product: {e.get('name','?')}]\n"
         f"artist_brief was: {e.get('artist_brief','?')}"
         for e in exemplars[:3]
     ) or "(no verified exemplars yet — apply first principles)"
+    corrections_block = (
+        f"\n\nCOMMON USER CORRECTIONS ACROSS PRIOR BUILDS (steer the brief to avoid "
+        f"repeating these — real edits users had to make after a build was delivered):\n{corrections}"
+        if corrections else ""
+    )
     await _emit(chain_id, "stage", "teacher")
     raw, tokens = await _call_role(
         "teacher",
         [{"role": "system", "content": SYSTEM_TEACHER},
          {"role": "user", "content":
-             f"HUMAN TARGET:\n{target}\n\nTOP-VERIFIED PRIOR CHAINS:\n{exemplar_block}\n\n"
-             f"Design the Teacher spec as strict JSON."}],
+             f"HUMAN TARGET:\n{target}\n\nTOP-VERIFIED PRIOR CHAINS:\n{exemplar_block}"
+             f"{corrections_block}\n\nDesign the Teacher spec as strict JSON."}],
         assignment, user_keys=user_keys, tier=tier,
         stream_chain_id=chain_id, stream_event="teacher_delta",
         temperature=0.4, max_tokens=800,
@@ -573,7 +578,8 @@ STAGE_SEQUENCE = {
 def new_progress(chain_id: str, target_prompt: str, tier: str,
                  assignments: Optional[dict] = None,
                  exemplars: Optional[list[dict]] = None,
-                 exemplar_files: Optional[list[dict]] = None) -> dict:
+                 exemplar_files: Optional[list[dict]] = None,
+                 corrections: str = "") -> dict:
     """Initial checkpoint state for a fresh chain. server.py writes this to
     db.chain_progress right after budget-checking, BEFORE any stage runs."""
     role_sequence = _providers.role_sequence_for_tier(tier)
@@ -591,6 +597,7 @@ def new_progress(chain_id: str, target_prompt: str, tier: str,
         "assignments": a,
         "exemplars": exemplars or [],
         "exemplar_files": exemplar_files or [],
+        "corrections": corrections or "",
         "tokens_used": 0,
         "fallback_used": False,
         "needs_fix": False,
@@ -686,7 +693,8 @@ async def run_stage(progress: dict) -> dict:
             if stage == "teacher":
                 ts = await teacher_step(progress["target_prompt"], progress["exemplars"],
                                         assignment=a["teacher"], user_keys=user_keys,
-                                        chain_id=chain_id, tier=tier)
+                                        chain_id=chain_id, tier=tier,
+                                        corrections=progress.get("corrections", ""))
                 progress["tokens_used"] += ts.pop("_tokens", 0)
                 progress["teacher_spec"] = ts
 

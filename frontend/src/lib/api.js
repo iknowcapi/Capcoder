@@ -62,4 +62,12 @@ export const api = {
   startTrial: () => axios.post(`${API}/tier/start-trial`).then((r) => r.data),
   tierStatus: () => axios.get(`${API}/tier/status`).then((r) => r.data),
   tierPrices: () => axios.get(`${API}/tier/prices`).then((r) => r.data),
+  // ---- Edit-Diffing loop (#7) ----
+  checkEditsGit: (chainId) => axios.post(`${API}/chains/${chainId}/check-edits`).then((r) => r.data),
+  checkEditsUpload: (chainId, file) => {
+    const form = new FormData();
+    form.append("file", file);
+    return axios.post(`${API}/chains/${chainId}/check-edits`, form).then((r) => r.data);
+  },
+  getEditDiffs: (chainId) => axios.get(`${API}/chains/${chainId}/edit-diffs`).then((r) => r.data),
 };

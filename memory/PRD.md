@@ -46,9 +46,26 @@ CapCode is a recursive bot-builder. Human types the app they want; the system ru
 - `REACT_APP_NEON_AUTH_URL` — same as backend's `NEON_AUTH_URL`, exposed to the browser.
 - `WDS_SOCKET_PORT=443`.
 
-## Status (2026-08-18 — Pricing page, trial repricing, annual billing)
+## Status (2026-08-18 — Recursive self-improvement Layer #7: User Edit Diffing)
 
-### ✅ Shipped this session (2026-08-18)
+### ✅ Shipped this session (2026-08-18, second pass)
+User asked to make every decision layer of the app recursive (prompt/instruction, test-gen, error-pattern library, architecture decisions, eval-criteria meta-loop, dependency selection, user-edit diffing, docs/context). Agreed sequencing: **#7 (User Edit Diffing) first** — it's the ground-truth signal everything else (#5, #1) would otherwise guess at.
+
+- **`backend/edits.py`** (new): every completed build gets a `build_manifest` (sha256 per file) + `built_at` stamped on the chain doc (`Chain` Pydantic model gained these + `github` fields — root-cause fix for a bug where they were silently stripped from every API response).
+- **`POST /api/chains/{id}/check-edits`**: two ways in — (a) if pushed to GitHub, diffs the pushed commit vs current HEAD via GitHub's compare API (`check_git_edits`, untested live — no PAT available in this env); (b) upload the edited project as a `.zip` (`check_upload_edits`) — hash-compared against the manifest, real unified diffs via `difflib`. Upload takes priority over the git path when both are present. Path-normalization handles one level of nested-zip folders. Append-only storage with de-dup against the last identical hunk (no spam on repeat checks).
+- **`GET /api/chains/{id}/edit-diffs`**: persisted history of detected corrections per chain.
+- **Feedback loop closed**: `corrections_digest()` pulls the 5 most recent cross-tenant corrections and injects them into every new build's Teacher prompt as "COMMON USER CORRECTIONS ACROSS PRIOR BUILDS" — this is what makes the loop recursive, not just a diff viewer.
+- **Frontend**: `ChainViewer.jsx` gained a "check for edits"/"upload edits" button (context-sensitive on whether the chain was pushed), a hidden `.zip` file input, and a "LEARNED CORRECTIONS" panel with per-file expandable diff hunks.
+- **Storage**: `edit_diffs` is a new logical collection inside the *same* single Postgres `docs` table (docdb.py) — no new database, no migration, confirmed auto-created and populated.
+- **Bug found+fixed mid-session** (correction-pass trigger in `chain_generator.py` was gated on non-empty stderr, silently skipping correction + reporting "already working" right after EXECUTE said "failed to start" — now fixed in both the checkpointed and legacy code paths, verified live via curl).
+- Tested: testing_agent iteration_10 — 13/13 backend pytest cases + full Playwright frontend flow, 100% pass, no critical issues (2 cosmetic LOW items noted below).
+
+### Not yet built (explicitly deferred, next up per user's stated order)
+- **#5 — Evaluation criteria meta-loop**: recursively refine the scoring rubric itself using acceptance signals (✓ Verify button + now also edit-diff volume/severity as a proxy). NOT started.
+- **#1 — Prompt/instruction self-tuning**: rewrite Teacher/Artist system prompts based on which produced the highest-scoring, least-corrected builds. NOT started (the corrections_digest feed into the Teacher prompt is a first step toward this, but the prompts themselves are still static).
+- **#2, #3, #4, #6, #8** (test-gen loop, error-pattern library, architecture-decision tracking, dependency allow/avoid list, auto-doc context): not scoped yet, no user decision made on sequencing beyond "#7 → #5 → #1".
+
+### Previously shipped (2026-08-18, first pass — Pricing page, trial repricing, annual billing)
 - **New Pricing page** (`PricingPage.jsx`) — 3 plan cards (Free/Trial/Paid), reachable from landing nav, build-view header, and Settings "see full plans" link. Monthly/annual toggle for the Paid card.
 - **Trial repriced**: was free/no-card, now a **$2.99 one-time Stripe charge** (`plan=trial` in `/api/tier/checkout`, mode="payment") — priced to cover the trial's own NVIDIA compute cost. `/api/tier/start-trial` (the old free path) is now gated behind `ALLOW_MOCK_BILLING=true` and 410s otherwise.
 - **Trial is NVIDIA-only end to end**: `providers.TIER_ASSIGNMENTS["trial"]` and new `TRIAL_FALLBACKS` route all 6 roles (teacher/architect/artist/reviewer/rater/corrector) through NVIDIA only — even the error-path fallback never reaches a metered OpenRouter/Venice call.
@@ -78,16 +95,23 @@ CapCode is a recursive bot-builder. Human types the app they want; the system ru
 
 ### P0 — none open
 
+### P1 — Recursive self-improvement layers (user's stated priority: #7 done → #5 next → #1 next)
+- **#5 Evaluation criteria meta-loop**: let real acceptance signals (✓ Verify clicks, edit-diff volume/severity per build) reshape the composite scoring rubric instead of it staying static.
+- **#1 Prompt/instruction self-tuning**: rewrite Teacher/Artist system prompts based on outcome data (which prompts→highest scores, fewest corrections). corrections_digest() already feeds the Teacher per-build; the prompts themselves are still hand-written/static.
+- GitHub compare path (`check_git_edits` in edits.py) has never been exercised live — no PAT available in this env. Needs a real push+edit+PAT cycle to verify end to end.
+
 ### P1 — Product / billing follow-ups
-- Add `stripe`-key-holder must paste `STRIPE_PRICE_ID_TRIAL` and `STRIPE_PRICE_ID_PAID_ANNUAL` into Render once created (one-time price for trial, recurring-yearly price for annual) — everything else is already wired.
-- Credit top-up packs (user mentioned wanting these once annual/trial landed) — no price/size decided yet, needs its own round of clarification before building.
-- `billing.get_cycle()`'s lazy renewal refills on `status=="active"` alone — doesn't check a paid-through timestamp, so a lapsed annual subscription with a missed webhook would still refill. Low-risk edge case, revisit if it becomes real.
+- User needs to paste `STRIPE_PRICE_ID_TRIAL` and `STRIPE_PRICE_ID_PAID_ANNUAL` into Render once created in Stripe.
+- Credit top-up packs — no price/size decided yet.
 
 ### P2 — Polish
 - Seed the verified pool with 5-10 pre-verified builds.
 - TOS / Privacy pages.
-- `/api/auth/me` 401s on every signed-out page load are cosmetic console noise (frontend calls it on mount + 60s poll) — consider 200 `{user:null}` or skipping the call with no JWT present.
-- `/api/tier/prices` cache has no manual bust (`?refresh=1`) like `/providers/models` does — 1h staleness after a Stripe price edit.
+- `/api/auth/me` 401s on every signed-out page load are cosmetic console noise — flagged again by testing_agent iteration_10.
+- ChainViewer's optimistic post-upload diff entries are missing `seconds_since_build` until reload (cosmetic, iteration_10 LOW finding).
+- `edits._normalize_upload_paths` only strips one leading path segment — a zip nested 2+ levels deep would still miss (iteration_10 code-review note).
+- `GET /edit-diffs` caps at 50 rows, no pagination — fine for now, revisit if a chain accumulates more corrections than that.
+- `/api/tier/prices` cache has no manual bust — 1h staleness after a Stripe price edit.
 - BYOK strict `user_id` resolution on the signed-in path.
 - Obsolete backend tests still reference Mongo (`tests/test_auth.py`, `tests/test_iteration6_fixes.py`) — rewrite for Postgres + Neon JWT or delete.
 

@@ -1,6 +1,7 @@
-import React, { useState } from "react";
-import { Download, FileCode, GitBranch, Github } from "lucide-react";
-import { API } from "@/lib/api";
+import React, { useEffect, useState } from "react";
+import { Download, FileCode, GitBranch, Github, History } from "lucide-react";
+import { toast } from "sonner";
+import { API, api } from "@/lib/api";
 
 const Bar = ({ label, value, max = 4, color = "phosphor" }) => {
   const pct = Math.max(0, Math.min(1, value / max));
@@ -211,6 +212,46 @@ export const ChainViewer = ({ chain, onVerify, onPush, streamBuf, advanceLog }) 
   const [repoName, setRepoName] = useState("");
   const [pushPrivate, setPushPrivate] = useState(true);
   const [pushing, setPushing] = useState(false);
+  const [editDiffs, setEditDiffs] = useState([]);
+  const [checkingEdits, setCheckingEdits] = useState(false);
+  const uploadRef = React.useRef(null);
+
+  useEffect(() => {
+    if (chain?.status === "complete") {
+      api.getEditDiffs(chain.id).then((r) => {
+        // API returns full history (newest first) per file — collapse to
+        // the latest hunk per file for display, same as the post-check merge below.
+        const seen = new Set();
+        const latestOnly = (r.diffs || []).filter((d) => {
+          if (seen.has(d.file_path)) return false;
+          seen.add(d.file_path);
+          return true;
+        });
+        setEditDiffs(latestOnly);
+      }).catch(() => {});
+    }
+  }, [chain?.id, chain?.status]);
+
+  const runCheckEdits = async (file) => {
+    setCheckingEdits(true);
+    try {
+      const res = file ? await api.checkEditsUpload(chain.id, file) : await api.checkEditsGit(chain.id);
+      if (res.changed_files > 0) {
+        toast.success(`found ${res.changed_files} corrected file(s) — learning from them`);
+        setEditDiffs((prev) => {
+          const byPath = new Map(prev.map((d) => [d.file_path, d]));
+          for (const d of res.diffs) byPath.set(d.file_path, { ...d, detected_at: new Date().toISOString() });
+          return Array.from(byPath.values());
+        });
+      } else {
+        toast.info("no edits detected yet");
+      }
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "couldn't check for edits");
+    } finally {
+      setCheckingEdits(false);
+    }
+  };
 
   if (!chain) {
     return (
@@ -307,6 +348,27 @@ export const ChainViewer = ({ chain, onVerify, onPush, streamBuf, advanceLog }) 
               <Github size={14} /> push to github
             </button>
           )}
+          {isComplete && (
+            <>
+              <button
+                data-testid="check-edits-btn"
+                disabled={checkingEdits}
+                onClick={() => (chain.github ? runCheckEdits() : uploadRef.current?.click())}
+                className="flex items-center gap-2 border border-neon_yellow/60 text-neon_yellow px-4 py-2 hover:bg-neon_yellow hover:text-black transition-colors label-xs disabled:opacity-40"
+                title="Detect what you changed after the build so future builds learn from it"
+              >
+                <History size={14} /> {checkingEdits ? "checking…" : chain.github ? "check for edits" : "upload edits"}
+              </button>
+              <input
+                ref={uploadRef}
+                data-testid="check-edits-upload-input"
+                type="file"
+                accept=".zip"
+                className="hidden"
+                onChange={(e) => { const f = e.target.files?.[0]; if (f) runCheckEdits(f); e.target.value = ""; }}
+              />
+            </>
+          )}
         </div>
       </header>
 
@@ -350,6 +412,33 @@ export const ChainViewer = ({ chain, onVerify, onPush, streamBuf, advanceLog }) 
             requires your github username + a personal access token (scope:{" "}
             <code className="text-neon_cyan">repo</code>) saved under model settings.
           </p>
+        </div>
+      )}
+
+      {editDiffs.length > 0 && (
+        <div className="panel p-4 space-y-3" data-testid="edit-diffs-panel"
+             style={{ borderColor: "rgba(245,230,0,0.35)" }}>
+          <div className="label-xs text-neon_yellow">
+            [ LEARNED CORRECTIONS :: {editDiffs.length} FILE{editDiffs.length > 1 ? "S" : ""} ]
+          </div>
+          <p className="text-[11px] text-phosphor3 font-mono">
+            what you changed after this build got delivered — future Teacher briefs are steered away from repeating these.
+          </p>
+          {editDiffs.map((d) => (
+            <details key={d.file_path} className="border-l-2 border-neon_yellow/40 pl-3" data-testid={`edit-diff-${d.file_path}`}>
+              <summary className="text-xs font-mono text-neon_yellow cursor-pointer">
+                {d.file_path}
+                {d.seconds_since_build != null && (
+                  <span className="text-phosphor3 ml-2">
+                    ({Math.round(d.seconds_since_build / 60)}m after build)
+                  </span>
+                )}
+              </summary>
+              <pre className="text-[10px] font-mono text-phosphor2 whitespace-pre-wrap max-h-40 overflow-y-auto mt-1">
+                {d.diff_hunk}
+              </pre>
+            </details>
+          ))}
         </div>
       )}
 

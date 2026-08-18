@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from dotenv import load_dotenv
-from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.cors import CORSMiddleware
@@ -32,6 +32,7 @@ import providers as _providers
 import usage as _usage
 import tiers as _tiers
 import billing as _billing
+import edits as _edits
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -92,6 +93,9 @@ class Chain(BaseModel):
     venice_consent: Optional[dict] = None
     error: Optional[str] = None
     billing: Optional[dict] = None
+    build_manifest: Optional[dict] = None
+    built_at: Optional[str] = None
+    github: Optional[dict] = None
 
 
 class EvolveRequest(BaseModel):
@@ -732,9 +736,16 @@ async def evolve(req: EvolveRequest, background_tasks: BackgroundTasks, request:
     # report while the next call is already in flight. No single request
     # ever does more than one LLM call's worth of work, so there's no long-
     # running function for any serverless timeout to kill.
+    #
+    # `corrections` is the recursive Edit-Diffing loop (#7) closing itself —
+    # real user corrections detected on PRIOR builds (across all users, same
+    # cross-tenant learning model as verified exemplars) get fed into this
+    # build's Teacher brief so it steers away from repeating them.
+    corrections = await _edits.corrections_digest(db)
     progress = chain_generator.new_progress(
         chain_id, target, tier,
         assignments=assignments, exemplars=exemplars, exemplar_files=exemplar_files,
+        corrections=corrections,
     )
     # SEC: never persist decrypted BYOK keys to the DB. Store only the
     # session_id so /advance can re-derive keys fresh on each stage call.
@@ -801,11 +812,17 @@ async def advance_chain(chain_id: str, request: Request):
 
     if done:
         product = progress["product"]
+        completed_at = datetime.now(timezone.utc).isoformat()
+        # Edit-Diffing loop (#7) starts here: stamp a sha256 manifest of the
+        # final files so a future GitHub push/upload can cheaply tell which
+        # files the user actually changed after delivery.
+        build_manifest = _edits.sha256_manifest(product.get("files", []))
         await db.chains.update_one(
             {"id": chain_id},
             {"$push": {"generations": product},
              "$set": {"status": "complete", "fallback_used": progress["fallback_used"],
-                      "completed_at": datetime.now(timezone.utc).isoformat()}},
+                      "completed_at": completed_at,
+                      "build_manifest": build_manifest, "built_at": completed_at}},
         )
         km = (product.get("refinement") or {}).get("knowledge_module")
         if km:
@@ -1156,6 +1173,22 @@ async def push_to_github(chain_id: str, req: GithubPushRequest, request: Request
                     continue
                 raise HTTPException(502, f"git step {' '.join(cmd[:3])} failed: {err[:300]}")
 
+        # Edit-Diffing loop (#7): remember exactly which commit we just
+        # pushed so a later "check for edits" can diff HEAD against it via
+        # GitHub's compare API — no local clone needed at check time.
+        sha_res = _run(["git", "rev-parse", "HEAD"], tmp, with_creds=False)
+        commit_sha = (sha_res.stdout or "").strip()
+
+    if commit_sha:
+        await db.chains.update_one(
+            {"id": chain_id},
+            {"$set": {"github": {
+                "repo": f"{username}/{repo_name}",
+                "commit_sha": commit_sha,
+                "pushed_at": datetime.now(timezone.utc).isoformat(),
+            }}},
+        )
+
     return {
         "id": chain_id,
         "repo": f"{username}/{repo_name}",
@@ -1163,6 +1196,79 @@ async def push_to_github(chain_id: str, req: GithubPushRequest, request: Request
         "private": bool(req.private),
         "created": was_created,
     }
+
+
+@api.post("/chains/{chain_id}/check-edits")
+async def check_edits(chain_id: str, request: Request, file: UploadFile = File(None)):
+    """Edit-Diffing loop (#7): looks for real changes the user made to a
+    delivered build. Two ways in — whichever applies:
+      1. Chain was pushed to GitHub -> diff the pushed commit against the
+         repo's current HEAD via GitHub's compare API (no upload needed).
+      2. No push (or you want to check local-only edits) -> upload the
+         edited project as a .zip and we hash+difflib it against what was
+         originally generated.
+    Detected hunks are stored permanently and feed every future build's
+    Teacher prompt via corrections_digest()."""
+    owner = await _owner_from_request(request)
+    _check_rate_limit(owner, "check-edits", max_calls=10, window_sec=60)
+    q = {"id": chain_id, **_owner_filter(owner)}
+    doc = await db.chains.find_one(q, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "chain not found")
+    if doc.get("status") != "complete":
+        raise HTTPException(409, "chain not complete")
+
+    changed: list[dict] = []
+
+    # Prefer an explicit upload when the caller sent one — pushing to GitHub
+    # doesn't retire the upload path, and a stale/removed PAT shouldn't turn
+    # a valid attached zip into a 400.
+    if file is not None:
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > 10 * 1024 * 1024:
+            raise HTTPException(413, "zip too large (10MB max)")
+        raw = await file.read()
+        if len(raw) > 10 * 1024 * 1024:
+            raise HTTPException(413, "zip too large (10MB max)")
+        uploaded: dict[str, str] = {}
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                for name in zf.namelist():
+                    if name.endswith("/"):
+                        continue
+                    if not _exec._is_safe_relpath(name):
+                        continue
+                    try:
+                        uploaded[name] = zf.read(name).decode("utf-8", "ignore")
+                    except Exception:
+                        continue
+        except zipfile.BadZipFile:
+            raise HTTPException(400, "not a valid zip file")
+        changed = await _edits.check_upload_edits(db, doc, uploaded)
+    elif doc.get("github"):
+        settings_key = owner.get("anon")
+        settings = await db.settings.find_one({"session_id": settings_key}, {"_id": 0}) or {} if settings_key else {}
+        token = ((settings.get("github") or {}).get("token") or "").strip()
+        if not token:
+            raise HTTPException(400, "github token missing — save your PAT in settings to check pushed edits")
+        changed = await _edits.check_git_edits(db, doc, token)
+    else:
+        raise HTTPException(400, "push this chain to GitHub first, or upload your edited files as a .zip")
+
+    return {"chain_id": chain_id, "changed_files": len(changed), "diffs": changed}
+
+
+@api.get("/chains/{chain_id}/edit-diffs")
+async def get_edit_diffs(chain_id: str, request: Request):
+    owner = await _owner_from_request(request)
+    q = {"id": chain_id, **_owner_filter(owner)}
+    doc = await db.chains.find_one(q, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "chain not found")
+    rows = await db.edit_diffs.find({"chain_id": chain_id}).sort("detected_at", -1).to_list(50)
+    for r in rows:
+        r.pop("_id", None)
+    return {"chain_id": chain_id, "diffs": rows}
 
 
 app.include_router(api)
