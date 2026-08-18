@@ -3,7 +3,7 @@ import "@/App.css";
 import { Toaster, toast } from "sonner";
 import { LogIn, LogOut, Settings } from "lucide-react";
 import { api, API } from "@/lib/api";
-import { signInWithGoogle, signOut as neonSignOut } from "@/lib/authClient";
+import { signInWithGoogle, signOut as neonSignOut, getJwt } from "@/lib/authClient";
 import { TerminalHero } from "@/components/TerminalHero";
 import { EvolveButton } from "@/components/EvolveButton";
 import { ChainViewer } from "@/components/ChainViewer";
@@ -50,6 +50,14 @@ function App() {
     let alive = true;
     const load = async () => {
       try {
+        // Skip the backend round-trip entirely when there's no Neon Auth JWT
+        // yet — anonymous visitors would otherwise 401 against /api/auth/me
+        // on every mount + every 60s poll, for nothing but console noise.
+        const jwt = await getJwt();
+        if (!jwt) {
+          if (alive) setUser(null);
+          return;
+        }
         const me = await api.authMe();
         if (alive) setUser(me);
       } catch (_) {

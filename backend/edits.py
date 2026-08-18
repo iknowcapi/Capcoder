@@ -61,13 +61,15 @@ async def _store_diff(db, chain_id: str, file_path: str, diff_hunk: str,
     has ever fixed, not just the latest snapshot. Skips writing a duplicate
     when the most recent stored hunk for this file is byte-identical (so
     repeatedly clicking 'check for edits' with no new changes doesn't spam
-    the history)."""
+    the history). Returns the stored record's seconds_since_build (or None
+    if this call was a no-op dedup) so callers can echo it back immediately
+    instead of the caller having to reload to see 'time since build'."""
     diff_hunk = diff_hunk[:4000]
     latest = await db.edit_diffs.find(
         {"chain_id": chain_id, "file_path": file_path}
     ).sort("detected_at", -1).limit(1).to_list(1)
     if latest and latest[0].get("diff_hunk") == diff_hunk:
-        return
+        return latest[0].get("seconds_since_build")
     now = datetime.now(timezone.utc)
     seconds_since_build = None
     if built_at:
@@ -80,6 +82,7 @@ async def _store_diff(db, chain_id: str, file_path: str, diff_hunk: str,
         "diff_hunk": diff_hunk, "seconds_since_build": seconds_since_build,
         "source": source, "detected_at": now.isoformat(),
     })
+    return seconds_since_build
 
 
 async def check_git_edits(db, doc: dict, token: str) -> list[dict]:
@@ -107,8 +110,8 @@ async def check_git_edits(db, doc: dict, token: str) -> list[dict]:
         patch = f.get("patch", "")
         if not path or not patch or path not in manifest:
             continue
-        await _store_diff(db, doc["id"], path, patch, doc.get("built_at"), "git")
-        changed.append({"file_path": path, "diff_hunk": patch})
+        secs = await _store_diff(db, doc["id"], path, patch, doc.get("built_at"), "git")
+        changed.append({"file_path": path, "diff_hunk": patch, "seconds_since_build": secs})
     return changed
 
 
@@ -135,8 +138,8 @@ async def check_upload_edits(db, doc: dict, uploaded: dict[str, str]) -> list[di
         ))
         if not hunk:
             continue
-        await _store_diff(db, doc["id"], path, hunk, doc.get("built_at"), "upload")
-        changed.append({"file_path": path, "diff_hunk": hunk})
+        secs = await _store_diff(db, doc["id"], path, hunk, doc.get("built_at"), "upload")
+        changed.append({"file_path": path, "diff_hunk": hunk, "seconds_since_build": secs})
     return changed
 
 

@@ -579,7 +579,8 @@ def new_progress(chain_id: str, target_prompt: str, tier: str,
                  assignments: Optional[dict] = None,
                  exemplars: Optional[list[dict]] = None,
                  exemplar_files: Optional[list[dict]] = None,
-                 corrections: str = "") -> dict:
+                 corrections: str = "",
+                 eval_weights: Optional[dict] = None) -> dict:
     """Initial checkpoint state for a fresh chain. server.py writes this to
     db.chain_progress right after budget-checking, BEFORE any stage runs."""
     role_sequence = _providers.role_sequence_for_tier(tier)
@@ -598,6 +599,7 @@ def new_progress(chain_id: str, target_prompt: str, tier: str,
         "exemplars": exemplars or [],
         "exemplar_files": exemplar_files or [],
         "corrections": corrections or "",
+        "eval_weights": eval_weights,
         "tokens_used": 0,
         "fallback_used": False,
         "needs_fix": False,
@@ -784,10 +786,12 @@ async def run_stage(progress: dict) -> dict:
                 product["coverage"] = cov
                 if "corrector" in progress["role_sequence"] or "architect" in progress["role_sequence"]:
                     nov = novelty_score(product.get("files") or [], progress["exemplar_files"])
-                    result = composite_v2(cov.get("coverage"), progress["scores"], nov)
+                    weights = progress.get("eval_weights")
+                    result = composite_v2(cov.get("coverage"), progress["scores"], nov, weights=weights)
                     product["novelty"] = nov
                     product["composite_gated"] = result["gated"]
                     product["composite_score"] = result["score"]
+                    product["eval_weights"] = weights or {"coverage": 0.4, "rater": 0.4, "novelty": 0.2}
                 else:
                     base = composite(progress["scores"])
                     product["composite_score"] = (round(base * 0.6 + (cov["coverage"] * 4.0) * 0.4, 3)
@@ -1182,17 +1186,26 @@ def novelty_score(files: list[dict], exemplar_files: Optional[list[dict]]) -> fl
     return round(max(0.0, min(1.0, 1.0 - best_similarity)), 3)
 
 
-def composite_v2(coverage: Optional[float], rater_scores: dict, novelty: float) -> dict:
+def composite_v2(coverage: Optional[float], rater_scores: dict, novelty: float,
+                 weights: Optional[dict] = None) -> dict:
     """Returns {"score": float 0-4ish, "gated": bool, "coverage": float, "novelty": float}.
     rater_scores is the same dict rate_step() returns (helpfulness/correctness/etc) —
     we normalize its composite() output (roughly 0-4 scale) down to 0-1 to combine
     with coverage/novelty, then scale the final blended score back to 0-4 for
-    consistency with the existing composite()'s range."""
+    consistency with the existing composite()'s range.
+    `weights` (coverage/rater/novelty, summing to ~1.0) defaults to the
+    original fixed 0.4/0.4/0.2 split — Layer #5's meta-loop (eval_meta.py)
+    supplies a data-driven set here once there's enough outcome signal."""
+    w = weights or {"coverage": 0.4, "rater": 0.4, "novelty": 0.2}
     rater_norm = max(0.0, min(1.0, composite(rater_scores) / 4.0))
     cov = coverage if coverage is not None else 0.5  # neutral when no deterministic signal
     if cov < COVERAGE_GATE_THRESHOLD:
         return {"score": 0.0, "gated": True, "coverage": cov, "novelty": novelty}
-    blended = cov * 0.4 + rater_norm * 0.4 + novelty * 0.2
+    # .get() with a default, never w[...] — a partial/malformed eval_weights
+    # doc must degrade to the safe default for that one dimension, not crash
+    # the whole score stage.
+    blended = (cov * w.get("coverage", 0.4) + rater_norm * w.get("rater", 0.4)
+              + novelty * w.get("novelty", 0.2))
     return {"score": round(blended * 4.0, 3), "gated": False, "coverage": cov, "novelty": novelty}
 
 

@@ -33,6 +33,7 @@ import usage as _usage
 import tiers as _tiers
 import billing as _billing
 import edits as _edits
+import eval_meta as _eval_meta
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -742,10 +743,11 @@ async def evolve(req: EvolveRequest, background_tasks: BackgroundTasks, request:
     # cross-tenant learning model as verified exemplars) get fed into this
     # build's Teacher brief so it steers away from repeating them.
     corrections = await _edits.corrections_digest(db)
+    eval_weights_doc = await _eval_meta.get_weights(db)
     progress = chain_generator.new_progress(
         chain_id, target, tier,
         assignments=assignments, exemplars=exemplars, exemplar_files=exemplar_files,
-        corrections=corrections,
+        corrections=corrections, eval_weights=eval_weights_doc["weights"],
     )
     # SEC: never persist decrypted BYOK keys to the DB. Store only the
     # session_id so /advance can re-derive keys fresh on each stage call.
@@ -999,6 +1001,7 @@ async def verify_chain(chain_id: str, request: Request):
             "generations": new_gens,
         }},
     )
+    await _eval_meta.maybe_recompute(db)
     return {"id": chain_id, "verified": True}
 
 
@@ -1255,6 +1258,8 @@ async def check_edits(chain_id: str, request: Request, file: UploadFile = File(N
     else:
         raise HTTPException(400, "push this chain to GitHub first, or upload your edited files as a .zip")
 
+    if changed:
+        await _eval_meta.maybe_recompute(db)
     return {"chain_id": chain_id, "changed_files": len(changed), "diffs": changed}
 
 
@@ -1269,6 +1274,13 @@ async def get_edit_diffs(chain_id: str, request: Request):
     for r in rows:
         r.pop("_id", None)
     return {"chain_id": chain_id, "diffs": rows}
+
+
+@api.get("/eval-weights")
+async def get_eval_weights():
+    """Public, read-only — Layer #5's current scoring rubric, for
+    transparency (surfaced on generation cards in the UI)."""
+    return await _eval_meta.get_weights(db)
 
 
 app.include_router(api)

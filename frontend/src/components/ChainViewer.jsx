@@ -144,6 +144,11 @@ const GenerationCard = ({ gen, chainId, billing }) => {
               {Number(gen.composite_score || 0).toFixed(3)}
             </span>
           </div>
+          {gen.eval_weights && (
+            <div className="mt-1 text-[10px] font-mono text-phosphor3" data-testid={`eval-weights-${gen.gen}`}>
+              scored via: cov {Math.round(gen.eval_weights.coverage * 100)}% · rater {Math.round(gen.eval_weights.rater * 100)}% · novelty {Math.round(gen.eval_weights.novelty * 100)}%
+            </div>
+          )}
         </div>
       </div>
 

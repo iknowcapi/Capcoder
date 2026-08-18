@@ -46,9 +46,21 @@ CapCode is a recursive bot-builder. Human types the app they want; the system ru
 - `REACT_APP_NEON_AUTH_URL` — same as backend's `NEON_AUTH_URL`, exposed to the browser.
 - `WDS_SOCKET_PORT=443`.
 
-## Status (2026-08-18 — Recursive self-improvement Layer #7: User Edit Diffing)
+## Status (2026-08-18 — Recursive self-improvement Layer #5: Evaluation-Criteria Meta-Loop)
 
-### ✅ Shipped this session (2026-08-18, second pass)
+### ✅ Shipped this session (2026-08-18, third pass)
+- **`backend/eval_meta.py`** (new): the composite score's fixed weights (coverage×0.4 + rater×0.4 + novelty×0.2) are now data-driven. `maybe_recompute()` (throttled, ≤1/hr, called opportunistically from `/verify` and `/check-edits`) buckets recent complete builds into "good" (✓ Verify AND never edit-diffed) vs "bad", measures the mean-gap per dimension, floors each weight at 0.1, and blends 70% prior / 30% freshly computed for stability. Gated on `MIN_SAMPLE_SIZE=15` so early on the rubric stays exactly at defaults.
+- `GET /api/eval-weights` (public) — current weights + sample_size + is_default, for transparency.
+- `chain_generator.composite_v2()` now takes a `weights` param (`.get()`-safe against a partial/malformed doc — testing_agent-flagged fix); every scored generation on trial/paid tiers stamps `eval_weights` used. Free tier (teacher+artist only) never touches this path — unchanged, pre-existing behavior.
+- Frontend: `ChainViewer.jsx` shows a small "scored via: cov X% · rater X% · novelty X%" line under COMPOSITE when present.
+- **2 LOW bugs fixed from iteration_10**: `edits.py`'s `_store_diff` now returns `seconds_since_build` immediately in the `check-edits` response (no reload needed); `App.js`'s auth check now skips `/api/auth/me` entirely when there's no Neon JWT (was 401-spamming on every anon page load).
+- Tested: testing_agent iteration_11 — 18/18 backend pytest + full Playwright frontend, 100% pass, no critical issues.
+
+### Not yet built (deferred, per user's stated order: #7 done → #5 done → #1 next)
+- **#1 — Prompt/instruction self-tuning**: rewrite Teacher/Artist system prompts based on outcome data. `corrections_digest()` (Layer #7) already feeds per-build hints into the Teacher prompt, but the prompts themselves are still static — this is the next planned layer.
+- **#2, #3, #4, #6, #8** (test-gen loop, error-pattern library, architecture-decision tracking, dependency allow/avoid list, auto-doc context): not scoped, no sequencing decided beyond #7→#5→#1.
+
+### Previously shipped (2026-08-18, second pass — Layer #7 User Edit Diffing)
 User asked to make every decision layer of the app recursive (prompt/instruction, test-gen, error-pattern library, architecture decisions, eval-criteria meta-loop, dependency selection, user-edit diffing, docs/context). Agreed sequencing: **#7 (User Edit Diffing) first** — it's the ground-truth signal everything else (#5, #1) would otherwise guess at.
 
 - **`backend/edits.py`** (new): every completed build gets a `build_manifest` (sha256 per file) + `built_at` stamped on the chain doc (`Chain` Pydantic model gained these + `github` fields — root-cause fix for a bug where they were silently stripped from every API response).
@@ -95,10 +107,10 @@ User asked to make every decision layer of the app recursive (prompt/instruction
 
 ### P0 — none open
 
-### P1 — Recursive self-improvement layers (user's stated priority: #7 done → #5 next → #1 next)
-- **#5 Evaluation criteria meta-loop**: let real acceptance signals (✓ Verify clicks, edit-diff volume/severity per build) reshape the composite scoring rubric instead of it staying static.
-- **#1 Prompt/instruction self-tuning**: rewrite Teacher/Artist system prompts based on outcome data (which prompts→highest scores, fewest corrections). corrections_digest() already feeds the Teacher per-build; the prompts themselves are still hand-written/static.
-- GitHub compare path (`check_git_edits` in edits.py) has never been exercised live — no PAT available in this env. Needs a real push+edit+PAT cycle to verify end to end.
+### P1 — Recursive self-improvement layers (user's stated priority: #7 done, #5 done → #1 next)
+- **#1 Prompt/instruction self-tuning**: rewrite Teacher/Artist system prompts based on outcome data (which prompts→highest scores, fewest corrections). `corrections_digest()` already feeds the Teacher per-build; the prompts themselves are still hand-written/static.
+- GitHub compare path (`check_git_edits` in edits.py) and paid/trial-tier `eval_weights` wiring have never been exercised live end-to-end — no Google login / GitHub PAT available in this env. Verified by code inspection + unit-level calls only.
+- (Optional, LOW) `eval_meta.maybe_recompute()` runs inline inside `/verify`/`/check-edits` — once sample_size clears 15 it scans up to 500 chains on that one request. Fine at current scale; move to `BackgroundTasks` if it ever becomes noticeable.
 
 ### P1 — Product / billing follow-ups
 - User needs to paste `STRIPE_PRICE_ID_TRIAL` and `STRIPE_PRICE_ID_PAID_ANNUAL` into Render once created in Stripe.
@@ -107,10 +119,9 @@ User asked to make every decision layer of the app recursive (prompt/instruction
 ### P2 — Polish
 - Seed the verified pool with 5-10 pre-verified builds.
 - TOS / Privacy pages.
-- `/api/auth/me` 401s on every signed-out page load are cosmetic console noise — flagged again by testing_agent iteration_10.
-- ChainViewer's optimistic post-upload diff entries are missing `seconds_since_build` until reload (cosmetic, iteration_10 LOW finding).
-- `edits._normalize_upload_paths` only strips one leading path segment — a zip nested 2+ levels deep would still miss (iteration_10 code-review note).
-- `GET /edit-diffs` caps at 50 rows, no pagination — fine for now, revisit if a chain accumulates more corrections than that.
+- Neon's own `/token` endpoint still logs ~6-14 401s per anon session in console (out of scope for the auth-me fix this round — gate on a Neon session cookie if a fully clean console matters).
+- `edits._normalize_upload_paths` only strips one leading path segment — a zip nested 2+ levels deep would still miss.
+- `GET /edit-diffs` caps at 50 rows, no pagination.
 - `/api/tier/prices` cache has no manual bust — 1h staleness after a Stripe price edit.
 - BYOK strict `user_id` resolution on the signed-in path.
 - Obsolete backend tests still reference Mongo (`tests/test_auth.py`, `tests/test_iteration6_fixes.py`) — rewrite for Postgres + Neon JWT or delete.

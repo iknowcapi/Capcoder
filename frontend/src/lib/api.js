@@ -70,4 +70,6 @@ export const api = {
     return axios.post(`${API}/chains/${chainId}/check-edits`, form).then((r) => r.data);
   },
   getEditDiffs: (chainId) => axios.get(`${API}/chains/${chainId}/edit-diffs`).then((r) => r.data),
+  // ---- Evaluation-criteria meta-loop (#5) ----
+  getEvalWeights: () => axios.get(`${API}/eval-weights`).then((r) => r.data),
 };
