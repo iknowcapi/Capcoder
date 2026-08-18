@@ -111,6 +111,7 @@ User asked to make every decision layer of the app recursive (prompt/instruction
 - **#1 Prompt/instruction self-tuning**: rewrite Teacher/Artist system prompts based on outcome data (which prompts→highest scores, fewest corrections). `corrections_digest()` already feeds the Teacher per-build; the prompts themselves are still hand-written/static.
 - GitHub compare path (`check_git_edits` in edits.py) and paid/trial-tier `eval_weights` wiring have never been exercised live end-to-end — no Google login / GitHub PAT available in this env. Verified by code inspection + unit-level calls only.
 - (Optional, LOW) `eval_meta.maybe_recompute()` runs inline inside `/verify`/`/check-edits` — once sample_size clears 15 it scans up to 500 chains on that one request. Fine at current scale; move to `BackgroundTasks` if it ever becomes noticeable.
+- `tiers.py`'s monthly-plan price lookup now accepts BOTH `STRIPE_PRICE_ID_PAID` and the shorter legacy `STRIPE_PRICE_ID` (user already had the latter set in Render for the pre-existing monthly plan) — `STRIPE_PRICE_ID_PAID` wins if both are set. Trial/annual only accept their own explicit names (`STRIPE_PRICE_ID_TRIAL` / `STRIPE_PRICE_ID_PAID_ANNUAL`, added this session).
 
 ### P1 — Product / billing follow-ups
 - User needs to paste `STRIPE_PRICE_ID_TRIAL` and `STRIPE_PRICE_ID_PAID_ANNUAL` into Render once created in Stripe.

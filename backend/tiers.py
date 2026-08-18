@@ -52,6 +52,20 @@ PRICE_ENV_BY_PLAN = {
     "paid_annual": "STRIPE_PRICE_ID_PAID_ANNUAL",
 }
 
+# "paid" also accepts the shorter STRIPE_PRICE_ID as an alias — some Render
+# setups (this user's included) named their existing monthly price that way
+# before "paid_annual"/"trial" existed and needed their own distinct names.
+_LEGACY_PRICE_ENV_ALIAS = {"paid": "STRIPE_PRICE_ID"}
+
+
+def _price_id_for(plan: str) -> str:
+    primary = os.environ.get(PRICE_ENV_BY_PLAN[plan], "").strip()
+    if primary:
+        return primary
+    alias = _LEGACY_PRICE_ENV_ALIAS.get(plan)
+    return os.environ.get(alias, "").strip() if alias else ""
+
+
 # Shown on the Pricing page until/unless a real Stripe price is configured
 # for that plan — deliberately NOT hardcoded as the source of truth once
 # Stripe IS configured, since the monthly price is expected to drift over
@@ -114,8 +128,8 @@ async def get_prices():
         try:
             import stripe
             stripe.api_key = key
-            for plan, env_name in PRICE_ENV_BY_PLAN.items():
-                price_id = os.environ.get(env_name, "").strip()
+            for plan in PRICE_ENV_BY_PLAN:
+                price_id = _price_id_for(plan)
                 if not price_id:
                     continue
                 p = stripe.Price.retrieve(price_id)
@@ -240,10 +254,10 @@ async def create_checkout_session(request: Request):
         return {"checkout_url": None, "mock": True, "tier": "paid", "billing_cycle": cycle}
 
     stripe = _stripe()
-    price_env = PRICE_ENV_BY_PLAN[plan]
-    price_id = os.environ.get(price_env, "").strip()
+    price_id = _price_id_for(plan)
     if not price_id:
-        raise HTTPException(500, f"{price_env} not configured")
+        alias_hint = f" (or the legacy {_LEGACY_PRICE_ENV_ALIAS[plan]})" if plan in _LEGACY_PRICE_ENV_ALIAS else ""
+        raise HTTPException(500, f"{PRICE_ENV_BY_PLAN[plan]}{alias_hint} not configured")
 
     frontend_url = os.environ.get("FRONTEND_URL", "").rstrip("/")
     if not frontend_url:
