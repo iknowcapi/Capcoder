@@ -10,7 +10,9 @@ from __future__ import annotations
 import asyncio
 import os
 import pathlib
+import pwd
 import re
+import resource
 import socket
 from typing import Optional
 
@@ -58,6 +60,15 @@ def materialize(chain_id: str, gen: dict) -> pathlib.Path:
         p.write_text(f["content"])
         if p.suffix == ".sh":
             p.chmod(0o755)
+    # The child process runs as `nobody` (see _sandbox_preexec), but every
+    # file/dir above was just created by root — open up the whole workspace
+    # so the generated app can actually write its own logs/db/cache files.
+    # Scoped to this one throwaway per-build directory only.
+    for dirpath, dirnames, filenames in os.walk(root):
+        os.chmod(dirpath, 0o777)
+        for fn in filenames:
+            fp = pathlib.Path(dirpath) / fn
+            fp.chmod(0o777 if fp.suffix == ".sh" else 0o666)
     return root
 
 
@@ -67,6 +78,33 @@ def _port_open(port: int, host: str = "127.0.0.1") -> bool:
             return True
     except OSError:
         return False
+
+
+def _sandbox_preexec():
+    """Runs in the child, right before exec. Drops root (if we have it) to
+    the unprivileged `nobody` account so generated code can't read root-owned
+    files like backend/.env (SEC-001) even though it shares this filesystem,
+    and caps CPU/memory/open-files so a runaway build can't take the host
+    down. Best-effort: if we're already non-root or `nobody` doesn't exist,
+    this silently no-ops rather than breaking the run."""
+    os.setsid()
+    try:
+        nobody = pwd.getpwnam("nobody")
+        os.setgroups([])
+        os.setgid(nobody.pw_gid)
+        os.setuid(nobody.pw_uid)
+    except (KeyError, PermissionError, OSError):
+        pass
+    os.umask(0o077)
+    for limit, cap in (
+        (resource.RLIMIT_CPU, (25, 25)),
+        (resource.RLIMIT_AS, (1024 * 1024 * 1024,) * 2),
+        (resource.RLIMIT_NOFILE, (512, 512)),
+    ):
+        try:
+            resource.setrlimit(limit, cap)
+        except (ValueError, OSError):
+            pass
 
 
 async def run_workspace(
@@ -108,7 +146,7 @@ async def run_workspace(
         env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        preexec_fn=os.setsid,  # new process group so we can kill children too
+        preexec_fn=_sandbox_preexec,  # drop root -> nobody, cap resources, new pgid
     )
 
     # Poll port up to `timeout` seconds; when it opens we call it "started".

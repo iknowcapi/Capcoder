@@ -119,11 +119,17 @@ async def create_checkout_session(request: Request):
     key = os.environ.get("STRIPE_SECRET_KEY", "").strip()
 
     if not key:
-        # No Stripe keys yet — grant paid tier + open the $16/mo credit cycle
-        # directly so the whole billing flow (fund/profit split, refinement
-        # loop subsidy, Credit Rebirth) can be tested end-to-end. Swap to
-        # real Stripe checkout below the moment STRIPE_SECRET_KEY is set —
-        # no other code changes needed.
+        # SEC-002 fix: mock-subscribe is ONLY available when explicitly opted
+        # into via ALLOW_MOCK_BILLING=true (dev/test only). Without that flag
+        # this fails closed — a missing Stripe key must never silently grant
+        # a free paid-tier upgrade to anyone who's signed in.
+        if os.environ.get("ALLOW_MOCK_BILLING", "").strip().lower() != "true":
+            raise HTTPException(503, "Billing is not configured yet — try again later.")
+        # Grant paid tier + open the $16/mo credit cycle directly so the
+        # whole billing flow (fund/profit split, refinement loop subsidy,
+        # Credit Rebirth) can be tested end-to-end. Swap to real Stripe
+        # checkout below the moment STRIPE_SECRET_KEY is set — no other
+        # code changes needed, and this mock path becomes unreachable.
         await _db.users.update_one({"user_id": user_id}, {"$set": {"tier": "paid"}})
         cycle = await _billing.start_cycle(_db, user_id)
         return {"checkout_url": None, "mock": True, "tier": "paid", "billing_cycle": cycle}
