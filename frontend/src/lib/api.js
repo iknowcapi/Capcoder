@@ -47,8 +47,8 @@ export const api = {
   getChain: (id) => axios.get(`${API}/chains/${id}`).then((r) => r.data),
   advanceChain: (id) => axios.post(`${API}/chains/${id}/advance`).then((r) => r.data),
   verifyChain: (id) => axios.post(`${API}/chains/${id}/verify`).then((r) => r.data),
-  pushChain: (id, session_id, repo, isPrivate = true) =>
-    axios.post(`${API}/chains/${id}/push`, { session_id, repo, private: isPrivate }).then((r) => r.data),
+  pushChain: (id, repo, isPrivate = true) =>
+    axios.post(`${API}/chains/${id}/push`, { repo, private: isPrivate }).then((r) => r.data),
   // ---- Neon Managed Better Auth ----
   authMe: () => axios.get(`${API}/auth/me`).then((r) => r.data),
   authLogout: () => axios.post(`${API}/auth/logout`).then((r) => r.data),

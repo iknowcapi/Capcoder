@@ -168,7 +168,7 @@ function App() {
 
   const handlePush = async (id, repo, isPrivate) => {
     try {
-      const r = await api.pushChain(id, sessionId, repo, isPrivate);
+      const r = await api.pushChain(id, repo, isPrivate);
       toast.success(`PUSHED :: ${r.repo}`);
       window.open(r.url, "_blank", "noopener");
       return r;

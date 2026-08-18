@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import time
 import zipfile
 from datetime import datetime, timedelta, timezone
 import uuid
@@ -575,6 +576,24 @@ async def _has_recent_venice_consent(owner: dict) -> bool:
     return (await _get_recent_venice_consent(owner)) is not None
 
 
+# --- Rate limiting -----------------------------------------------------
+# In-memory sliding window keyed by caller identity (user_id or anon
+# session). Scoped to a single process — fine for the current single-Render-
+# instance deployment; would need a shared store (Redis) if this ever scales
+# to multiple backend instances.
+_rate_buckets: dict[str, list[float]] = {}
+
+
+def _check_rate_limit(owner: dict, bucket: str, max_calls: int, window_sec: int) -> None:
+    key = f"{bucket}:{owner.get('user_id') or owner.get('anon') or 'unknown'}"
+    now = time.monotonic()
+    hits = [t for t in _rate_buckets.get(key, []) if now - t < window_sec]
+    if len(hits) >= max_calls:
+        raise HTTPException(429, f"Rate limit exceeded — max {max_calls} per {window_sec}s. Try again shortly.")
+    hits.append(now)
+    _rate_buckets[key] = hits
+
+
 @api.post("/evolve", response_model=Chain)
 async def evolve(req: EvolveRequest, background_tasks: BackgroundTasks, request: Request):
     """Human types a target. Teacher -> Artist -> Product -> Rater runs in background.
@@ -594,6 +613,7 @@ async def evolve(req: EvolveRequest, background_tasks: BackgroundTasks, request:
         owner["anon"] = (req.session_id or "").strip() or None
     if not owner.get("user_id") and not owner.get("anon"):
         raise HTTPException(400, "no session identity — sign in or send X-Capcode-Session header")
+    _check_rate_limit(owner, "evolve", max_calls=5, window_sec=60)
 
     # TIER — signed-in users carry a `tier` field on their user doc
     # (free/trial/paid). Anonymous sessions are always free-tier: trial and
@@ -733,6 +753,7 @@ async def advance_chain(chain_id: str, request: Request):
     report of what just happened. Call this repeatedly (frontend can fire
     the next call immediately after rendering the report) until done=true."""
     owner = await _owner_from_request(request)
+    _check_rate_limit(owner, "advance", max_calls=40, window_sec=60)
     q = {"id": chain_id, **_owner_filter(owner)}
     progress = await db.chain_progress.find_one(q)
     if not progress:
@@ -1003,7 +1024,6 @@ async def stream_chain(chain_id: str, request: Request):
 
 
 class GithubPushRequest(BaseModel):
-    session_id: str
     repo: str  # target repo name (without owner)
     private: bool = True
 
@@ -1020,7 +1040,14 @@ async def push_to_github(chain_id: str, req: GithubPushRequest, request: Request
     if doc.get("status") != "complete":
         raise HTTPException(409, "chain not complete — cannot push")
 
-    settings = await db.settings.find_one({"session_id": req.session_id}, {"_id": 0}) or {}
+    # SEC fix: the GitHub PAT must be looked up under the CALLER's own
+    # verified identity (same owner used to fetch the chain above) — never
+    # trust a client-supplied session_id here, or any caller could push using
+    # someone else's stored token just by naming their session id in the body.
+    settings_key = owner.get("anon")
+    if not settings_key:
+        raise HTTPException(400, "no session identity — send X-Capcode-Session header")
+    settings = await db.settings.find_one({"session_id": settings_key}, {"_id": 0}) or {}
     gh = (settings.get("github") or {})
     token = (gh.get("token") or "").strip()
     username = (gh.get("username") or "").strip()
@@ -1134,14 +1161,17 @@ app.include_router(api)
 _tiers.init(db, _owner_from_request)
 app.include_router(_tiers.router)
 # CORS: cookies require an explicit origin (browsers reject wildcard + credentials).
-# We echo the caller's Origin back via allow_origin_regex so any preview URL and
-# localhost dev can auth without hard-coding the frontend host.
+# SEC fix: the old fallback matched ANY origin (`https?://.*`) with credentials
+# enabled whenever CORS_ORIGINS was unset — effectively CORS disabled for
+# every deployment that forgot to set it. Fallback is now scoped to this
+# platform's own preview domains + localhost dev only; any real deployment
+# MUST set CORS_ORIGINS explicitly or cross-origin requests are rejected.
 _cors_env = (os.environ.get("CORS_ORIGINS") or "").strip()
 if _cors_env and _cors_env != "*":
     app.add_middleware(
         CORSMiddleware,
         allow_credentials=True,
-        allow_origins=_cors_env.split(","),
+        allow_origins=[o.strip() for o in _cors_env.split(",") if o.strip()],
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -1149,7 +1179,7 @@ else:
     app.add_middleware(
         CORSMiddleware,
         allow_credentials=True,
-        allow_origin_regex=r"https?://.*",
+        allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?|https://[a-zA-Z0-9.-]+\.(emergentagent\.com|emergent\.host)",
         allow_methods=["*"],
         allow_headers=["*"],
     )
