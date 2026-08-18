@@ -8,18 +8,32 @@ and usage.py's check_budget):
     trial_started_at  — ISO 8601 UTC, set once, first time tier becomes "trial"
     trial_used        — bool, set True the first time trial starts (one-time only)
 
-No Stripe integration existed in this codebase before this file. Trial is
-fully functional as-is (no external dependency). Paid checkout/webhook are
-built against the Stripe API but WILL NOT WORK until you set:
-    STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRICE_ID_PAID
-in your environment (Vercel), and `pip install stripe` (added to
-requirements.txt). Until those are set, /api/tier/checkout will fail loudly
-with a 500 rather than silently pretending to work.
+Trial is a $2.99 ONE-TIME Stripe charge (not free, not a subscription) —
+priced specifically to cover the trial's own NVIDIA-only recursion-loop
+cost (see providers.TIER_ASSIGNMENTS["trial"] / TRIAL_FALLBACKS, both
+NVIDIA-only end to end so trial spend never touches metered
+OpenRouter/Venice credits). Paid ($16/mo, or the same entitlement billed
+annually as "paid_annual") is a recurring subscription — annual doesn't
+change what a user gets, only how Stripe bills them; the $8/$4/$4 credit
+split still refills every 30 days regardless of billing interval (see
+billing.get_cycle's lazy renewal).
+Both go through the same /checkout endpoint, disambiguated by `plan`.
+
+Checkout/webhook are built against the Stripe API but WILL NOT WORK until
+you set STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRICE_ID_PAID,
+STRIPE_PRICE_ID_PAID_ANNUAL, STRIPE_PRICE_ID_TRIAL in your environment
+(Render), and `pip install stripe` (already in requirements.txt). Until
+those are set, /api/tier/checkout only works via the ALLOW_MOCK_BILLING=true
+dev/test path — it fails loudly with a 503 in production rather than
+silently pretending to work. /api/tier/prices always works (falls back to
+DEFAULT_PRICES when Stripe/price IDs aren't configured) so the Pricing page
+never shows a blank price.
 """
 from __future__ import annotations
 
 import logging
 import os
+import time as _time
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Request
@@ -29,6 +43,27 @@ import billing as _billing
 logger = logging.getLogger("tiers")
 
 router = APIRouter(prefix="/api/tier")
+
+TRIAL_PRICE_USD = 2.99
+
+PRICE_ENV_BY_PLAN = {
+    "trial": "STRIPE_PRICE_ID_TRIAL",
+    "paid": "STRIPE_PRICE_ID_PAID",
+    "paid_annual": "STRIPE_PRICE_ID_PAID_ANNUAL",
+}
+
+# Shown on the Pricing page until/unless a real Stripe price is configured
+# for that plan — deliberately NOT hardcoded as the source of truth once
+# Stripe IS configured, since the monthly price is expected to drift over
+# time (see /prices, which prefers the live Stripe amount when available).
+DEFAULT_PRICES = {
+    "trial": {"amount": TRIAL_PRICE_USD, "currency": "usd", "interval": "one_time"},
+    "paid": {"amount": 16.00, "currency": "usd", "interval": "month"},
+    "paid_annual": {"amount": 192.00, "currency": "usd", "interval": "year"},
+}
+
+_PRICE_CACHE: dict = {"data": None, "at": 0.0}
+_PRICE_CACHE_TTL_SEC = 3600
 
 
 # ---------------------------------------------------------------------------
@@ -53,11 +88,63 @@ async def _require_signed_in(request: Request) -> str:
     return owner["user_id"]
 
 
+async def _grant_trial(user_id: str) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    await _db.users.update_one(
+        {"user_id": user_id},
+        {"$set": {"tier": "trial", "trial_started_at": now, "trial_used": True}},
+    )
+    return {"tier": "trial", "trial_started_at": now}
+
+
+@router.get("/prices")
+async def get_prices():
+    """Public, cached, no auth — the Pricing page's source of truth for what
+    to display. Prefers the LIVE amount from Stripe (so the copy never
+    drifts from what a card actually gets charged as the price changes over
+    time); falls back to DEFAULT_PRICES for any plan without a configured
+    Stripe price yet."""
+    now = _time.time()
+    if _PRICE_CACHE["data"] is not None and (now - _PRICE_CACHE["at"] < _PRICE_CACHE_TTL_SEC):
+        return _PRICE_CACHE["data"]
+
+    out = {k: dict(v) for k, v in DEFAULT_PRICES.items()}
+    key = os.environ.get("STRIPE_SECRET_KEY", "").strip()
+    if key:
+        try:
+            import stripe
+            stripe.api_key = key
+            for plan, env_name in PRICE_ENV_BY_PLAN.items():
+                price_id = os.environ.get(env_name, "").strip()
+                if not price_id:
+                    continue
+                p = stripe.Price.retrieve(price_id)
+                if p.get("unit_amount") is not None:
+                    out[plan] = {
+                        "amount": round(p["unit_amount"] / 100, 2),
+                        "currency": p.get("currency", "usd"),
+                        "interval": (p.get("recurring") or {}).get("interval") or "one_time",
+                    }
+        except Exception as exc:
+            logger.warning("stripe price fetch failed, serving defaults: %s", exc)
+
+    _PRICE_CACHE["data"] = out
+    _PRICE_CACHE["at"] = now
+    return out
+
+
 # ---------------------------------------------------------------------------
-# TRIAL — no payment, one-time per account, 7-day clock starts on this call.
+# TRIAL — dev/mock only from here on. In production this is a $2.99 Stripe
+# one-time charge via POST /checkout {"plan": "trial"}, not a free unlock.
 # ---------------------------------------------------------------------------
 @router.post("/start-trial")
 async def start_trial(request: Request):
+    if os.environ.get("ALLOW_MOCK_BILLING", "").strip().lower() != "true":
+        raise HTTPException(
+            410,
+            "the trial now requires a one-time $2.99 payment — "
+            "use POST /api/tier/checkout with {\"plan\": \"trial\"}",
+        )
     user_id = await _require_signed_in(request)
     user_doc = await _db.users.find_one({"user_id": user_id}) or {}
 
@@ -66,12 +153,7 @@ async def start_trial(request: Request):
     if user_doc.get("tier") == "paid":
         raise HTTPException(409, "already on paid tier")
 
-    now = datetime.now(timezone.utc).isoformat()
-    await _db.users.update_one(
-        {"user_id": user_id},
-        {"$set": {"tier": "trial", "trial_started_at": now, "trial_used": True}},
-    )
-    return {"tier": "trial", "trial_started_at": now}
+    return await _grant_trial(user_id)
 
 
 @router.get("/status")
@@ -98,8 +180,8 @@ async def tier_status(request: Request):
 
 
 # ---------------------------------------------------------------------------
-# PAID — Stripe checkout + webhook. Skeleton only; needs real Stripe keys
-# and a real price ID before this does anything but 500.
+# PAID + TRIAL checkout — Stripe. Skeleton only; needs real Stripe keys
+# and real price IDs before this does anything but 500/503.
 # ---------------------------------------------------------------------------
 def _stripe():
     try:
@@ -115,29 +197,53 @@ def _stripe():
 
 @router.post("/checkout")
 async def create_checkout_session(request: Request):
+    """Body: {"plan": "paid" | "paid_annual" | "trial"} — defaults to "paid"
+    for backward compatibility. "paid"/"paid_annual" are the same $16/mo
+    entitlement, billed monthly vs annually; "trial" is a one-time charge
+    (see PRICE_ENV_BY_PLAN) that unlocks the NVIDIA-only 7-day trial."""
     user_id = await _require_signed_in(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    plan = (body or {}).get("plan", "paid")
+    if plan not in ("paid", "paid_annual", "trial"):
+        raise HTTPException(400, "plan must be 'paid', 'paid_annual', or 'trial'")
+
+    if plan == "trial":
+        user_doc = await _db.users.find_one({"user_id": user_id}) or {}
+        if user_doc.get("trial_used"):
+            raise HTTPException(409, "trial already used on this account")
+
     key = os.environ.get("STRIPE_SECRET_KEY", "").strip()
 
     if not key:
         # SEC-002 fix: mock-subscribe is ONLY available when explicitly opted
         # into via ALLOW_MOCK_BILLING=true (dev/test only). Without that flag
         # this fails closed — a missing Stripe key must never silently grant
-        # a free paid-tier upgrade to anyone who's signed in.
+        # a free paid-tier or trial upgrade to anyone who's signed in.
         if os.environ.get("ALLOW_MOCK_BILLING", "").strip().lower() != "true":
             raise HTTPException(503, "Billing is not configured yet — try again later.")
+        if plan == "trial":
+            result = await _grant_trial(user_id)
+            return {"checkout_url": None, "mock": True, **result}
         # Grant paid tier + open the $16/mo credit cycle directly so the
         # whole billing flow (fund/profit split, refinement loop subsidy,
         # Credit Rebirth) can be tested end-to-end. Swap to real Stripe
         # checkout below the moment STRIPE_SECRET_KEY is set — no other
         # code changes needed, and this mock path becomes unreachable.
-        await _db.users.update_one({"user_id": user_id}, {"$set": {"tier": "paid"}})
+        await _db.users.update_one(
+            {"user_id": user_id},
+            {"$set": {"tier": "paid", "billing_interval": "annual" if plan == "paid_annual" else "monthly"}},
+        )
         cycle = await _billing.start_cycle(_db, user_id)
         return {"checkout_url": None, "mock": True, "tier": "paid", "billing_cycle": cycle}
 
     stripe = _stripe()
-    price_id = os.environ.get("STRIPE_PRICE_ID_PAID", "").strip()
+    price_env = PRICE_ENV_BY_PLAN[plan]
+    price_id = os.environ.get(price_env, "").strip()
     if not price_id:
-        raise HTTPException(500, "STRIPE_PRICE_ID_PAID not configured")
+        raise HTTPException(500, f"{price_env} not configured")
 
     frontend_url = os.environ.get("FRONTEND_URL", "").rstrip("/")
     if not frontend_url:
@@ -145,9 +251,10 @@ async def create_checkout_session(request: Request):
 
     try:
         session = stripe.checkout.Session.create(
-            mode="subscription",
+            mode="payment" if plan == "trial" else "subscription",
             line_items=[{"price": price_id, "quantity": 1}],
             client_reference_id=user_id,
+            metadata={"plan": plan, "user_id": user_id},
             success_url=f"{frontend_url}/settings?upgraded=1",
             cancel_url=f"{frontend_url}/settings?upgrade_cancelled=1",
         )
@@ -181,16 +288,27 @@ async def stripe_webhook(request: Request):
 
     if etype == "checkout.session.completed":
         user_id = obj.get("client_reference_id")
-        if user_id:
+        plan = (obj.get("metadata") or {}).get("plan", "paid")
+        if user_id and plan == "trial":
+            await _grant_trial(user_id)
+            logger.info("user %s started NVIDIA-only trial via $2.99 stripe checkout", user_id)
+        elif user_id:
+            # "paid" and "paid_annual" grant the identical entitlement —
+            # annual only changes Stripe's billing interval, never what the
+            # user gets (see billing.get_cycle's lazy 30-day renewal, which
+            # refills credits monthly either way).
             await _db.users.update_one(
                 {"user_id": user_id},
-                {"$set": {"tier": "paid", "stripe_customer_id": obj.get("customer")}},
+                {"$set": {"tier": "paid", "stripe_customer_id": obj.get("customer"),
+                          "billing_interval": "annual" if plan == "paid_annual" else "monthly"}},
             )
             await _billing.start_cycle(_db, user_id)
-            logger.info("user %s upgraded to paid via stripe checkout", user_id)
+            logger.info("user %s upgraded to paid (%s) via stripe checkout", user_id, plan)
 
     elif etype in ("customer.subscription.deleted", "customer.subscription.updated"):
         # On cancellation or a status change away from active, revert to free.
+        # Trial is a one-time payment (no subscription object), so this only
+        # ever applies to the paid plan.
         status = obj.get("status")
         customer_id = obj.get("customer")
         if customer_id and (etype == "customer.subscription.deleted" or status not in ("active", "trialing")):
@@ -204,3 +322,4 @@ async def stripe_webhook(request: Request):
                 logger.info("user %s reverted to free — subscription %s", user_doc["user_id"], etype)
 
     return {"received": True}
+

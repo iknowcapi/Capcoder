@@ -355,7 +355,9 @@ DEFAULT_ASSIGNMENTS = {
 # Tier -> role pipeline + provider routing
 # ---------------------------------------------------------------------------
 # Free: only teacher+artist ever run, pinned to Groq, no NVIDIA per spec.
-# Trial: full 6-role team, token-capped, Groq+NVIDIA+OpenRouter.
+# Trial: full 6-role team, token-capped, NVIDIA-only ($2.99 one-time, priced
+# to cover the recursion loop's own NVIDIA cost — never touches metered
+# OpenRouter/Venice credits).
 # Paid: full 6-role team, OpenRouter/Venice primary (unlimited within plan tokens).
 TIER_ROLE_SEQUENCE = {
     "free":  ["teacher", "artist"],
@@ -373,15 +375,32 @@ TIER_ASSIGNMENTS = {
         # No fallback chain on free — if Groq's pool is exhausted, the
         # tier/budget check in usage.py stops the call before it ever gets here.
     },
+    # Trial is a paid ($2.99 one-time) product priced specifically to cover
+    # its own recursion-loop cost — kept NVIDIA-only on purpose so trial
+    # spend never touches metered OpenRouter/Venice credits. See billing.py
+    # / tiers.py for the Stripe one-time-payment wiring.
     "trial": {
-        "teacher":   {"provider": "groq",   "model": "llama-3.3-70b-versatile"},
+        "teacher":   {"provider": "nvidia", "model": "z-ai/glm-5.2"},
         "architect": {"provider": "nvidia", "model": "z-ai/glm-5.2"},
-        "artist":    {"provider": "groq",   "model": "llama-3.3-70b-versatile"},
+        "artist":    {"provider": "nvidia", "model": "minimaxai/minimax-m3"},
         "reviewer":  {"provider": "nvidia", "model": "nvidia/llama-3.3-nemotron-super-49b-v1.5"},
-        "rater":     {"provider": "groq",   "model": "llama-3.1-8b-instant"},
-        "corrector": {"provider": "openrouter", "model": "openai/gpt-4o-mini"},
+        "rater":     {"provider": "nvidia", "model": "nvidia/llama-3.3-nemotron-super-49b-v1.5"},
+        "corrector": {"provider": "nvidia", "model": "deepseek-ai/deepseek-v4-pro"},
     },
     "paid": DEFAULT_ASSIGNMENTS,  # full OpenRouter/Venice routing as already defined above
+}
+
+# Trial's own fallback map — deliberately NVIDIA-only (never falls through to
+# a paid OpenRouter/Venice model) so an NVIDIA hiccup can't turn into a
+# metered charge for a $2.99 trial customer. Used instead of
+# DEFAULT_ASSIGNMENTS's *_fallback entries when tier == "trial".
+TRIAL_FALLBACKS = {
+    "teacher":   ("nvidia", "deepseek-ai/deepseek-v4-pro"),
+    "architect": ("nvidia", "deepseek-ai/deepseek-v4-pro"),
+    "artist":    ("nvidia", "deepseek-ai/deepseek-v4-pro"),
+    "reviewer":  ("nvidia", "z-ai/glm-5.2"),
+    "rater":     ("nvidia", "z-ai/glm-5.2"),
+    "corrector": ("nvidia", "z-ai/glm-5.2"),
 }
 
 

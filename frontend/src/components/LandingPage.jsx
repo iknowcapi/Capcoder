@@ -2,10 +2,20 @@ import React from "react";
 import { ArrowRight } from "lucide-react";
 import { AmbientBackground } from "@/components/AmbientBackground";
 
-export const LandingPage = ({ onStart }) => {
+export const LandingPage = ({ onStart, onPricing }) => {
   return (
     <div className="min-h-screen flex flex-col relative overflow-hidden">
       <AmbientBackground />
+
+      <nav className="relative z-10 flex justify-end px-6 pt-6">
+        <button
+          data-testid="landing-pricing-link"
+          onClick={onPricing}
+          className="text-text2 hover:text-text text-xs font-mono transition-colors"
+        >
+          pricing
+        </button>
+      </nav>
 
       <main className="flex-1 flex items-center relative z-10">
         <div className="max-w-3xl mx-auto px-6 py-24 w-full">
@@ -39,7 +49,14 @@ export const LandingPage = ({ onStart }) => {
           <div className="mt-10 pt-6 border-t border-line text-xs text-text3 max-w-lg leading-relaxed">
             Free runs a two-model chain — Teacher writes the brief, Artist builds it.
             Paid adds an Architect to plan the structure first and a Reviewer to catch
-            issues before you see the result.
+            issues before you see the result.{" "}
+            <button
+              data-testid="landing-pricing-inline-link"
+              onClick={onPricing}
+              className="text-canary hover:underline"
+            >
+              See plans →
+            </button>
           </div>
         </div>
       </main>

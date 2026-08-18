@@ -68,7 +68,18 @@ async def start_cycle(db, user_id: str) -> dict:
 
 
 async def get_cycle(db, user_id: str) -> Optional[dict]:
-    return await db.billing_cycles.find_one({"user_id": user_id, "status": "active"})
+    cycle = await db.billing_cycles.find_one({"user_id": user_id, "status": "active"})
+    if not cycle:
+        return None
+    # Lazy renewal — credits refill every 30 days regardless of whether the
+    # underlying Stripe subscription bills monthly or annually. Stripe only
+    # sends us a webhook on each Stripe invoice (once/year for an annual
+    # plan), so the monthly refill has to be driven by our own clock instead
+    # of waiting on a Stripe event that won't fire on the right cadence.
+    cycle_end = datetime.fromisoformat(cycle["cycle_end"])
+    if datetime.now(timezone.utc) >= cycle_end:
+        cycle = await start_cycle(db, user_id)
+    return cycle
 
 
 async def cancel_cycle(db, user_id: str) -> None:

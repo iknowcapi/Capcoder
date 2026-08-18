@@ -186,14 +186,23 @@ export const SettingsPanel = ({ sessionId, user, open, onClose, onSaved }) => {
               </span>
             </div>
           ) : (
-            <button
-              data-testid="upgrade-btn"
-              onClick={handleUpgrade}
-              disabled={checkingOut}
-              className="flex items-center gap-2 border border-neon_yellow text-neon_yellow px-3 py-2 hover:bg-neon_yellow hover:text-black label-xs disabled:opacity-50"
-            >
-              <DollarSign size={14} /> {checkingOut ? "…" : "UPGRADE — $16/MO"}
-            </button>
+            <div className="flex items-center gap-3">
+              <button
+                data-testid="upgrade-btn"
+                onClick={handleUpgrade}
+                disabled={checkingOut}
+                className="flex items-center gap-2 border border-neon_yellow text-neon_yellow px-3 py-2 hover:bg-neon_yellow hover:text-black label-xs disabled:opacity-50"
+              >
+                <DollarSign size={14} /> {checkingOut ? "…" : "UPGRADE — $16/MO"}
+              </button>
+              <button
+                data-testid="settings-see-plans"
+                onClick={() => window.dispatchEvent(new CustomEvent("capcode:open-pricing"))}
+                className="label-xs text-phosphor3 hover:text-neon_cyan underline"
+              >
+                see full plans
+              </button>
+            </div>
           )}
         </div>
 

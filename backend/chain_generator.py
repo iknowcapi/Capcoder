@@ -445,6 +445,10 @@ async def _call_role(role: str, messages: list[dict], assignment: Optional[dict]
     a = assignment or _providers.DEFAULT_ASSIGNMENTS[role]
     if tier == "free":
         fb = None
+    elif tier == "trial":
+        # Trial is NVIDIA-only end to end — never fall through to a metered
+        # OpenRouter/Venice model even on an NVIDIA error/rate-limit.
+        fb = _providers.TRIAL_FALLBACKS.get(role)
     else:
         fbd = _providers.DEFAULT_ASSIGNMENTS.get(f"{role}_fallback", {"provider": "nvidia", "model": "z-ai/glm-5.1"})
         fb = (fbd["provider"], fbd["model"])
@@ -456,6 +460,12 @@ async def _call_role(role: str, messages: list[dict], assignment: Optional[dict]
     input_text = "\n".join(m.get("content", "") for m in messages if isinstance(m, dict))
     tokens = _estimate_tokens(input_text, out or "")
     return out, tokens
+
+
+class TeacherFailedError(Exception):
+    """Raised when the Teacher gets no response at all from its provider
+    (missing/invalid key, provider outage) — must fail loudly instead of
+    silently substituting a placeholder spec that masks the real problem."""
 
 
 async def teacher_step(target: str, exemplars: list[dict], assignment: Optional[dict] = None,
@@ -477,6 +487,12 @@ async def teacher_step(target: str, exemplars: list[dict], assignment: Optional[
         stream_chain_id=chain_id, stream_event="teacher_delta",
         temperature=0.4, max_tokens=800,
     )
+    if not (raw or "").strip():
+        raise TeacherFailedError(
+            "Teacher got no response from its model — the provider may be "
+            "unavailable or missing an API key. Try a different Teacher model "
+            "in Settings, or try again shortly."
+        )
     parsed = _extract_json(raw or "") or {}
     parsed.setdefault("target", target)
     parsed.setdefault("name", f"TeacherSpec-{target[:20]}")
@@ -718,7 +734,15 @@ async def run_stage(progress: dict) -> dict:
                 progress["product"]["reviewer"] = review
 
             elif stage == "correct":
-                if progress["needs_fix"] and (progress["exec_result"].get("stderr") or progress["review_notes"]):
+                # Correction must run whenever the Reviewer/exec flagged an
+                # issue — the presence of stderr text is not the trigger,
+                # only extra context. Previously this required a non-empty
+                # stderr OR review_notes to fire, which silently skipped the
+                # correction pass (and then reported "already working") on
+                # any failure that produced no stderr — e.g. a SIGTERM
+                # (-15) timeout kill or a static build that just never binds
+                # a port.
+                if progress["needs_fix"]:
                     progress["fallback_used"] = True
                     progress["_correction_ran"] = True
                     corrector_role_key = "corrector" if "corrector" in progress["role_sequence"] else "artist"
@@ -1267,8 +1291,11 @@ async def evolve_chain_with_callback(
             review_notes = review.get("review_notes", "")
             product["reviewer"] = review
 
-        # 5) CORRECTION pass if execution failed OR reviewer flagged it
-        if needs_fix and (exec_result.get("stderr") or review_notes):
+        # 5) CORRECTION pass whenever execution failed OR reviewer flagged it —
+        # not gated on stderr/review_notes being non-empty (a SIGTERM/-15
+        # timeout or a static build that never binds a port has no stderr,
+        # but still needs the correction pass to actually run).
+        if needs_fix:
             fallback_used = True
             await _emit(chain_id, "stage", "corrector")
             corrector_role_key = "corrector" if "corrector" in role_sequence else "artist"

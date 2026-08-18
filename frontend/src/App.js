@@ -9,6 +9,7 @@ import { EvolveButton } from "@/components/EvolveButton";
 import { ChainViewer } from "@/components/ChainViewer";
 import { SettingsPanel } from "@/components/SettingsPanel";
 import { LandingPage } from "@/components/LandingPage";
+import { PricingPage } from "@/components/PricingPage";
 import { AmbientBackground } from "@/components/AmbientBackground";
 
 function getSessionId() {
@@ -38,7 +39,10 @@ function App() {
   const esRef = useRef(null);
   const [user, setUser] = useState(null);          // logged-in AuthUser or null
   const [checkingAuth, setCheckingAuth] = useState(true);
-  const [view, setView] = useState("landing");      // "landing" | "build"
+  const [view, setView] = useState("landing");      // "landing" | "build" | "pricing"
+  const [pricingReturnView, setPricingReturnView] = useState("landing");
+
+  const openPricing = (from) => { setPricingReturnView(from); setView("pricing"); };
 
   // Watch Neon Better Auth session state — fires on sign-in/out & OAuth
   // redirect back from Google.
@@ -84,6 +88,13 @@ function App() {
   }, []);
 
   useEffect(() => { refresh(); }, [refresh]);
+
+  useEffect(() => {
+    const handler = () => { setSettingsOpen(false); openPricing("build"); };
+    window.addEventListener("capcode:open-pricing", handler);
+    return () => window.removeEventListener("capcode:open-pricing", handler);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const handleEvolve = async (targetPrompt) => {
     setBusy(true);
@@ -142,6 +153,7 @@ function App() {
       if (stub?.id) {
         try { const c = await api.getChain(stub.id); setChain(c); } catch { /* noop */ }
       }
+      refresh();
     } finally {
       try { esRef.current && esRef.current.close(); } catch { /* noop */ }
       esRef.current = null;
@@ -188,7 +200,27 @@ function App() {
             fontFamily: "'IBM Plex Mono', monospace", fontSize: "13px",
           },
         }} />
-        <LandingPage onStart={() => setView("build")} />
+        <LandingPage onStart={() => setView("build")} onPricing={() => openPricing("landing")} />
+      </div>
+    );
+  }
+
+  if (view === "pricing") {
+    return (
+      <div className="App relative" data-testid="app-root">
+        <Toaster position="bottom-right" toastOptions={{
+          style: {
+            background: "#15171D", border: "1px solid #2A2E38",
+            color: "#EDEDF0", borderRadius: "8px",
+            fontFamily: "'IBM Plex Mono', monospace", fontSize: "13px",
+          },
+        }} />
+        <PricingPage
+          user={user}
+          onBack={() => setView(pricingReturnView)}
+          onSignIn={handleSignIn}
+          onStart={() => setView("build")}
+        />
       </div>
     );
   }
@@ -209,6 +241,13 @@ function App() {
         <TerminalHero status={status} onBack={() => setView("landing")} />
 
         <div className="flex items-center justify-end gap-2">
+          <button
+            data-testid="build-pricing-link"
+            onClick={() => openPricing("build")}
+            className="flex items-center gap-2 border border-line rounded-md text-text2 px-3 py-2 hover:border-text3 transition-colors text-xs"
+          >
+            pricing
+          </button>
           {user ? (
             <div className="flex items-center gap-2" data-testid="auth-user">
               {user.picture && (

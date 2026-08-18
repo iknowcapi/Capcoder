@@ -56,7 +56,10 @@ export const api = {
   // ---- Venice / uncensored consent waiver ----
   veniceConsent: (chain_id = null) =>
     axios.post(`${API}/venice/consent`, { chain_id }).then((r) => r.data),
-  // ---- $16/mo credit subscription ----
+  // ---- $16/mo credit subscription / $2.99 one-time trial / annual ----
   billingStatus: () => axios.get(`${API}/billing/status`).then((r) => r.data),
-  checkout: () => axios.post(`${API}/tier/checkout`).then((r) => r.data),
+  checkout: (plan = "paid") => axios.post(`${API}/tier/checkout`, { plan }).then((r) => r.data),
+  startTrial: () => axios.post(`${API}/tier/start-trial`).then((r) => r.data),
+  tierStatus: () => axios.get(`${API}/tier/status`).then((r) => r.data),
+  tierPrices: () => axios.get(`${API}/tier/prices`).then((r) => r.data),
 };

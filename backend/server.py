@@ -777,6 +777,14 @@ async def advance_chain(chain_id: str, request: Request):
         )
         await db.chain_progress.delete_one({"id": chain_id})
         raise HTTPException(422, f"build failed: {exc}")
+    except chain_generator.TeacherFailedError as exc:
+        await db.chains.update_one(
+            {"id": chain_id},
+            {"$set": {"status": "failed", "error": str(exc),
+                      "completed_at": datetime.now(timezone.utc).isoformat()}},
+        )
+        await db.chain_progress.delete_one({"id": chain_id})
+        raise HTTPException(422, f"build failed: {exc}")
     except Exception as exc:
         logger.exception("chain %s stage failed: %s", chain_id, exc)
         await db.chains.update_one(

@@ -19,7 +19,7 @@ CapCode is a recursive bot-builder. Human types the app they want; the system ru
 - **Database**: **Neon Postgres** (via a home-grown `docdb.py` adapter that mimics a small Mongo subset over JSONB)
 - **Auth**: **Neon Managed Better Auth** (Google OAuth via Neon "Shared keys" + email/password), JWT verified against `${NEON_AUTH_URL}/.well-known/jwks.json`
 - **LLMs**: OpenRouter (default), NVIDIA NIM, Venice — all BYOK
-- **Deploy target**: Vercel (upcoming — needs Vercel Sandbox executor rewrite + `vercel.json`)
+- **Deploy target**: Split — **Frontend on Vercel**, **Backend on Render** (persistent container; Render was chosen over Vercel Serverless because the code-execution sandbox needs a real `subprocess.Popen`, which serverless can't reliably support).
 
 ## Architecture files
 - `/app/backend/server.py` — FastAPI routes (owner-filtered) + Neon JWT verification.
@@ -46,9 +46,18 @@ CapCode is a recursive bot-builder. Human types the app they want; the system ru
 - `REACT_APP_NEON_AUTH_URL` — same as backend's `NEON_AUTH_URL`, exposed to the browser.
 - `WDS_SOCKET_PORT=443`.
 
-## Status (2026-08-09 — Postgres + Neon Auth migration)
+## Status (2026-08-18 — Pricing page, trial repricing, annual billing)
 
-### ✅ Shipped this session (2026-08-09)
+### ✅ Shipped this session (2026-08-18)
+- **New Pricing page** (`PricingPage.jsx`) — 3 plan cards (Free/Trial/Paid), reachable from landing nav, build-view header, and Settings "see full plans" link. Monthly/annual toggle for the Paid card.
+- **Trial repriced**: was free/no-card, now a **$2.99 one-time Stripe charge** (`plan=trial` in `/api/tier/checkout`, mode="payment") — priced to cover the trial's own NVIDIA compute cost. `/api/tier/start-trial` (the old free path) is now gated behind `ALLOW_MOCK_BILLING=true` and 410s otherwise.
+- **Trial is NVIDIA-only end to end**: `providers.TIER_ASSIGNMENTS["trial"]` and new `TRIAL_FALLBACKS` route all 6 roles (teacher/architect/artist/reviewer/rater/corrector) through NVIDIA only — even the error-path fallback never reaches a metered OpenRouter/Venice call.
+- **Annual billing** added for the $16/mo plan (`plan=paid_annual`, same entitlement as `paid`, just a different Stripe price/interval). `billing.get_cycle()` now does lazy 30-day renewal so credits refill monthly regardless of billing interval (no Stripe webhook needed per renewal).
+- **`GET /api/tier/prices`** (public, cached 1h) — Stripe-backed with static fallback, so the Pricing page never hardcodes a price that can drift from what Stripe actually charges.
+- **Bug fixes** (found by testing_agent iterations 8 & 9): `teacher_step` now raises `TeacherFailedError` instead of silently faking a spec when the LLM returns nothing; `handleEvolve`'s catch branch now calls `refresh()` so failed builds show up in history immediately; Pricing page's back button now returns to wherever it was opened from instead of always landing; **correction-pass trigger bug** — `correct` stage was gated on `stderr` or `review_notes` being non-empty, so a failed build with no stderr (e.g. SIGTERM/-15 timeout, static HTML never binding a port) silently skipped correction and reported "already working" right after EXECUTE said "failed to start". Fixed in both the checkpointed `run_stage` path and the legacy (dead but fixed for consistency) `evolve_chain_with_callback`.
+- Env vars still needed on Render (user creating in Stripe, not yet supplied): `STRIPE_PRICE_ID_TRIAL` (one-time $2.99), `STRIPE_PRICE_ID_PAID_ANNUAL` (recurring yearly). `STRIPE_PRICE_ID_PAID`/`STRIPE_SECRET_KEY`/`STRIPE_WEBHOOK_SECRET` + 5 Groq keys already added by user in Render.
+
+### Previously shipped (2026-08-09 — Postgres + Neon Auth migration)
 - **Mongo → Neon Postgres migration.** Built `docdb.py` — a tiny mongo-look-alike over JSONB (`find_one`, `find`, `insert_one`, `update_one`, `update_many`, `count_documents`, `.sort().limit().to_list()`, `$set`, `$push`, upserts). Swapped all ~15 mongo call sites in `server.py` without rewriting business logic. Verified end-to-end: chain built, files generated, scored 2.62 composite, owner-isolated (404 on wrong session). Motor & DB_NAME/MONGO_URL removed.
 - **Emergent Google Auth → Neon Managed Better Auth.** Backend verifies EdDSA JWTs from Neon's JWKS. Frontend uses `better-auth/react` — sign-in redirects through Neon → Google → back to app; JWT auto-refreshes and is attached to every `/api/*` request as `Authorization: Bearer`. Sign-in flow verified live (Google OAuth page reached).
 - **CORS + trusted domains configured** for the preview URL in the Neon Auth dashboard.
@@ -67,21 +76,23 @@ CapCode is a recursive bot-builder. Human types the app they want; the system ru
 
 ## Backlog
 
-### P0 — Vercel deployability
-- Rewrite `executor.py` to use **Vercel Sandbox API** (drop local subprocess). Needs `VERCEL_SANDBOX_TOKEN`. Blocks `vercel.json` and going live.
-- Add `vercel.json` + serverless-safe pool lifecycle for asyncpg.
+### P0 — none open
 
-### P1 — Product features
-- **6-Man AI Dev Team**: add Architect + Reviewer roles to the current Teacher / Artist / Corrector / Rater lineup. Extend `chain_generator.py` + `SettingsPanel.jsx` role picker + `ChainViewer.jsx` breadcrumb.
-- **Novelty metric** in scoring: `composite = coverage*0.4 + rater*0.4 + novelty*0.2`, where `novelty = 1 - jaccard(artist_files, top_exemplar)`, gated on coverage ≥ threshold.
-- **Rate limit on `/api/evolve`** (in-process token bucket keyed on `user_id` or `session_id`) to prevent LLM key burn.
+### P1 — Product / billing follow-ups
+- Add `stripe`-key-holder must paste `STRIPE_PRICE_ID_TRIAL` and `STRIPE_PRICE_ID_PAID_ANNUAL` into Render once created (one-time price for trial, recurring-yearly price for annual) — everything else is already wired.
+- Credit top-up packs (user mentioned wanting these once annual/trial landed) — no price/size decided yet, needs its own round of clarification before building.
+- `billing.get_cycle()`'s lazy renewal refills on `status=="active"` alone — doesn't check a paid-through timestamp, so a lapsed annual subscription with a missed webhook would still refill. Low-risk edge case, revisit if it becomes real.
 
 ### P2 — Polish
 - Seed the verified pool with 5-10 pre-verified builds.
-- Landing / TOS / Privacy pages.
+- TOS / Privacy pages.
+- `/api/auth/me` 401s on every signed-out page load are cosmetic console noise (frontend calls it on mount + 60s poll) — consider 200 `{user:null}` or skipping the call with no JWT present.
+- `/api/tier/prices` cache has no manual bust (`?refresh=1`) like `/providers/models` does — 1h staleness after a Stripe price edit.
 - BYOK strict `user_id` resolution on the signed-in path.
-- `/api/status` cross-tenant `total_chains` leak (scope to caller).
 - Obsolete backend tests still reference Mongo (`tests/test_auth.py`, `tests/test_iteration6_fixes.py`) — rewrite for Postgres + Neon JWT or delete.
+
+### Known env gap (this preview only, not production)
+- No `GROQ_API_KEY` configured here → default anonymous free-tier builds fail at the Teacher step with a clear error (not a silent fake). User confirmed 5 keys already in Render for production. Workaround for testing here: point Settings at an OpenRouter model.
 
 ## Credentials
 - All secrets in `/app/backend/.env` and `/app/frontend/.env`. Never committed.
