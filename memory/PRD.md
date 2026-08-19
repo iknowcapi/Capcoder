@@ -38,8 +38,11 @@ pipeline, Tier System (free/trial/paid), Uncensored Mode waiver (Venice).
 4. **User Profile UI** — `GET /api/profile` (email, tier, trial days left,
    billing cycle, topup balance). New `ProfilePanel.jsx`, "profile" button in
    App.js header (only shown when signed in).
-5. Legal docs (Privacy/TOS) — explicitly declined by user, NOT built. The
-   existing `VeniceConsentModal.jsx` liability waiver stands as-is.
+5. Legal docs — real Privacy Policy + Terms of Service pages added
+   (`LegalPage.jsx`), linked from Landing/Pricing/build-view footers. Distinct
+   from `VeniceConsentModal.jsx` (that's the narrow uncensored-mode-only
+   liability waiver, unchanged). Entity name "CapCode", no dedicated legal
+   contact email yet, governing-law kept generic per user's call.
 6. Fixed layout bug from testing: SettingsPanel role-tab row was flex-shrunk
    to ~5px by the new Default Teams section — added `shrink-0` to all fixed
    sections + `min-h-0` on the model-list scroll region. Also fixed a bug

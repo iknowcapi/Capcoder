@@ -19,7 +19,7 @@ const DEFAULT_PRICES = {
 
 const fmt = (amount) => (Number.isInteger(amount) ? amount.toFixed(0) : amount.toFixed(2));
 
-export const PricingPage = ({ user, onBack, onSignIn, onStart }) => {
+export const PricingPage = ({ user, onBack, onSignIn, onStart, onLegal }) => {
   const [busy, setBusy] = useState(null); // "trial" | "paid" | null
   const [annual, setAnnual] = useState(false);
   const [prices, setPrices] = useState(DEFAULT_PRICES);
@@ -210,8 +210,14 @@ export const PricingPage = ({ user, onBack, onSignIn, onStart }) => {
         </div>
       </main>
 
-      <footer className="text-text3 font-mono text-xs px-6 py-6 border-t border-line relative z-10">
-        capcode
+      <footer className="text-text3 font-mono text-xs px-6 py-6 border-t border-line relative z-10 flex items-center gap-3">
+        <span>capcode</span>
+        <button data-testid="pricing-privacy-link" onClick={() => onLegal?.("privacy")} className="hover:text-text2 underline">
+          privacy
+        </button>
+        <button data-testid="pricing-terms-link" onClick={() => onLegal?.("terms")} className="hover:text-text2 underline">
+          terms
+        </button>
       </footer>
     </div>
   );

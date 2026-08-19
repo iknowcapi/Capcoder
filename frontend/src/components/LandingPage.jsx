@@ -2,7 +2,7 @@ import React from "react";
 import { ArrowRight } from "lucide-react";
 import { AmbientBackground } from "@/components/AmbientBackground";
 
-export const LandingPage = ({ onStart, onPricing }) => {
+export const LandingPage = ({ onStart, onPricing, onLegal }) => {
   return (
     <div className="min-h-screen flex flex-col relative overflow-hidden">
       <AmbientBackground />
@@ -61,8 +61,14 @@ export const LandingPage = ({ onStart, onPricing }) => {
         </div>
       </main>
 
-      <footer className="text-text3 font-mono text-xs px-6 py-6 border-t border-line relative z-10">
-        capcode
+      <footer className="text-text3 font-mono text-xs px-6 py-6 border-t border-line relative z-10 flex items-center gap-3">
+        <span>capcode</span>
+        <button data-testid="landing-privacy-link" onClick={() => onLegal?.("privacy")} className="hover:text-text2 underline">
+          privacy
+        </button>
+        <button data-testid="landing-terms-link" onClick={() => onLegal?.("terms")} className="hover:text-text2 underline">
+          terms
+        </button>
       </footer>
     </div>
   );

@@ -11,6 +11,7 @@ import { SettingsPanel } from "@/components/SettingsPanel";
 import { ProfilePanel } from "@/components/ProfilePanel";
 import { LandingPage } from "@/components/LandingPage";
 import { PricingPage } from "@/components/PricingPage";
+import { LegalPage } from "@/components/LegalPage";
 import { AmbientBackground } from "@/components/AmbientBackground";
 
 function getSessionId() {
@@ -41,10 +42,12 @@ function App() {
   const esRef = useRef(null);
   const [user, setUser] = useState(null);          // logged-in AuthUser or null
   const [checkingAuth, setCheckingAuth] = useState(true);
-  const [view, setView] = useState("landing");      // "landing" | "build" | "pricing"
+  const [view, setView] = useState("landing");      // "landing" | "build" | "pricing" | "privacy" | "terms"
   const [pricingReturnView, setPricingReturnView] = useState("landing");
+  const [legalReturnView, setLegalReturnView] = useState("landing");
 
   const openPricing = (from) => { setPricingReturnView(from); setView("pricing"); };
+  const openLegal = (doc, from) => { setLegalReturnView(from); setView(doc); };
 
   // Watch Neon Better Auth session state — fires on sign-in/out & OAuth
   // redirect back from Google.
@@ -231,7 +234,22 @@ function App() {
             fontFamily: "'IBM Plex Mono', monospace", fontSize: "13px",
           },
         }} />
-        <LandingPage onStart={() => setView("build")} onPricing={() => openPricing("landing")} />
+        <LandingPage onStart={() => setView("build")} onPricing={() => openPricing("landing")} onLegal={(doc) => openLegal(doc, "landing")} />
+      </div>
+    );
+  }
+
+  if (view === "privacy" || view === "terms") {
+    return (
+      <div className="App relative" data-testid="app-root">
+        <Toaster position="bottom-right" toastOptions={{
+          style: {
+            background: "#15171D", border: "1px solid #2A2E38",
+            color: "#EDEDF0", borderRadius: "8px",
+            fontFamily: "'IBM Plex Mono', monospace", fontSize: "13px",
+          },
+        }} />
+        <LegalPage doc={view} onBack={() => setView(legalReturnView)} />
       </div>
     );
   }
@@ -251,6 +269,7 @@ function App() {
           onBack={() => setView(pricingReturnView)}
           onSignIn={handleSignIn}
           onStart={() => setView("build")}
+          onLegal={(doc) => openLegal(doc, "pricing")}
         />
       </div>
     );
@@ -386,7 +405,14 @@ function App() {
         )}
 
         <footer className="text-center text-text3 font-mono text-xs py-6 border-t border-line" data-testid="footer">
-          capcode · session {sessionId.slice(0, 8)} · © {new Date().getFullYear()}
+          capcode · session {sessionId.slice(0, 8)} · © {new Date().getFullYear()} ·{" "}
+          <button data-testid="footer-privacy-link" onClick={() => openLegal("privacy", "build")} className="hover:text-text2 underline">
+            privacy
+          </button>{" "}
+          ·{" "}
+          <button data-testid="footer-terms-link" onClick={() => openLegal("terms", "build")} className="hover:text-text2 underline">
+            terms
+          </button>
         </footer>
       </main>
 
