@@ -24,6 +24,7 @@ from fastapi import APIRouter, BackgroundTasks, FastAPI, File, HTTPException, Re
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.cors import CORSMiddleware
+import httpx
 
 import chain_generator
 import docdb
@@ -268,6 +269,48 @@ import jwt as _pyjwt  # PyJWT
 from jwt import PyJWKClient
 
 _jwks_client = PyJWKClient(NEON_JWKS_URL, cache_keys=True, lifespan=300)
+
+# ---------------------------------------------------------------------------
+# Neon Auth reverse proxy — the frontend calls THIS (same-origin, via its own
+# Vercel `vercel.json` rewrite) instead of Neon's domain directly, so Neon's
+# session cookies land as first-party and survive Safari/iOS's cross-site
+# cookie blocking. A plain Vercel-level rewrite to Neon's raw URL can't do
+# this on its own: Vercel forwards the original Host header unmodified,
+# which Neon Auth rejects outright ("INVALID_HOSTNAME") — this proxy issues
+# a fresh outbound request per hop instead, so the Host header is always
+# correct for Neon's side, while the response still looks first-party to
+# the browser.
+_neon_proxy_client = httpx.AsyncClient(timeout=30.0)
+
+
+@api.api_route("/neon-auth/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def neon_auth_proxy(path: str, request: Request):
+    target = f"{NEON_AUTH_URL}/{path}"
+    body = await request.body()
+    fwd_headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in (
+            "host", "content-length", "connection",
+            "x-forwarded-host", "x-forwarded-proto", "x-forwarded-for",
+            "x-forwarded-port", "forwarded",
+        )
+    }
+    try:
+        upstream = await _neon_proxy_client.request(
+            request.method, target, params=request.query_params,
+            content=body, headers=fwd_headers,
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"neon auth upstream unreachable: {exc}")
+    resp = Response(content=upstream.content, status_code=upstream.status_code,
+                    media_type=upstream.headers.get("content-type"))
+    for key, value in upstream.headers.multi_items():
+        lk = key.lower()
+        if lk == "set-cookie":
+            resp.headers.append(key, value)
+        elif lk not in ("content-length", "content-encoding", "transfer-encoding", "connection"):
+            resp.headers[key] = value
+    return resp
 
 
 class AuthUser(BaseModel):

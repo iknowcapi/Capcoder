@@ -93,26 +93,6 @@ export const PricingPage = ({ user, onBack, onSignIn, onStart }) => {
             self-correction loop.
           </p>
 
-          <div className="mt-8 flex items-center gap-3" data-testid="billing-toggle">
-            <button
-              data-testid="billing-toggle-monthly"
-              onClick={() => setAnnual(false)}
-              className={`px-3 py-1.5 rounded-md text-xs font-mono border transition-colors ${
-                !annual ? "border-pink bg-pink/10 text-pink" : "border-line text-text2 hover:border-text3"}`}
-            >
-              monthly
-            </button>
-            <button
-              data-testid="billing-toggle-annual"
-              onClick={() => setAnnual(true)}
-              className={`px-3 py-1.5 rounded-md text-xs font-mono border transition-colors ${
-                annual ? "border-pink bg-pink/10 text-pink" : "border-line text-text2 hover:border-text3"}`}
-            >
-              annual
-            </button>
-            <span className="text-text3 text-xs font-mono">applies to the Paid plan below</span>
-          </div>
-
           <div className="mt-8 grid grid-cols-1 md:grid-cols-3 gap-5">
             {/* FREE */}
             <div className="rounded-lg border border-line bg-slate p-6 flex flex-col" data-testid="plan-free">
@@ -170,6 +150,24 @@ export const PricingPage = ({ user, onBack, onSignIn, onStart }) => {
                 RECOMMENDED
               </div>
               <div className="font-mono text-xs text-text3 uppercase tracking-wide">paid</div>
+              <div className="mt-3 flex items-center gap-2" data-testid="billing-toggle">
+                <button
+                  data-testid="billing-toggle-monthly"
+                  onClick={() => setAnnual(false)}
+                  className={`px-2.5 py-1 rounded-md text-[11px] font-mono border transition-colors ${
+                    !annual ? "border-pink bg-pink/10 text-pink" : "border-line text-text2 hover:border-text3"}`}
+                >
+                  monthly
+                </button>
+                <button
+                  data-testid="billing-toggle-annual"
+                  onClick={() => setAnnual(true)}
+                  className={`px-2.5 py-1 rounded-md text-[11px] font-mono border transition-colors ${
+                    annual ? "border-pink bg-pink/10 text-pink" : "border-line text-text2 hover:border-text3"}`}
+                >
+                  annual
+                </button>
+              </div>
               <div className="mt-2 flex items-baseline gap-1">
                 <span className="font-display font-bold text-3xl text-text" data-testid="plan-paid-amount">
                   ${fmt(paidPrice.amount)}
