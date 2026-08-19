@@ -3,15 +3,19 @@
 Covers: POST /api/auth/session validation contract, GET /api/auth/me
 (cookie + bearer), POST /api/auth/logout, expired sessions, CORS credentials.
 The real Emergent exchange is not reachable from the test env, so sessions are
-seeded directly in Mongo (per /app/auth_testing.md).
+seeded directly through docdb (per /app/auth_testing.md).
 """
+import asyncio
 import os
+import sys
 from datetime import datetime, timedelta, timezone
 
 import pytest
 import requests
 from dotenv import dotenv_values
-from pymongo import MongoClient
+
+sys.path.insert(0, "/app/backend")
+import docdb  # noqa: E402
 
 frontend_env = dotenv_values("/app/frontend/.env")
 backend_env = dotenv_values("/app/backend/.env")
@@ -21,8 +25,9 @@ if not base_url:
 BASE_URL = base_url.rstrip("/")
 API = f"{BASE_URL}/api"
 
-MONGO_URL = os.environ.get("MONGO_URL") or backend_env.get("MONGO_URL")
-DB_NAME = os.environ.get("DB_NAME") or backend_env.get("DB_NAME")
+POSTGRES_URL = os.environ.get("POSTGRES_URL") or backend_env.get("POSTGRES_URL")
+if not POSTGRES_URL:
+    raise RuntimeError("POSTGRES_URL missing")
 
 VALID_TOKEN = "MY_TEST_TOKEN"
 EXPIRED_TOKEN = "MY_TEST_TOKEN_EXPIRED"
@@ -31,17 +36,32 @@ TEST_USER_ID = "user_TESTAUTH"
 TEST_EMAIL = "test@capcode.dev"
 
 
+def _run(coro):
+    """Run a docdb coroutine from a sync pytest test/fixture. Resilient to a
+    closed/missing event loop (e.g. after another test's `asyncio.run()`)."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError("closed loop")
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop.run_until_complete(coro)
+
+
 # --- fixtures -------------------------------------------------------------
 @pytest.fixture(scope="module")
 def mongo_db():
-    client = MongoClient(MONGO_URL)
-    yield client[DB_NAME]
-    client.close()
+    """Kept the name `mongo_db` to minimize diff noise at call sites below —
+    it now yields docdb.db (Postgres/JSONB-backed), not a real Mongo handle."""
+    _run(docdb.connect(POSTGRES_URL))
+    yield docdb.db
+    _run(docdb.close())
 
 
 def _seed_session(db, token, days=7):
     now = datetime.now(timezone.utc)
-    db.users.update_one(
+    _run(db.users.update_one(
         {"user_id": TEST_USER_ID},
         {"$set": {
             "user_id": TEST_USER_ID,
@@ -51,8 +71,8 @@ def _seed_session(db, token, days=7):
             "created_at": now.isoformat(),
         }},
         upsert=True,
-    )
-    db.user_sessions.update_one(
+    ))
+    _run(db.user_sessions.update_one(
         {"session_token": token},
         {"$set": {
             "session_token": token,
@@ -61,7 +81,7 @@ def _seed_session(db, token, days=7):
             "created_at": now.isoformat(),
         }},
         upsert=True,
-    )
+    ))
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -70,10 +90,11 @@ def seeded(mongo_db):
     _seed_session(mongo_db, LOGOUT_TOKEN, days=7)
     _seed_session(mongo_db, EXPIRED_TOKEN, days=-1)
     yield
-    mongo_db.user_sessions.delete_many(
-        {"session_token": {"$in": [VALID_TOKEN, EXPIRED_TOKEN, LOGOUT_TOKEN]}}
-    )
-    mongo_db.users.delete_many({"email": TEST_EMAIL})
+    # docdb has no `$in` support, so delete each token individually — same
+    # net effect as the original `delete_many({"$in": [...]})`.
+    for tok in (VALID_TOKEN, EXPIRED_TOKEN, LOGOUT_TOKEN):
+        _run(mongo_db.user_sessions.delete_one({"session_token": tok}))
+    _run(mongo_db.users.delete_one({"email": TEST_EMAIL}))
 
 
 @pytest.fixture(scope="module")
@@ -151,8 +172,8 @@ class TestAuthLogout:
         # Cookie cleared
         assert "session_token=" in (r.headers.get("set-cookie") or "")
 
-        # Session row gone from Mongo
-        assert mongo_db.user_sessions.find_one({"session_token": LOGOUT_TOKEN}) is None
+        # Session row gone
+        assert _run(mongo_db.user_sessions.find_one({"session_token": LOGOUT_TOKEN})) is None
 
         after = requests.get(f"{API}/auth/me", headers={"Authorization": f"Bearer {LOGOUT_TOKEN}"})
         assert after.status_code == 401, after.text

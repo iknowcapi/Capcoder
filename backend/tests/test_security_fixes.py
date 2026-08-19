@@ -17,6 +17,7 @@ import requests
 from dotenv import dotenv_values
 
 sys.path.insert(0, "/app/backend")
+import docdb  # noqa: E402
 
 frontend_env = dotenv_values("/app/frontend/.env")
 base = os.environ.get("REACT_APP_BACKEND_URL") or frontend_env.get("REACT_APP_BACKEND_URL")
@@ -26,6 +27,23 @@ BASE_URL = base.rstrip("/")
 
 backend_env = dotenv_values("/app/backend/.env")
 FORBIDDEN = ["NVIDIA_API_KEY", "OPENROUTER_API_KEY", "VENICE_API_KEY", "POSTGRES_URL", "NEON_AUTH_URL"]
+
+POSTGRES_URL = os.environ.get("POSTGRES_URL") or backend_env.get("POSTGRES_URL")
+if not POSTGRES_URL:
+    raise RuntimeError("POSTGRES_URL missing")
+
+
+def _run(coro):
+    """Run a docdb coroutine from a sync pytest test/fixture. Resilient to a
+    closed/missing event loop (e.g. after another test's `asyncio.run()`)."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError("closed loop")
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop.run_until_complete(coro)
 
 
 # ---------------------------------------------------------------- SEC-001
@@ -209,39 +227,39 @@ class TestSettingsBYOK:
 # ---------------------------------------------------------------- fixtures
 @pytest.fixture(scope="session")
 def mongo_db():
-    from pymongo import MongoClient
-    url = backend_env.get("MONGO_URL") or os.environ["MONGO_URL"]
-    name = backend_env.get("DB_NAME") or os.environ["DB_NAME"]
-    return MongoClient(url).get_database(name)
+    """Kept the name `mongo_db` to minimize diff noise at call sites below —
+    it now yields docdb.db (Postgres/JSONB-backed), not a real Mongo handle."""
+    _run(docdb.connect(POSTGRES_URL))
+    return docdb.db
 
 
 @pytest.fixture(scope="session")
 def incomplete_chain_id(mongo_db):
     cid = str(uuid.uuid4())
-    mongo_db.chains.insert_one({
+    _run(mongo_db.chains.insert_one({
         "id": cid, "session_id": "sec004-test", "anon_session_id": "sec004-test",
         "target_prompt": "TEST_incomplete",
         "status": "running", "generations": [],
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-    })
+    }))
     yield cid
-    mongo_db.chains.delete_one({"id": cid})
+    _run(mongo_db.chains.delete_one({"id": cid}))
 
 
 @pytest.fixture(scope="session")
 def complete_chain_id(mongo_db):
-    doc = mongo_db.chains.find_one(
-        {"status": "complete", "anon_session_id": "sec004-test"}, {"_id": 0, "id": 1})
+    doc = _run(mongo_db.chains.find_one(
+        {"status": "complete", "anon_session_id": "sec004-test"}, {"_id": 0, "id": 1}))
     if doc:
         return doc["id"]
     cid = str(uuid.uuid4())
-    mongo_db.chains.insert_one({
+    _run(mongo_db.chains.insert_one({
         "id": cid, "session_id": "sec004-test", "anon_session_id": "sec004-test",
         "target_prompt": "TEST_complete",
         "status": "complete",
         "generations": [{"gen": 0, "name": "TEST", "files": [{"path": "run.sh", "content": "echo hi"}]}],
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-    })
+    }))
     return cid
 
 
@@ -249,11 +267,11 @@ def complete_chain_id(mongo_db):
 class TestOrphanSweep:
     def test_running_chain_marked_failed_on_restart(self, mongo_db):
         cid = str(uuid.uuid4())
-        mongo_db.chains.insert_one({
+        _run(mongo_db.chains.insert_one({
             "id": cid, "session_id": "orphan-test", "target_prompt": "TEST_orphan",
             "status": "running", "generations": [],
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        })
+        }))
         try:
             subprocess.run(["sudo", "supervisorctl", "restart", "backend"],
                            capture_output=True, text=True, timeout=90)
@@ -265,8 +283,8 @@ class TestOrphanSweep:
                         break
                 except Exception:
                     pass
-            doc = mongo_db.chains.find_one({"id": cid}, {"_id": 0})
+            doc = _run(mongo_db.chains.find_one({"id": cid}, {"_id": 0}))
             assert doc["status"] == "failed", doc
             assert doc.get("error") == "backend restarted before build finished — try again", doc
         finally:
-            mongo_db.chains.delete_one({"id": cid})
+            _run(mongo_db.chains.delete_one({"id": cid}))

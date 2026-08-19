@@ -1,11 +1,16 @@
 """Ownership isolation tests for chains (FIX #2/#3/#4)."""
+import asyncio
 import os
-import subprocess
+import sys
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import pytest
 import requests
 from dotenv import dotenv_values
+
+sys.path.insert(0, "/app/backend")
+import docdb  # noqa: E402
 
 frontend_env = dotenv_values("/app/frontend/.env")
 base_url = os.environ.get("REACT_APP_BACKEND_URL") or frontend_env.get("REACT_APP_BACKEND_URL")
@@ -13,16 +18,34 @@ if not base_url:
     raise RuntimeError("REACT_APP_BACKEND_URL missing")
 BASE_URL = base_url.rstrip("/")
 
+backend_env = dotenv_values("/app/backend/.env")
+POSTGRES_URL = os.environ.get("POSTGRES_URL") or backend_env.get("POSTGRES_URL")
+if not POSTGRES_URL:
+    raise RuntimeError("POSTGRES_URL missing")
+
 OWNER_A = f"TEST_ownerA_{uuid.uuid4()}"
 OWNER_B = f"TEST_ownerB_{uuid.uuid4()}"
 AUTH_USER = "user_TESTAUTH"
 AUTH_TOKEN = "MY_TEST_TOKEN"
 
 
-def mongo(js):
-    r = subprocess.run(["mongosh", "--quiet", "--eval", f"use('test_database');{js}"],
-                       capture_output=True, text=True, timeout=60)
-    return r.stdout.strip()
+def _run(coro):
+    """Run a docdb coroutine from a sync pytest test/fixture. Resilient to a
+    closed/missing event loop (e.g. after another test's `asyncio.run()`)."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError("closed loop")
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop.run_until_complete(coro)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _docdb_conn():
+    _run(docdb.connect(POSTGRES_URL))
+    yield
 
 
 @pytest.fixture(scope="module")
@@ -43,24 +66,32 @@ def chain_a(client):
     d = r.json()
     assert d.get("id")
     yield d["id"]
-    mongo(f'db.chains.deleteMany({{anon_session_id: /TEST_owner/}});')
+    _run(docdb.db.chains.delete_one({"id": d["id"]}))
 
 
 @pytest.fixture(scope="module")
 def seeded_auth():
     """Seed user_TESTAUTH + MY_TEST_TOKEN per /app/auth_testing.md."""
-    mongo(f"""
-      db.users.deleteOne({{user_id:'{AUTH_USER}'}});
-      db.user_sessions.deleteOne({{session_token:'{AUTH_TOKEN}'}});
-      db.users.insertOne({{user_id:'{AUTH_USER}', email:'test.user.testauth@example.com',
-        name:'Test Auth User', picture:'https://via.placeholder.com/150', created_at:new Date()}});
-      db.user_sessions.insertOne({{user_id:'{AUTH_USER}', session_token:'{AUTH_TOKEN}',
-        expires_at:new Date(Date.now()+7*24*60*60*1000), created_at:new Date()}});
-    """)
+    now = datetime.now(timezone.utc)
+    _run(docdb.db.users.delete_one({"user_id": AUTH_USER}))
+    _run(docdb.db.user_sessions.delete_one({"session_token": AUTH_TOKEN}))
+    _run(docdb.db.users.insert_one({
+        "user_id": AUTH_USER,
+        "email": "test.user.testauth@example.com",
+        "name": "Test Auth User",
+        "picture": "https://via.placeholder.com/150",
+        "created_at": now.isoformat(),
+    }))
+    _run(docdb.db.user_sessions.insert_one({
+        "user_id": AUTH_USER,
+        "session_token": AUTH_TOKEN,
+        "expires_at": (now + timedelta(days=7)).isoformat(),
+        "created_at": now.isoformat(),
+    }))
     yield AUTH_TOKEN
-    mongo(f"""db.users.deleteOne({{user_id:'{AUTH_USER}'}});
-              db.user_sessions.deleteOne({{session_token:'{AUTH_TOKEN}'}});
-              db.chains.deleteMany({{user_id:'{AUTH_USER}'}});""")
+    _run(docdb.db.users.delete_one({"user_id": AUTH_USER}))
+    _run(docdb.db.user_sessions.delete_one({"session_token": AUTH_TOKEN}))
+    _run(docdb.db.chains.delete_many({"user_id": AUTH_USER}))
 
 
 class TestOwnership:
@@ -71,9 +102,10 @@ class TestOwnership:
         assert r.json()["id"] == chain_a
 
     def test_chain_doc_has_anon_session_id(self, chain_a):
-        out = mongo(f"print(JSON.stringify(db.chains.findOne({{id:'{chain_a}'}},{{anon_session_id:1,user_id:1,_id:0}})))")
-        assert OWNER_A in out, out
-        assert '"user_id"' not in out, out
+        doc = _run(docdb.db.chains.find_one({"id": chain_a}))
+        assert doc is not None, "chain doc missing"
+        assert doc.get("anon_session_id") == OWNER_A, doc
+        assert "user_id" not in doc, doc
 
     # (c) non-owner gets 404
     def test_owner_b_gets_404(self, client, chain_a):
@@ -150,9 +182,10 @@ class TestSignedInOwnership:
                           json={"target_prompt": "TEST_ownership signed-in page"}, timeout=60)
         assert r.status_code == 200, r.text
         cid = r.json()["id"]
-        out = mongo(f"print(JSON.stringify(db.chains.findOne({{id:'{cid}'}},{{user_id:1,anon_session_id:1,_id:0}})))")
-        assert AUTH_USER in out, out
-        assert "anon_session_id" not in out, out
+        doc = _run(docdb.db.chains.find_one({"id": cid}))
+        assert doc is not None, "chain doc missing"
+        assert doc.get("user_id") == AUTH_USER, doc
+        assert "anon_session_id" not in doc, doc
         # owner can read
         r2 = requests.get(f"{BASE_URL}/api/chains/{cid}",
                           headers={"Authorization": f"Bearer {seeded_auth}"}, timeout=30)
@@ -173,7 +206,7 @@ class TestSettingsAndPushContract:
         assert g.status_code == 200, g.text
         assert g.json().get("session_id") == sid
         assert g.json().get("rater", {}).get("model") == "openai/gpt-3.5-turbo"
-        mongo(f"db.settings.deleteMany({{session_id: /TEST_settings/}})")
+        _run(docdb.db.settings.delete_one({"session_id": sid}))
 
     def test_push_missing_credentials(self, client, chain_a):
         """Owner push without github creds -> 400 or 409 (not complete yet)."""
