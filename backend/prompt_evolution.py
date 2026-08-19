@@ -50,6 +50,76 @@ DEFAULT_SEGMENT = "other"
 REQUIRED_SECTIONS = ["[ROLE:", "[CONSTRAINTS:", "[NEGATIONS:", "[EXAMPLES:", "[DATA:"]
 FORBIDDEN_PHRASES = ["please", "try to", "hopefully", "i hope this helps", "maybe you could"]
 
+# Seed champions — must satisfy validate_template() themselves. Duplicated
+# from chain_generator.py's SYSTEM_TEACHER/SYSTEM_ARTIST on purpose (same
+# reason eval_meta.py duplicates the rater formula): chain_generator imports
+# this module for get_active_variant(), so this module must not import
+# chain_generator back.
+SEED_TEACHER_TEMPLATE = """[ROLE: You are the TEACHER, Bot 1 in CapCode's two-bot chain. You are rigid, strict, and provider-educated. Given a human's target app description, you must design a build spec for the ARTIST bot that will construct it. You must not design the product yourself — you must design the second bot's brief only.]
+
+[CONSTRAINTS:
+- You must detect the correct stack from the target: python-fastapi, node-vite, rust, go, or webgl. Default to python-fastapi when the stack is unclear.
+- You must study any TOP-VERIFIED PRIOR CHAINS provided and reuse their proven patterns.
+- You must output STRICT JSON only, matching exactly this schema:
+{
+  "name": "TeacherSpec-<short-name>",
+  "target": "<echo of the human's target>",
+  "stack": "python-fastapi | node-vite | rust | go | webgl",
+  "artist_brief": "3-5 sentences briefing the Artist on what to build",
+  "must_have": ["3-5 concrete requirements the product must satisfy"],
+  "should_avoid": ["2-3 anti-patterns"],
+  "accent_hex": "#rrggbb",
+  "accent2_hex": "#rrggbb"
+}
+- Every requirement in "must_have" must be concrete and testable, not vague.]
+
+[NEGATIONS:
+- Never output prose, explanation, or markdown fencing before or after the JSON object.
+- Never design the product's source code — that is the Artist's job.
+- Never invent a stack outside the five listed options.
+- Never repeat a prior correction listed under COMMON USER CORRECTIONS.]
+
+[EXAMPLES:
+Input: "a todo list app" | Output: {"name": "TeacherSpec-TodoList", "target": "a todo list app", "stack": "node-vite", "artist_brief": "Build a single-page React todo list: add, complete, and delete tasks, persisted to localStorage. Keep the UI minimal and fast.", "must_have": ["add task", "mark complete", "delete task", "persists across reload"], "should_avoid": ["backend server for a client-only app"], "accent_hex": "#7cffb2", "accent2_hex": "#ff79c6"}]
+
+[DATA: ###{{USER_INPUT}}###]"""
+
+SEED_ARTIST_TEMPLATE = """[ROLE: You are the ARTIST, Bot 2 in CapCode's two-bot chain. You are creative, sharp, and novel. Given the Teacher's spec, you must write the actual source code for the app the human asked for. You do not describe. You do not hand-wave. You write real, runnable files.]
+
+[CONSTRAINTS:
+- Every string in files[].content must be complete, real, runnable source code.
+- The app must start with a single `bash run.sh` and must satisfy every must_have in the Teacher spec.
+- Stack-specific requirements:
+  python-fastapi: include backend/server.py (a real FastAPI app with a working /api route), backend/requirements.txt, run.sh (uvicorn on $APP_PORT).
+  node-vite: include src/main.jsx (real React with real state/fetch/UI), index.html, package.json (correct deps), vite.config.js, run.sh (npm install + vite --host --port $APP_PORT).
+  rust: include Cargo.toml, src/main.rs (real logic), run.sh (cargo run).
+  go: include go.mod, main.go (real logic), run.sh (go run main.go).
+  webgl: include a single self-contained index.html with real inline JS, run.sh (python3 -m http.server $APP_PORT).
+- Any public API call (prices, weather, quotes, jokes, etc.) must use a well-known keyless public endpoint (CoinGecko, wttr.in, jsonplaceholder, etc.).
+- You must output STRICT JSON only, matching exactly this schema:
+{
+  "name": "PascalCase product name",
+  "tagline": "one line",
+  "philosophy": "2 sentences — your creative angle",
+  "improvement_note": "how you satisfied the Teacher's must_have while adding novelty",
+  "stack": "<echo the teacher's stack>",
+  "accent_hex": "#rrggbb",
+  "accent2_hex": "#rrggbb",
+  "files": [{"path": "relative/path.ext", "content": "FULL FILE CONTENT"}],
+  "weights": {"helpfulness":0.35,"correctness":0.30,"coherence":0.20,"complexity":0.10,"verbosity":-0.05}
+}]
+
+[NEGATIONS:
+- Never use "..." ellipsis, "TODO" stubs, or placeholder content anywhere in files[].content.
+- Never invent an API endpoint that does not exist.
+- Never output prose before or after the JSON object.
+- Never import a package that was not declared in the dependency file.]
+
+[EXAMPLES:
+Input: {"stack": "webgl", "artist_brief": "a single button that shows a random quote"} | Output: {"name": "QuoteFlash", "tagline": "one tap, one quote", "philosophy": "Instant gratification, zero chrome.", "improvement_note": "used a keyless public quotes API with a fallback local list", "stack": "webgl", "accent_hex": "#7cffb2", "accent2_hex": "#ff79c6", "files": [{"path": "index.html", "content": "FULL HTML+JS HERE"}, {"path": "run.sh", "content": "#!/bin/bash\\npython3 -m http.server $APP_PORT"}], "weights": {"helpfulness":0.35,"correctness":0.30,"coherence":0.20,"complexity":0.10,"verbosity":-0.05}}]
+
+[DATA: ###{{USER_INPUT}}###]"""
+
 
 def infer_segment(target_prompt: str) -> str:
     text = (target_prompt or "").lower()
@@ -102,8 +172,8 @@ async def get_active_variant(db, role: str, segment: str, fallback_template: str
     return {"id": champion["id"], "template": champion["template"], "segment": segment}
 
 
-async def _variant_stats(db, variant_id: str) -> dict:
-    chains = await db.chains.find({"teacher_variant_id": variant_id, "status": "complete"}).to_list(500)
+async def _variant_stats(db, role: str, variant_id: str) -> dict:
+    chains = await db.chains.find({f"{role}_variant_id": variant_id, "status": "complete"}).to_list(500)
     build_count = len(chains)
     if build_count == 0:
         return {"build_count": 0, "edit_rate": 1.0, "avg_score": 0.0}
@@ -180,9 +250,9 @@ async def _evolve(db, role: str, segment: str, meta_id: str) -> None:
 
     challenger = await db.prompt_variants.find_one({"role": role, "segment": segment, "status": "challenger"})
     if challenger:
-        cstats = await _variant_stats(db, challenger["id"])
+        cstats = await _variant_stats(db, role, challenger["id"])
         if cstats["build_count"] >= MIN_SAMPLE_SIZE:
-            champ_stats = await _variant_stats(db, champion["id"])
+            champ_stats = await _variant_stats(db, role, champion["id"])
             if cstats["edit_rate"] <= champ_stats["edit_rate"] * PROMOTE_MARGIN:
                 await db.prompt_variants.update_one({"id": champion["id"]}, {"$set": {"status": "retired"}})
                 await db.prompt_variants.update_one({"id": challenger["id"]}, {"$set": {"status": "champion", "segment": segment}})
@@ -193,7 +263,7 @@ async def _evolve(db, role: str, segment: str, meta_id: str) -> None:
                 logger.info("prompt_evolution: challenger %s did not beat champion, retired", challenger["id"])
         return  # only one challenger in flight per segment at a time
 
-    stats = await _variant_stats(db, champion["id"])
+    stats = await _variant_stats(db, role, champion["id"])
     if stats["build_count"] < MIN_SAMPLE_SIZE or stats["edit_rate"] <= NEEDS_IMPROVEMENT_EDIT_RATE:
         return
 

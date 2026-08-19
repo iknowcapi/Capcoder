@@ -3,7 +3,7 @@ import "@/App.css";
 import { Toaster, toast } from "sonner";
 import { LogIn, LogOut, Settings } from "lucide-react";
 import { api, API } from "@/lib/api";
-import { signInWithGoogle, signOut as neonSignOut, getJwt } from "@/lib/authClient";
+import { signInWithGoogle, signOut as neonSignOut, getJwt, getSession } from "@/lib/authClient";
 import { TerminalHero } from "@/components/TerminalHero";
 import { EvolveButton } from "@/components/EvolveButton";
 import { ChainViewer } from "@/components/ChainViewer";
@@ -50,6 +50,24 @@ function App() {
     let alive = true;
     const load = async () => {
       try {
+        // getSession() consumes Neon's `neon_auth_session_verifier` URL param
+        // (present right after a Google OAuth redirect) and finalizes the
+        // session. Must run before getJwt() or the verifier is left unused
+        // and the user silently stays signed out.
+        await getSession();
+        const returningFromOAuth = window.location.search.includes("neon_auth_session_verifier");
+        if (returningFromOAuth) {
+          const url = new URL(window.location.href);
+          url.searchParams.delete("neon_auth_session_verifier");
+          window.history.replaceState({}, document.title, url.toString());
+          if (alive) {
+            const preAuthView = sessionStorage.getItem("capcode.pre_auth_view");
+            if (preAuthView) {
+              sessionStorage.removeItem("capcode.pre_auth_view");
+              setView(preAuthView);
+            }
+          }
+        }
         // Skip the backend round-trip entirely when there's no Neon Auth JWT
         // yet — anonymous visitors would otherwise 401 against /api/auth/me
         // on every mount + every 60s poll, for nothing but console noise.
@@ -74,7 +92,10 @@ function App() {
   }, []);
 
   const handleSignIn = async () => {
-    try { await signInWithGoogle(); }
+    try {
+      sessionStorage.setItem("capcode.pre_auth_view", view);
+      await signInWithGoogle();
+    }
     catch (e) { toast.error(e?.message || "sign-in failed"); }
   };
 

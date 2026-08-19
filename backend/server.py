@@ -34,6 +34,7 @@ import tiers as _tiers
 import billing as _billing
 import edits as _edits
 import eval_meta as _eval_meta
+import prompt_evolution as _prompt_evo
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -744,10 +745,16 @@ async def evolve(req: EvolveRequest, background_tasks: BackgroundTasks, request:
     # build's Teacher brief so it steers away from repeating them.
     corrections = await _edits.corrections_digest(db)
     eval_weights_doc = await _eval_meta.get_weights(db)
+    segment = _prompt_evo.infer_segment(target)
+    teacher_variant = await _prompt_evo.get_active_variant(db, "teacher", segment, chain_generator.SYSTEM_TEACHER)
+    artist_variant = await _prompt_evo.get_active_variant(db, "artist", segment, chain_generator.SYSTEM_ARTIST)
     progress = chain_generator.new_progress(
         chain_id, target, tier,
         assignments=assignments, exemplars=exemplars, exemplar_files=exemplar_files,
         corrections=corrections, eval_weights=eval_weights_doc["weights"],
+        teacher_prompt_template=teacher_variant["template"], teacher_variant_id=teacher_variant["id"],
+        artist_prompt_template=artist_variant["template"], artist_variant_id=artist_variant["id"],
+        segment=segment,
     )
     # SEC: never persist decrypted BYOK keys to the DB. Store only the
     # session_id so /advance can re-derive keys fresh on each stage call.
@@ -824,7 +831,9 @@ async def advance_chain(chain_id: str, request: Request):
             {"$push": {"generations": product},
              "$set": {"status": "complete", "fallback_used": progress["fallback_used"],
                       "completed_at": completed_at,
-                      "build_manifest": build_manifest, "built_at": completed_at}},
+                      "build_manifest": build_manifest, "built_at": completed_at,
+                      "teacher_variant_id": product.get("teacher_variant_id"),
+                      "artist_variant_id": product.get("artist_variant_id")}},
         )
         km = (product.get("refinement") or {}).get("knowledge_module")
         if km:
@@ -846,6 +855,9 @@ async def advance_chain(chain_id: str, request: Request):
             billing_result = await _billing.apply_chain_billing(
                 db, owner["user_id"], chain_id, product["refinement"],
             )
+        if progress.get("segment"):
+            await _prompt_evo.maybe_evolve(db, "teacher", progress["segment"])
+            await _prompt_evo.maybe_evolve(db, "artist", progress["segment"])
         await db.chain_progress.delete_one({"id": chain_id})
         return {"stage": stage_just_ran, "report": report, "done": True,
                 "composite_score": product.get("composite_score"),
@@ -1283,6 +1295,22 @@ async def get_eval_weights():
     return await _eval_meta.get_weights(db)
 
 
+@api.get("/prompt-variants")
+async def get_prompt_variants():
+    """Public, read-only — Layer #1's current Teacher/Artist prompt
+    champions + any in-flight A/B challengers, for transparency."""
+    out = {}
+    for role in ("teacher", "artist"):
+        champs = await db.prompt_variants.find({"role": role, "status": "champion"}).to_list(50)
+        challengers = await db.prompt_variants.find({"role": role, "status": "challenger"}).to_list(50)
+        out[role] = {
+            "champions": [{"segment": c["segment"], "version": c["version"], "id": c["id"]} for c in champs],
+            "challengers": [{"segment": c["segment"], "version": c["version"], "id": c["id"],
+                              "challenging_variant_id": c.get("challenging_variant_id")} for c in challengers],
+        }
+    return out
+
+
 app.include_router(api)
 _tiers.init(db, _owner_from_request)
 app.include_router(_tiers.router)
@@ -1362,6 +1390,17 @@ async def _sweep_orphans():
             logger.info("startup sweep: marked %d orphaned chain(s) as failed", r.modified_count)
     except Exception as exc:
         logger.warning("startup sweep failed: %s", exc)
+
+
+@app.on_event("startup")
+async def _seed_prompt_variants():
+    """Layer #1 — seed the global champion prompts (Teacher + Artist) once.
+    Idempotent; never clobbers a promoted challenger on hot-reload/restart."""
+    try:
+        await _prompt_evo.ensure_seed(db, "teacher", _prompt_evo.SEED_TEACHER_TEMPLATE)
+        await _prompt_evo.ensure_seed(db, "artist", _prompt_evo.SEED_ARTIST_TEMPLATE)
+    except Exception as exc:
+        logger.warning("prompt_evolution seeding failed: %s", exc)
 
 
 @app.on_event("shutdown")

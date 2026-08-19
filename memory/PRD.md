@@ -46,9 +46,18 @@ CapCode is a recursive bot-builder. Human types the app they want; the system ru
 - `REACT_APP_NEON_AUTH_URL` — same as backend's `NEON_AUTH_URL`, exposed to the browser.
 - `WDS_SOCKET_PORT=443`.
 
-## Status (2026-08-18 — Recursive self-improvement Layer #5: Evaluation-Criteria Meta-Loop)
+## Status (2026-08-19 — P0 Auth fix: Google Sign-In on Vercel)
 
-### ✅ Shipped this session (2026-08-18, third pass)
+### ✅ Shipped this session (2026-08-19)
+- **Root-caused and fixed Google Sign-In failure** reported on the live Vercel deploy (`capcode-mu.vercel.app`): after picking a Google account, user landed back on the app but was never actually signed in.
+  - **Real root cause**: `authClient.js` used raw `better-auth/react`'s `createAuthClient`, which has no concept of Neon's cross-domain OAuth handoff. After the Google redirect, Neon appends `?neon_auth_session_verifier=...` to the callback URL — only `@neondatabase/auth`'s client knows how to consume that to finalize the session. On top of that, `@neondatabase/auth`'s public `createAuthClient()` only returns the adapter (not `getJWTToken`) — calling `.getJWTToken()` on it triggered a bogus auto-generated `/get-jwt-token` request that 404'd (confirmed live via browser console during debugging).
+  - **Fix**: swapped to `@neondatabase/auth`'s `createInternalNeonAuth()` (destructure `{ adapter, getJWTToken }`); `App.js`'s auth-check effect now calls a new `getSession()` first (consumes the verifier + strips it from the URL) before `getJwt()`. Also restores whichever view (landing/pricing/build) the user was on before sign-in via `sessionStorage['capcode.pre_auth_view']`.
+  - `better-auth` package removed from `frontend/package.json`; `@neondatabase/auth@0.5.0-beta` added (required `--ignore-engines` — one transitive dep, `kysely`, wants Node ≥22, we run Node 20; harmless, package works fine).
+  - Tested: testing_agent iteration_12 — zero console errors, no bogus 404s, OAuth redirect chain (Neon → Google) initiates cleanly, landing/pricing/build views regression-clean. **Real end-to-end Google login still needs the human user to verify on the deployed Vercel app** — no automated agent can complete a real Google consent screen.
+  - Also: page `<title>`/description changed to "CapCode - Recursive App Builder", added `favicon.ico`/`logo192.png`/`logo512.png` placeholders (previously missing entirely).
+- **Separate, still-open Neon Auth item (not code-fixable)**: Neon Auth's email/password endpoints (`/sign-up/email`, `/sign-in/email`) return `403 Invalid origin` for the current origin even though CORS headers match — likely a Neon-console-side "Trusted Domains" config gap. Out of scope since the user's flow is Google-only, but flagged for future email/password support.
+
+### Previous pass (2026-08-18, third pass) — Layer #5 shipped
 - **`backend/eval_meta.py`** (new): the composite score's fixed weights (coverage×0.4 + rater×0.4 + novelty×0.2) are now data-driven. `maybe_recompute()` (throttled, ≤1/hr, called opportunistically from `/verify` and `/check-edits`) buckets recent complete builds into "good" (✓ Verify AND never edit-diffed) vs "bad", measures the mean-gap per dimension, floors each weight at 0.1, and blends 70% prior / 30% freshly computed for stability. Gated on `MIN_SAMPLE_SIZE=15` so early on the rubric stays exactly at defaults.
 - `GET /api/eval-weights` (public) — current weights + sample_size + is_default, for transparency.
 - `chain_generator.composite_v2()` now takes a `weights` param (`.get()`-safe against a partial/malformed doc — testing_agent-flagged fix); every scored generation on trial/paid tiers stamps `eval_weights` used. Free tier (teacher+artist only) never touches this path — unchanged, pre-existing behavior.
@@ -105,10 +114,12 @@ User asked to make every decision layer of the app recursive (prompt/instruction
 
 ## Backlog
 
-### P0 — none open
+### P0 — none open (auth sign-in fix shipped 2026-08-19, pending human verification on live Vercel deploy)
 
 ### P1 — Recursive self-improvement layers (user's stated priority: #7 done, #5 done → #1 next)
-- **#1 Prompt/instruction self-tuning**: rewrite Teacher/Artist system prompts based on outcome data (which prompts→highest scores, fewest corrections). `corrections_digest()` already feeds the Teacher per-build; the prompts themselves are still hand-written/static.
+- **#1 Prompt/instruction self-tuning** (`backend/prompt_evolution.py` — file created, empty, next up): rewrite Teacher/Artist system prompts based on outcome data (which prompts→highest scores, fewest corrections). User mandated a strict rule-based template (no soft qualifiers, no conversational prompts):
+  `[ROLE: {role definition}] [CONSTRAINTS: {mandatory output requirements}] [NEGATIONS: {prohibited elements/phrases}] [EXAMPLES: Input: {A} | Output: {B}] [DATA: ###{{USER_INPUT}}###]`
+  Use "Must/Shall", never "Please/Try to". Zero-shot, no preamble. `corrections_digest()` (Layer #7) already feeds per-build hints into the Teacher prompt, but the prompts themselves are still static — this is the next planned layer.
 - GitHub compare path (`check_git_edits` in edits.py) and paid/trial-tier `eval_weights` wiring have never been exercised live end-to-end — no Google login / GitHub PAT available in this env. Verified by code inspection + unit-level calls only.
 - (Optional, LOW) `eval_meta.maybe_recompute()` runs inline inside `/verify`/`/check-edits` — once sample_size clears 15 it scans up to 500 chains on that one request. Fine at current scale; move to `BackgroundTasks` if it ever becomes noticeable.
 - `tiers.py`'s monthly-plan price lookup now accepts BOTH `STRIPE_PRICE_ID_PAID` and the shorter legacy `STRIPE_PRICE_ID` (user already had the latter set in Render for the pre-existing monthly plan) — `STRIPE_PRICE_ID_PAID` wins if both are set. Trial/annual only accept their own explicit names (`STRIPE_PRICE_ID_TRIAL` / `STRIPE_PRICE_ID_PAID_ANNUAL`, added this session).

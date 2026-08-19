@@ -1,9 +1,12 @@
 // Neon Managed Better Auth — browser client.
 //
-// Uses better-auth's framework-agnostic React client. All auth traffic goes
-// direct to Neon Auth (sign-in, session, sign-out); our FastAPI backend only
-// verifies the resulting JWT.
-import { createAuthClient } from "better-auth/react";
+// Uses Neon's own `@neondatabase/auth` wrapper (NOT raw better-auth/react).
+// Raw better-auth has no idea about Neon's cross-domain OAuth handoff — after
+// Google redirects back, Neon appends `?neon_auth_session_verifier=...` to
+// the URL, and only the Neon client knows how to consume that token to
+// finalize the session. Using plain better-auth left that verifier unused,
+// so sign-in silently never completed.
+import { createInternalNeonAuth } from "@neondatabase/auth";
 
 const NEON_AUTH_URL = process.env.REACT_APP_NEON_AUTH_URL;
 
@@ -13,21 +16,27 @@ if (!NEON_AUTH_URL) {
   );
 }
 
-export const authClient = createAuthClient({
-  baseURL: NEON_AUTH_URL,
-  fetchOptions: { credentials: "include" },
-});
+// createAuthClient() only returns the adapter (signIn/signOut/getSession) —
+// getJWTToken lives one level up, on the internal wrapper, so we need the
+// non-public factory to get both.
+const { adapter, getJWTToken } = createInternalNeonAuth(NEON_AUTH_URL);
+export const authClient = adapter;
 
-// Fetch the current JWT (Neon's Better Auth JWT plugin). Returns null when
-// the user is not signed in.
+// Finalizes the OAuth session — consumes `neon_auth_session_verifier` from
+// the URL (if present) and resolves the current session, or null.
+export async function getSession() {
+  try {
+    const res = await authClient.getSession();
+    return res?.data?.session ? res.data : null;
+  } catch (_e) {
+    return null;
+  }
+}
+
+// Returns the current JWT, or null when not signed in.
 export async function getJwt() {
   try {
-    const res = await authClient.$fetch("/token", { method: "GET" });
-    // better-auth's $fetch resolves with { data, error } OR the raw JSON body
-    // depending on the endpoint — accept both shapes.
-    const payload = res?.data ?? res ?? null;
-    if (!payload) return null;
-    return payload.token || payload.jwt || payload.accessToken || null;
+    return (await getJWTToken()) || null;
   } catch (_e) {
     return null;
   }

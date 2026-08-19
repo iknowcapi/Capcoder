@@ -470,7 +470,8 @@ class TeacherFailedError(Exception):
 
 async def teacher_step(target: str, exemplars: list[dict], assignment: Optional[dict] = None,
                        user_keys: Optional[dict] = None, chain_id: Optional[str] = None,
-                       tier: Optional[str] = None, corrections: str = "") -> dict:
+                       tier: Optional[str] = None, corrections: str = "",
+                       prompt_template: Optional[str] = None) -> dict:
     exemplar_block = "\n\n".join(
         f"[verified — target: {e.get('target','?')} — product: {e.get('name','?')}]\n"
         f"artist_brief was: {e.get('artist_brief','?')}"
@@ -482,12 +483,20 @@ async def teacher_step(target: str, exemplars: list[dict], assignment: Optional[
         if corrections else ""
     )
     await _emit(chain_id, "stage", "teacher")
+    user_data = (f"HUMAN TARGET:\n{target}\n\nTOP-VERIFIED PRIOR CHAINS:\n{exemplar_block}"
+                f"{corrections_block}\n\nDesign the Teacher spec as strict JSON.")
+    # Layer #1 — Prompt Self-Tuning: when server.py resolved an active
+    # champion/challenger variant, its full [ROLE]/[CONSTRAINTS]/[NEGATIONS]/
+    # [EXAMPLES]/[DATA] template REPLACES the hardcoded SYSTEM_TEACHER + user
+    # message split entirely — {{USER_INPUT}} is substituted with the same
+    # dynamic content that would have gone into the user message, and the
+    # whole thing is sent as a single message, per the template's own shape.
+    if prompt_template:
+        messages = [{"role": "user", "content": prompt_template.replace("{{USER_INPUT}}", user_data)}]
+    else:
+        messages = [{"role": "system", "content": SYSTEM_TEACHER}, {"role": "user", "content": user_data}]
     raw, tokens = await _call_role(
-        "teacher",
-        [{"role": "system", "content": SYSTEM_TEACHER},
-         {"role": "user", "content":
-             f"HUMAN TARGET:\n{target}\n\nTOP-VERIFIED PRIOR CHAINS:\n{exemplar_block}"
-             f"{corrections_block}\n\nDesign the Teacher spec as strict JSON."}],
+        "teacher", messages,
         assignment, user_keys=user_keys, tier=tier,
         stream_chain_id=chain_id, stream_event="teacher_delta",
         temperature=0.4, max_tokens=800,
@@ -580,7 +589,12 @@ def new_progress(chain_id: str, target_prompt: str, tier: str,
                  exemplars: Optional[list[dict]] = None,
                  exemplar_files: Optional[list[dict]] = None,
                  corrections: str = "",
-                 eval_weights: Optional[dict] = None) -> dict:
+                 eval_weights: Optional[dict] = None,
+                 teacher_prompt_template: Optional[str] = None,
+                 teacher_variant_id: Optional[str] = None,
+                 artist_prompt_template: Optional[str] = None,
+                 artist_variant_id: Optional[str] = None,
+                 segment: Optional[str] = None) -> dict:
     """Initial checkpoint state for a fresh chain. server.py writes this to
     db.chain_progress right after budget-checking, BEFORE any stage runs."""
     role_sequence = _providers.role_sequence_for_tier(tier)
@@ -600,6 +614,11 @@ def new_progress(chain_id: str, target_prompt: str, tier: str,
         "exemplar_files": exemplar_files or [],
         "corrections": corrections or "",
         "eval_weights": eval_weights,
+        "teacher_prompt_template": teacher_prompt_template,
+        "teacher_variant_id": teacher_variant_id,
+        "artist_prompt_template": artist_prompt_template,
+        "artist_variant_id": artist_variant_id,
+        "segment": segment,
         "tokens_used": 0,
         "fallback_used": False,
         "needs_fix": False,
@@ -696,7 +715,8 @@ async def run_stage(progress: dict) -> dict:
                 ts = await teacher_step(progress["target_prompt"], progress["exemplars"],
                                         assignment=a["teacher"], user_keys=user_keys,
                                         chain_id=chain_id, tier=tier,
-                                        corrections=progress.get("corrections", ""))
+                                        corrections=progress.get("corrections", ""),
+                                        prompt_template=progress.get("teacher_prompt_template"))
                 progress["tokens_used"] += ts.pop("_tokens", 0)
                 progress["teacher_spec"] = ts
 
@@ -714,7 +734,8 @@ async def run_stage(progress: dict) -> dict:
             elif stage == "artist":
                 spec = await artist_step(progress["teacher_spec"], exemplar_files=progress["exemplar_files"],
                                          assignment=a["artist"], user_keys=user_keys,
-                                         chain_id=chain_id, tier=tier)
+                                         chain_id=chain_id, tier=tier,
+                                         prompt_template=progress.get("artist_prompt_template"))
                 progress["tokens_used"] += spec.pop("_tokens", 0)
                 progress["artist_spec"] = spec
 
@@ -805,6 +826,8 @@ async def run_stage(progress: dict) -> dict:
                     f"Port listening: {progress['exec_result'].get('port_listening')}."
                 )
                 product["assignments"] = {k: a[k] for k in progress["role_sequence"] if k in a}
+                product["teacher_variant_id"] = progress.get("teacher_variant_id")
+                product["artist_variant_id"] = progress.get("artist_variant_id")
                 progress["product"] = product
 
                 # --- Recursive Refinement Loop -------------------------------
@@ -898,7 +921,8 @@ async def artist_step(teacher_spec: dict, exemplar_files: Optional[list[dict]] =
                       assignment: Optional[dict] = None,
                       user_keys: Optional[dict] = None,
                       chain_id: Optional[str] = None,
-                      tier: Optional[str] = None) -> dict:
+                      tier: Optional[str] = None,
+                      prompt_template: Optional[str] = None) -> dict:
     parsed: dict = {}
     raw = ""
     exemplar_block = ""
@@ -949,10 +973,14 @@ async def artist_step(teacher_spec: dict, exemplar_files: Optional[list[dict]] =
         user_msg += directive
         if attempt > 0:
             await _emit(chain_id, "stage", f"artist-retry-{attempt}")
+        # Layer #1 — same template-replaces-system-prompt substitution as
+        # teacher_step(), see there for why.
+        if prompt_template:
+            messages = [{"role": "user", "content": prompt_template.replace("{{USER_INPUT}}", user_msg)}]
+        else:
+            messages = [{"role": "system", "content": SYSTEM_ARTIST}, {"role": "user", "content": user_msg}]
         raw, call_tokens = await _call_role(
-            "artist",
-            [{"role": "system", "content": SYSTEM_ARTIST},
-             {"role": "user", "content": user_msg}],
+            "artist", messages,
             assignment,
             user_keys=user_keys, tier=tier,
             stream_chain_id=chain_id, stream_event="artist_delta",
