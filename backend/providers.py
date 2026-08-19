@@ -404,6 +404,40 @@ TRIAL_FALLBACKS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Default LLM Teams — 3 one-click presets covering all 6 roles, surfaced in
+# Settings as "reset to default team" buttons.
+# ---------------------------------------------------------------------------
+DEFAULT_TEAMS = {
+    "venice": {
+        "label": "Venice — Uncensored",
+        "description": "All 6 roles routed through Venice's uncensored models. Requires the uncensored-mode waiver.",
+        "uncensored": True,
+        "assignments": {
+            "teacher":   {"provider": "venice", "model": "venice-uncensored"},
+            "architect": {"provider": "venice", "model": "qwen3-coder-480b-a35b-instruct-turbo"},
+            "artist":    {"provider": "venice", "model": "qwen3-coder-480b-a35b-instruct-turbo"},
+            "reviewer":  {"provider": "venice", "model": "venice-uncensored"},
+            "rater":     {"provider": "venice", "model": "venice-uncensored"},
+            "corrector": {"provider": "venice", "model": "qwen3-coder-480b-a35b-instruct-turbo"},
+        },
+    },
+    "openrouter": {
+        "label": "OpenRouter — Best Models",
+        "description": "All 6 roles routed through OpenRouter's strongest models, one per role.",
+        "uncensored": False,
+        "assignments": {r: DEFAULT_ASSIGNMENTS[r] for r in
+                         ("teacher", "architect", "artist", "reviewer", "rater", "corrector")},
+    },
+    "nvidia": {
+        "label": "NVIDIA NIM — Trial Team",
+        "description": "All 6 roles pinned to NVIDIA NIM models — the same team the 7-day trial uses.",
+        "uncensored": False,
+        "assignments": dict(TIER_ASSIGNMENTS["trial"]),
+    },
+}
+
+
 def assignments_for_tier(tier: str) -> dict:
     return TIER_ASSIGNMENTS.get(tier, TIER_ASSIGNMENTS["free"])
 

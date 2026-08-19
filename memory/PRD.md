@@ -1,145 +1,71 @@
-# CapCode — PRD
+# CapCode — PRD / Architecture Memory
 
-## What it is
-CapCode is a recursive bot-builder. Human types the app they want; the system runs **Teacher → Artist → Product → Rater**, delivering a runnable downloadable code folder. Dark 1980s neo-noir BBS aesthetic. Not a Cursor/v0 competitor — CapCode strictly generates a fresh runnable project, not IDE assistance.
+## Original problem statement
+Recursive AI dev-team app (CapCode): 6-role pipeline Teacher -> Architect ->
+Artist -> Reviewer -> Executor/Corrector -> Rater -> Scorer. Checkpointed
+pipeline, Tier System (free/trial/paid), Uncensored Mode waiver (Venice).
 
-## Strict topology (do not deviate)
-1. Human types the app they want built.
-2. **TEACHER** bot (rigid, strict) reads the target + top-verified prior chains and writes a brief for the Artist. Default: OpenRouter `deepseek/deepseek-v4-flash`.
-3. **ARTIST** bot (creative, novel) — **writes the actual source files** as a `files: [{path, content}]` array. Default: OpenRouter `anthropic/claude-sonnet-5`. Auto-retries once with terser directive if the first response is truncated/unparseable.
-4. **Product** is materialized to `/workspaces/<chain>/<name>/`.
-5. **Executor** runs `bash run.sh` in an isolated process group (soon: Vercel Sandbox API).
-6. If the app fails to start, **one** correction pass runs.
-7. **RATER** scores. Composite score = weighted sum.
-8. Human clicks **✓ Works — Verify** on a completed chain → +0.5 composite boost + fed into the Teacher exemplar pool.
+## Stack
+- Backend: FastAPI + Neon Postgres via `docdb.py` (JSONB adapter, Mongo-like API)
+- Frontend: React + Tailwind, BBS/neon terminal aesthetic
+- Auth: Neon Managed Better Auth (Google OAuth), proxied through backend
+  `/api/neon-auth/*` to fix Safari cross-domain cookie issues
+- Deploy: Frontend on Vercel, Backend on Render. User deploys via zip download
+  (Emergent->GitHub integration currently broken on their end)
+- Billing: Stripe — $16/mo (or annual) subscription, $2.99 one-time trial,
+  now also one-time credit top-ups ($8/500, $16/1000, $32/2000 credits)
 
-## Tech stack (2026-08-09 — after migration)
-- **Frontend**: React (CRA), Tailwind, Shadcn UI, better-auth React SDK
-- **Backend**: FastAPI, asyncpg, PyJWT (EdDSA)
-- **Database**: **Neon Postgres** (via a home-grown `docdb.py` adapter that mimics a small Mongo subset over JSONB)
-- **Auth**: **Neon Managed Better Auth** (Google OAuth via Neon "Shared keys" + email/password), JWT verified against `${NEON_AUTH_URL}/.well-known/jwks.json`
-- **LLMs**: OpenRouter (default), NVIDIA NIM, Venice — all BYOK
-- **Deploy target**: Split — **Frontend on Vercel**, **Backend on Render** (persistent container; Render was chosen over Vercel Serverless because the code-execution sandbox needs a real `subprocess.Popen`, which serverless can't reliably support).
+## Implemented (this session, Aug 2026)
+1. **Dead Vercel code cleanup** — deleted `/app/api/index.py` + root
+   `requirements.txt`; removed the `functions` block + `/api/(.*)` rewrite
+   from `vercel.json` (frontend calls Render directly via
+   `REACT_APP_BACKEND_URL`, so this was pure dead weight/build risk).
+2. **Default LLM Teams** — `providers.DEFAULT_TEAMS` (venice/openrouter/nvidia
+   presets, all 6 roles). `GET /api/teams/defaults`, `POST /api/teams/reset`.
+   Settings extended from 3 roles (teacher/artist/rater) to all 6
+   (+architect/reviewer/corrector) — `SETTINGS_ROLES` in server.py.
+   Frontend: SettingsPanel "DEFAULT TEAMS" section, 6 role tabs, Venice preset
+   gates through the existing consent waiver modal first.
+3. **Credit top-ups** — `billing.TOPUP_PACKAGES` ($8→500cr, $16→1000cr,
+   $32→2000cr), `add_topup_credits`/`get_topup_balance`, persistent
+   `users.topup_credits_balance` (doesn't expire on cycle renewal; spent
+   before card overage in `apply_chain_billing`). Endpoints:
+   `GET /api/tier/topup/packages`, `POST /api/tier/topup/checkout` (mock path
+   via ALLOW_MOCK_BILLING=true when no Stripe key, same pattern as existing
+   trial/paid checkout). Env vars needed in Render for real Stripe:
+   `STRIPE_PRICE_ID_CREDITS_8`, `STRIPE_PRICE_ID_CREDITS_16`,
+   `STRIPE_PRICE_ID_CREDITS_32`.
+4. **User Profile UI** — `GET /api/profile` (email, tier, trial days left,
+   billing cycle, topup balance). New `ProfilePanel.jsx`, "profile" button in
+   App.js header (only shown when signed in).
+5. Legal docs (Privacy/TOS) — explicitly declined by user, NOT built. The
+   existing `VeniceConsentModal.jsx` liability waiver stands as-is.
+6. Fixed layout bug from testing: SettingsPanel role-tab row was flex-shrunk
+   to ~5px by the new Default Teams section — added `shrink-0` to all fixed
+   sections + `min-h-0` on the model-list scroll region. Also fixed a bug
+   where applying the Venice preset also silently force-enabled the
+   unrelated "uncensored only" catalog filter checkbox.
 
-## Architecture files
-- `/app/backend/server.py` — FastAPI routes (owner-filtered) + Neon JWT verification.
-- `/app/backend/docdb.py` — Postgres/JSONB Mongo-compat adapter (find/insert/update_one/update_many/count_documents/$set/$push/upserts).
-- `/app/backend/chain_generator.py` — Teacher / Artist / Corrector / Rater LLM orchestration + SSE streaming.
-- `/app/backend/executor.py` — subprocess spawn with `os.setsid()` + env whitelist scrub (SEC-001).
-- `/app/backend/seed_template.py` — fills gaps in Artist's file set (run.sh, package.json, etc.).
-- `/app/backend/providers.py` — OpenRouter / NVIDIA / Venice OpenAI-compatible clients.
-- `/app/frontend/src/App.js` — main orchestration, SSE tokens, Neon Auth session watcher.
-- `/app/frontend/src/lib/authClient.js` — better-auth React client + `getJwt()` for backend calls.
-- `/app/frontend/src/lib/api.js` — axios with global JWT bearer + `X-Capcode-Session` interceptor.
-- `/app/frontend/src/components/ChainViewer.jsx` — lineage + terminal + download/verify/push buttons.
-- `/app/frontend/src/components/SettingsPanel.jsx` — role/model picker + BYOK keys.
+## Testing status
+- `/app/test_reports/iteration_13.json` — backend 21/21 pass, frontend
+  90%→100% after layout fix (retest recommended but fix is a pure CSS change
+  mirroring the exact fix the testing agent RCA'd).
+- Known limitation: no email/password UI exists, only Google OAuth — so
+  signed-in-only flows (profile contents, topup checkout mock-credit,
+  real billing) can only be smoke-tested for correct 401s in this env, not
+  fully e2e. Anonymous-session flows (teams reset, 6-role settings) are
+  fully tested and pass.
 
-## Environment variables
-### Backend (`/app/backend/.env`)
-- `POSTGRES_URL` — Neon connection string.
-- `NEON_AUTH_URL` — `https://<endpoint>.neonauth.<region>.aws.neon.tech/<branch>/auth`.
-- `OPENROUTER_API_KEY`, `NVIDIA_API_KEY`, `VENICE_API_KEY` — server-default LLM keys.
-- `CORS_ORIGINS` — comma-list or `*`.
+## Pre-existing (not touched this session, noted by testing agent)
+- `POST /api/teams/reset` (like the pre-existing `/api/settings`) trusts a
+  caller-supplied `session_id` in the body rather than deriving it from the
+  `X-Capcode-Session` header — this is the SAME pattern the existing
+  `/api/settings` GET/POST already use, not a new regression. Would need a
+  broader auth-flow change to fix consistently; out of scope for this session.
 
-### Frontend (`/app/frontend/.env`)
-- `REACT_APP_BACKEND_URL` — public backend URL (Kubernetes ingress in dev, Vercel URL in prod).
-- `REACT_APP_NEON_AUTH_URL` — same as backend's `NEON_AUTH_URL`, exposed to the browser.
-- `WDS_SOCKET_PORT=443`.
-
-## Status (2026-08-19 — P0 Auth fix: Google Sign-In on Vercel)
-
-### ✅ Shipped this session (2026-08-19)
-- **Root-caused and fixed Google Sign-In failure** reported on the live Vercel deploy (`capcode-mu.vercel.app`): after picking a Google account, user landed back on the app but was never actually signed in.
-  - **Real root cause**: `authClient.js` used raw `better-auth/react`'s `createAuthClient`, which has no concept of Neon's cross-domain OAuth handoff. After the Google redirect, Neon appends `?neon_auth_session_verifier=...` to the callback URL — only `@neondatabase/auth`'s client knows how to consume that to finalize the session. On top of that, `@neondatabase/auth`'s public `createAuthClient()` only returns the adapter (not `getJWTToken`) — calling `.getJWTToken()` on it triggered a bogus auto-generated `/get-jwt-token` request that 404'd (confirmed live via browser console during debugging).
-  - **Fix**: swapped to `@neondatabase/auth`'s `createInternalNeonAuth()` (destructure `{ adapter, getJWTToken }`); `App.js`'s auth-check effect now calls a new `getSession()` first (consumes the verifier + strips it from the URL) before `getJwt()`. Also restores whichever view (landing/pricing/build) the user was on before sign-in via `sessionStorage['capcode.pre_auth_view']`.
-  - `better-auth` package removed from `frontend/package.json`; `@neondatabase/auth@0.5.0-beta` added (required `--ignore-engines` — one transitive dep, `kysely`, wants Node ≥22, we run Node 20; harmless, package works fine).
-  - Tested: testing_agent iteration_12 — zero console errors, no bogus 404s, OAuth redirect chain (Neon → Google) initiates cleanly, landing/pricing/build views regression-clean. **Real end-to-end Google login still needs the human user to verify on the deployed Vercel app** — no automated agent can complete a real Google consent screen.
-  - Also: page `<title>`/description changed to "CapCode - Recursive App Builder", added `favicon.ico`/`logo192.png`/`logo512.png` placeholders (previously missing entirely).
-- **Separate, still-open Neon Auth item (not code-fixable)**: Neon Auth's email/password endpoints (`/sign-up/email`, `/sign-in/email`) return `403 Invalid origin` for the current origin even though CORS headers match — likely a Neon-console-side "Trusted Domains" config gap. Out of scope since the user's flow is Google-only, but flagged for future email/password support.
-
-### Previous pass (2026-08-18, third pass) — Layer #5 shipped
-- **`backend/eval_meta.py`** (new): the composite score's fixed weights (coverage×0.4 + rater×0.4 + novelty×0.2) are now data-driven. `maybe_recompute()` (throttled, ≤1/hr, called opportunistically from `/verify` and `/check-edits`) buckets recent complete builds into "good" (✓ Verify AND never edit-diffed) vs "bad", measures the mean-gap per dimension, floors each weight at 0.1, and blends 70% prior / 30% freshly computed for stability. Gated on `MIN_SAMPLE_SIZE=15` so early on the rubric stays exactly at defaults.
-- `GET /api/eval-weights` (public) — current weights + sample_size + is_default, for transparency.
-- `chain_generator.composite_v2()` now takes a `weights` param (`.get()`-safe against a partial/malformed doc — testing_agent-flagged fix); every scored generation on trial/paid tiers stamps `eval_weights` used. Free tier (teacher+artist only) never touches this path — unchanged, pre-existing behavior.
-- Frontend: `ChainViewer.jsx` shows a small "scored via: cov X% · rater X% · novelty X%" line under COMPOSITE when present.
-- **2 LOW bugs fixed from iteration_10**: `edits.py`'s `_store_diff` now returns `seconds_since_build` immediately in the `check-edits` response (no reload needed); `App.js`'s auth check now skips `/api/auth/me` entirely when there's no Neon JWT (was 401-spamming on every anon page load).
-- Tested: testing_agent iteration_11 — 18/18 backend pytest + full Playwright frontend, 100% pass, no critical issues.
-
-### Not yet built (deferred, per user's stated order: #7 done → #5 done → #1 next)
-- **#1 — Prompt/instruction self-tuning**: rewrite Teacher/Artist system prompts based on outcome data. `corrections_digest()` (Layer #7) already feeds per-build hints into the Teacher prompt, but the prompts themselves are still static — this is the next planned layer.
-- **#2, #3, #4, #6, #8** (test-gen loop, error-pattern library, architecture-decision tracking, dependency allow/avoid list, auto-doc context): not scoped, no sequencing decided beyond #7→#5→#1.
-
-### Previously shipped (2026-08-18, second pass — Layer #7 User Edit Diffing)
-User asked to make every decision layer of the app recursive (prompt/instruction, test-gen, error-pattern library, architecture decisions, eval-criteria meta-loop, dependency selection, user-edit diffing, docs/context). Agreed sequencing: **#7 (User Edit Diffing) first** — it's the ground-truth signal everything else (#5, #1) would otherwise guess at.
-
-- **`backend/edits.py`** (new): every completed build gets a `build_manifest` (sha256 per file) + `built_at` stamped on the chain doc (`Chain` Pydantic model gained these + `github` fields — root-cause fix for a bug where they were silently stripped from every API response).
-- **`POST /api/chains/{id}/check-edits`**: two ways in — (a) if pushed to GitHub, diffs the pushed commit vs current HEAD via GitHub's compare API (`check_git_edits`, untested live — no PAT available in this env); (b) upload the edited project as a `.zip` (`check_upload_edits`) — hash-compared against the manifest, real unified diffs via `difflib`. Upload takes priority over the git path when both are present. Path-normalization handles one level of nested-zip folders. Append-only storage with de-dup against the last identical hunk (no spam on repeat checks).
-- **`GET /api/chains/{id}/edit-diffs`**: persisted history of detected corrections per chain.
-- **Feedback loop closed**: `corrections_digest()` pulls the 5 most recent cross-tenant corrections and injects them into every new build's Teacher prompt as "COMMON USER CORRECTIONS ACROSS PRIOR BUILDS" — this is what makes the loop recursive, not just a diff viewer.
-- **Frontend**: `ChainViewer.jsx` gained a "check for edits"/"upload edits" button (context-sensitive on whether the chain was pushed), a hidden `.zip` file input, and a "LEARNED CORRECTIONS" panel with per-file expandable diff hunks.
-- **Storage**: `edit_diffs` is a new logical collection inside the *same* single Postgres `docs` table (docdb.py) — no new database, no migration, confirmed auto-created and populated.
-- **Bug found+fixed mid-session** (correction-pass trigger in `chain_generator.py` was gated on non-empty stderr, silently skipping correction + reporting "already working" right after EXECUTE said "failed to start" — now fixed in both the checkpointed and legacy code paths, verified live via curl).
-- Tested: testing_agent iteration_10 — 13/13 backend pytest cases + full Playwright frontend flow, 100% pass, no critical issues (2 cosmetic LOW items noted below).
-
-### Not yet built (explicitly deferred, next up per user's stated order)
-- **#5 — Evaluation criteria meta-loop**: recursively refine the scoring rubric itself using acceptance signals (✓ Verify button + now also edit-diff volume/severity as a proxy). NOT started.
-- **#1 — Prompt/instruction self-tuning**: rewrite Teacher/Artist system prompts based on which produced the highest-scoring, least-corrected builds. NOT started (the corrections_digest feed into the Teacher prompt is a first step toward this, but the prompts themselves are still static).
-- **#2, #3, #4, #6, #8** (test-gen loop, error-pattern library, architecture-decision tracking, dependency allow/avoid list, auto-doc context): not scoped yet, no user decision made on sequencing beyond "#7 → #5 → #1".
-
-### Previously shipped (2026-08-18, first pass — Pricing page, trial repricing, annual billing)
-- **New Pricing page** (`PricingPage.jsx`) — 3 plan cards (Free/Trial/Paid), reachable from landing nav, build-view header, and Settings "see full plans" link. Monthly/annual toggle for the Paid card.
-- **Trial repriced**: was free/no-card, now a **$2.99 one-time Stripe charge** (`plan=trial` in `/api/tier/checkout`, mode="payment") — priced to cover the trial's own NVIDIA compute cost. `/api/tier/start-trial` (the old free path) is now gated behind `ALLOW_MOCK_BILLING=true` and 410s otherwise.
-- **Trial is NVIDIA-only end to end**: `providers.TIER_ASSIGNMENTS["trial"]` and new `TRIAL_FALLBACKS` route all 6 roles (teacher/architect/artist/reviewer/rater/corrector) through NVIDIA only — even the error-path fallback never reaches a metered OpenRouter/Venice call.
-- **Annual billing** added for the $16/mo plan (`plan=paid_annual`, same entitlement as `paid`, just a different Stripe price/interval). `billing.get_cycle()` now does lazy 30-day renewal so credits refill monthly regardless of billing interval (no Stripe webhook needed per renewal).
-- **`GET /api/tier/prices`** (public, cached 1h) — Stripe-backed with static fallback, so the Pricing page never hardcodes a price that can drift from what Stripe actually charges.
-- **Bug fixes** (found by testing_agent iterations 8 & 9): `teacher_step` now raises `TeacherFailedError` instead of silently faking a spec when the LLM returns nothing; `handleEvolve`'s catch branch now calls `refresh()` so failed builds show up in history immediately; Pricing page's back button now returns to wherever it was opened from instead of always landing; **correction-pass trigger bug** — `correct` stage was gated on `stderr` or `review_notes` being non-empty, so a failed build with no stderr (e.g. SIGTERM/-15 timeout, static HTML never binding a port) silently skipped correction and reported "already working" right after EXECUTE said "failed to start". Fixed in both the checkpointed `run_stage` path and the legacy (dead but fixed for consistency) `evolve_chain_with_callback`.
-- Env vars still needed on Render (user creating in Stripe, not yet supplied): `STRIPE_PRICE_ID_TRIAL` (one-time $2.99), `STRIPE_PRICE_ID_PAID_ANNUAL` (recurring yearly). `STRIPE_PRICE_ID_PAID`/`STRIPE_SECRET_KEY`/`STRIPE_WEBHOOK_SECRET` + 5 Groq keys already added by user in Render.
-
-### Previously shipped (2026-08-09 — Postgres + Neon Auth migration)
-- **Mongo → Neon Postgres migration.** Built `docdb.py` — a tiny mongo-look-alike over JSONB (`find_one`, `find`, `insert_one`, `update_one`, `update_many`, `count_documents`, `.sort().limit().to_list()`, `$set`, `$push`, upserts). Swapped all ~15 mongo call sites in `server.py` without rewriting business logic. Verified end-to-end: chain built, files generated, scored 2.62 composite, owner-isolated (404 on wrong session). Motor & DB_NAME/MONGO_URL removed.
-- **Emergent Google Auth → Neon Managed Better Auth.** Backend verifies EdDSA JWTs from Neon's JWKS. Frontend uses `better-auth/react` — sign-in redirects through Neon → Google → back to app; JWT auto-refreshes and is attached to every `/api/*` request as `Authorization: Bearer`. Sign-in flow verified live (Google OAuth page reached).
-- **CORS + trusted domains configured** for the preview URL in the Neon Auth dashboard.
-
-### Historical (previous sessions)
-- Real code gen (Artist emits actual source files, seed_template fills gaps).
-- Hard failure, never fake success (Artist retries 3× then chain hard-fails).
-- SSE streaming (Teacher/Artist tokens live in a two-pane console).
-- BYOK (users paste OpenRouter/Venice/NVIDIA keys — never leaked back to client).
-- GitHub push (creates repo + writes files + git push via env-fed GIT_ASKPASS).
-- Verified filter tab in the Archive.
-- Orphan sweep on boot (`running` chains → `failed`).
-- Executor kills whole process group (`os.setsid` + `os.killpg`).
-- Security audit fixes (SEC-001/002/004 closed).
-- Chain ownership across all 8 chain endpoints (SEC-003 closed).
-
-## Backlog
-
-### P0 — none open (auth sign-in fix shipped 2026-08-19, pending human verification on live Vercel deploy)
-
-### P1 — Recursive self-improvement layers (user's stated priority: #7 done, #5 done → #1 next)
-- **#1 Prompt/instruction self-tuning** (`backend/prompt_evolution.py` — file created, empty, next up): rewrite Teacher/Artist system prompts based on outcome data (which prompts→highest scores, fewest corrections). User mandated a strict rule-based template (no soft qualifiers, no conversational prompts):
-  `[ROLE: {role definition}] [CONSTRAINTS: {mandatory output requirements}] [NEGATIONS: {prohibited elements/phrases}] [EXAMPLES: Input: {A} | Output: {B}] [DATA: ###{{USER_INPUT}}###]`
-  Use "Must/Shall", never "Please/Try to". Zero-shot, no preamble. `corrections_digest()` (Layer #7) already feeds per-build hints into the Teacher prompt, but the prompts themselves are still static — this is the next planned layer.
-- GitHub compare path (`check_git_edits` in edits.py) and paid/trial-tier `eval_weights` wiring have never been exercised live end-to-end — no Google login / GitHub PAT available in this env. Verified by code inspection + unit-level calls only.
-- (Optional, LOW) `eval_meta.maybe_recompute()` runs inline inside `/verify`/`/check-edits` — once sample_size clears 15 it scans up to 500 chains on that one request. Fine at current scale; move to `BackgroundTasks` if it ever becomes noticeable.
-- `tiers.py`'s monthly-plan price lookup now accepts BOTH `STRIPE_PRICE_ID_PAID` and the shorter legacy `STRIPE_PRICE_ID` (user already had the latter set in Render for the pre-existing monthly plan) — `STRIPE_PRICE_ID_PAID` wins if both are set. Trial/annual only accept their own explicit names (`STRIPE_PRICE_ID_TRIAL` / `STRIPE_PRICE_ID_PAID_ANNUAL`, added this session).
-
-### P1 — Product / billing follow-ups
-- User needs to paste `STRIPE_PRICE_ID_TRIAL` and `STRIPE_PRICE_ID_PAID_ANNUAL` into Render once created in Stripe.
-- Credit top-up packs — no price/size decided yet.
-
-### P2 — Polish
-- Seed the verified pool with 5-10 pre-verified builds.
-- TOS / Privacy pages.
-- Neon's own `/token` endpoint still logs ~6-14 401s per anon session in console (out of scope for the auth-me fix this round — gate on a Neon session cookie if a fully clean console matters).
-- `edits._normalize_upload_paths` only strips one leading path segment — a zip nested 2+ levels deep would still miss.
-- `GET /edit-diffs` caps at 50 rows, no pagination.
-- `/api/tier/prices` cache has no manual bust — 1h staleness after a Stripe price edit.
-- BYOK strict `user_id` resolution on the signed-in path.
-- Obsolete backend tests still reference Mongo (`tests/test_auth.py`, `tests/test_iteration6_fixes.py`) — rewrite for Postgres + Neon JWT or delete.
-
-### Known env gap (this preview only, not production)
-- No `GROQ_API_KEY` configured here → default anonymous free-tier builds fail at the Teacher step with a clear error (not a silent fake). User confirmed 5 keys already in Render for production. Workaround for testing here: point Settings at an OpenRouter model.
-
-## Credentials
-- All secrets in `/app/backend/.env` and `/app/frontend/.env`. Never committed.
+## Backlog (P1/P2/P3)
+- P2: Optionally split SettingsPanel.jsx (now ~530 lines) into smaller
+  components (billing / teams / roles / BYOK) — code-health only, not
+  user-facing.
+- P3: Layer #2 Test Generation Loop, #3 Error Pattern Library,
+  #4 Architecture Decisions loop, #6 Dependency Selection loop.
