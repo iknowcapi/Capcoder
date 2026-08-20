@@ -79,6 +79,16 @@ pipeline, Tier System (free/trial/paid), Uncensored Mode waiver (Venice).
   `/api/settings` GET/POST already use, not a new regression. Would need a
   broader auth-flow change to fix consistently; out of scope for this session.
 
+## Deployment reality check (Aug 2026)
+This preview sandbox is where I build/test everything. The user's LIVE app is
+on Vercel (frontend) + Render (backend), deployed by manually downloading a
+zip (their GitHub push integration is broken). **Nothing I build here reaches
+their live site until they redeploy that zip.** Confirmed via deployment_agent
+scan (Aug 2026): no code blockers, CORS/`.gitignore`/auth-redirect all pass.
+Live-site "sign in / upgrade broken, no profile" reports are most likely stale
+code, not a new regression — pending user confirmation of exact live error +
+whether `STRIPE_SECRET_KEY` is actually set in Render's env vars.
+
 ## Backlog (P1/P2/P3)
 - P2: Optionally split SettingsPanel.jsx (now ~530 lines) into smaller
   components (billing / teams / roles / BYOK) — code-health only, not
