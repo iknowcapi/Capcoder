@@ -80,8 +80,10 @@ def provider_key(name: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # Groq key rotation pools
 # ---------------------------------------------------------------------------
-# Free-tier pool: GROQ_API_KEY_1, GROQ_API_KEY_2, ... (set as many as you have
-# in Vercel env vars). Trial-tier pool: GROQ_TRIAL_KEY_1, GROQ_TRIAL_KEY_2, ...
+# Free-tier pool: GROQ_API_KEY_1, GROQ_API_KEY_2, ... Trial-tier pool:
+# GROQ_TRIAL_KEY_1, GROQ_TRIAL_KEY_2, ... Set these on the BACKEND service
+# (Render) — this module only runs server-side and never sees Vercel's env
+# vars, which only apply to the static frontend build.
 # Kept as SEPARATE pools so trial traffic can never starve free-tier capacity.
 _groq_pool_idx = {"free": 0, "trial": 0}
 
