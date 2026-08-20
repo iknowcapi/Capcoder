@@ -30,11 +30,24 @@ pipeline, Tier System (free/trial/paid), Uncensored Mode waiver (Venice).
    $32→2000cr), `add_topup_credits`/`get_topup_balance`, persistent
    `users.topup_credits_balance` (doesn't expire on cycle renewal; spent
    before card overage in `apply_chain_billing`). Endpoints:
-   `GET /api/tier/topup/packages`, `POST /api/tier/topup/checkout` (mock path
-   via ALLOW_MOCK_BILLING=true when no Stripe key, same pattern as existing
-   trial/paid checkout). Env vars needed in Render for real Stripe:
-   `STRIPE_PRICE_ID_CREDITS_8`, `STRIPE_PRICE_ID_CREDITS_16`,
-   `STRIPE_PRICE_ID_CREDITS_32`.
+   `GET /api/tier/topup/packages`, `POST /api/tier/topup/checkout`.
+   **REAL Stripe wired (Aug 2026)**: provisioned an Emergent-managed
+   claimable Stripe test sandbox (`acct_1U6LKqRT8QV9RDE8`) and created all 6
+   real Price objects (trial/paid/paid_annual/credits_8/16/32) in it —
+   `STRIPE_SECRET_KEY`, `STRIPE_PUBLISHABLE_KEY`, `STRIPE_WEBHOOK_SECRET`,
+   and all `STRIPE_PRICE_ID_*` vars are now live in `backend/.env`,
+   `ALLOW_MOCK_BILLING=false`. Webhook endpoint re-pointed to the app's real
+   route `/api/tier/webhook` (Stripe's dashboard defaulted it to
+   `/api/stripe/webhook`, which doesn't exist in this app). Verified all 6
+   checkout sessions create real Stripe Checkout URLs. Tax mode: **DIY**
+   (Stripe just processes payment, no tax calc/filing) — matches the
+   existing checkout code which never enabled automatic_tax. Can switch to
+   Stripe-calculates-only or full managed tax later on request.
+   **To go live in production (Render)**: claim this sandbox via
+   `https://dashboard.stripe.com/onboard_sandbox/YWNjdF8xVTZMS3FSVDhRVjlSREU4LDE3ODc4MDU0NjEv100m7xhtfBX`
+   (completes Stripe KYC on the user's real business), then copy the same
+   6 env vars from this pod's `backend/.env` into Render's env vars. Live
+   keys auto-activate once KYC clears — no code changes needed.
 4. **User Profile UI** — `GET /api/profile` (email, tier, trial days left,
    billing cycle, topup balance). New `ProfilePanel.jsx`, "profile" button in
    App.js header (only shown when signed in).
