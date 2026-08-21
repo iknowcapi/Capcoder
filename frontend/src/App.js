@@ -234,7 +234,15 @@ function App() {
             fontFamily: "'IBM Plex Mono', monospace", fontSize: "13px",
           },
         }} />
-        <LandingPage onStart={() => setView("build")} onPricing={() => openPricing("landing")} onLegal={(doc) => openLegal(doc, "landing")} />
+        <LandingPage
+          onStart={() => setView("build")}
+          onPricing={() => openPricing("landing")}
+          onLegal={(doc) => openLegal(doc, "landing")}
+          user={user}
+          checkingAuth={checkingAuth}
+          onSignIn={handleSignIn}
+          onSignOut={handleSignOut}
+        />
       </div>
     );
   }
@@ -266,8 +274,10 @@ function App() {
         }} />
         <PricingPage
           user={user}
+          checkingAuth={checkingAuth}
           onBack={() => setView(pricingReturnView)}
           onSignIn={handleSignIn}
+          onSignOut={handleSignOut}
           onStart={() => setView("build")}
           onLegal={(doc) => openLegal(doc, "pricing")}
         />

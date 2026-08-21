@@ -19,7 +19,7 @@ const DEFAULT_PRICES = {
 
 const fmt = (amount) => (Number.isInteger(amount) ? amount.toFixed(0) : amount.toFixed(2));
 
-export const PricingPage = ({ user, onBack, onSignIn, onStart, onLegal }) => {
+export const PricingPage = ({ user, onBack, onSignIn, onSignOut, checkingAuth, onStart, onLegal }) => {
   const [busy, setBusy] = useState(null); // "trial" | "paid" | null
   const [annual, setAnnual] = useState(false);
   const [prices, setPrices] = useState(DEFAULT_PRICES);
@@ -71,7 +71,7 @@ export const PricingPage = ({ user, onBack, onSignIn, onStart, onLegal }) => {
     <div className="min-h-screen flex flex-col relative overflow-hidden" data-testid="pricing-page">
       <AmbientBackground />
 
-      <header className="relative z-10 max-w-5xl mx-auto w-full px-6 pt-8">
+      <header className="relative z-10 max-w-5xl mx-auto w-full px-6 pt-8 flex items-center justify-between">
         <button
           data-testid="pricing-back"
           onClick={onBack}
@@ -79,6 +79,27 @@ export const PricingPage = ({ user, onBack, onSignIn, onStart, onLegal }) => {
         >
           <ArrowLeft size={14} /> capcode
         </button>
+        <span data-testid="auth-status-badge" className="flex items-center gap-1.5 text-xs font-mono">
+          {checkingAuth ? (
+            <span className="text-text3">checking session…</span>
+          ) : user ? (
+            <>
+              <span className="w-1.5 h-1.5 rounded-full bg-canary" />
+              <span className="text-text2" data-testid="auth-status-email">{user.email}</span>
+              <button data-testid="auth-status-sign-out" onClick={onSignOut} className="text-text3 hover:text-text2 underline">
+                sign out
+              </button>
+            </>
+          ) : (
+            <>
+              <span className="w-1.5 h-1.5 rounded-full bg-text3" />
+              <span className="text-text3" data-testid="auth-status-signed-out">not signed in</span>
+              <button data-testid="auth-status-sign-in" onClick={onSignIn} className="text-canary hover:underline">
+                sign in
+              </button>
+            </>
+          )}
+        </span>
       </header>
 
       <main className="flex-1 relative z-10">

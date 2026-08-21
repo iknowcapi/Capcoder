@@ -2,12 +2,33 @@ import React from "react";
 import { ArrowRight } from "lucide-react";
 import { AmbientBackground } from "@/components/AmbientBackground";
 
-export const LandingPage = ({ onStart, onPricing, onLegal }) => {
+export const LandingPage = ({ onStart, onPricing, onLegal, user, checkingAuth, onSignIn, onSignOut }) => {
   return (
     <div className="min-h-screen flex flex-col relative overflow-hidden">
       <AmbientBackground />
 
-      <nav className="relative z-10 flex justify-end px-6 pt-6">
+      <nav className="relative z-10 flex justify-end items-center gap-4 px-6 pt-6">
+        <span data-testid="auth-status-badge" className="flex items-center gap-1.5 text-xs font-mono">
+          {checkingAuth ? (
+            <span className="text-text3">checking session…</span>
+          ) : user ? (
+            <>
+              <span className="w-1.5 h-1.5 rounded-full bg-canary" />
+              <span className="text-text2" data-testid="auth-status-email">{user.email}</span>
+              <button data-testid="auth-status-sign-out" onClick={onSignOut} className="text-text3 hover:text-text2 underline">
+                sign out
+              </button>
+            </>
+          ) : (
+            <>
+              <span className="w-1.5 h-1.5 rounded-full bg-text3" />
+              <span className="text-text3" data-testid="auth-status-signed-out">not signed in</span>
+              <button data-testid="auth-status-sign-in" onClick={onSignIn} className="text-canary hover:underline">
+                sign in
+              </button>
+            </>
+          )}
+        </span>
         <button
           data-testid="landing-pricing-link"
           onClick={onPricing}

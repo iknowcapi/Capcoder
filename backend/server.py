@@ -1427,7 +1427,20 @@ app.include_router(_tiers.router)
 # platform's own preview domains + localhost dev only; any real deployment
 # MUST set CORS_ORIGINS explicitly or cross-origin requests are rejected.
 _cors_env = (os.environ.get("CORS_ORIGINS") or "").strip()
-if _cors_env and _cors_env != "*":
+if _cors_env == "*":
+    # Explicit wildcard: reflect whatever Origin the browser sends. A literal
+    # "*" cannot be combined with allow_credentials per browser spec, so this
+    # is the only way "*" can mean what it looks like it means — previously
+    # it silently fell through to the Emergent-only fallback below instead,
+    # which is NOT what a deployer setting CORS_ORIGINS=* would expect.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_credentials=True,
+        allow_origin_regex=r".*",
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+elif _cors_env:
     app.add_middleware(
         CORSMiddleware,
         allow_credentials=True,
