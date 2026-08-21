@@ -89,6 +89,58 @@ Live-site "sign in / upgrade broken, no profile" reports are most likely stale
 code, not a new regression — pending user confirmation of exact live error +
 whether `STRIPE_SECRET_KEY` is actually set in Render's env vars.
 
+## Auth bug — ROOT CAUSE FOUND + FIXED (Aug 2026, this session)
+Two independent real bugs were causing "sign-in silently fails / bounces to
+logged-out state", found by reproduction (not guesswork):
+1. **`authClient.js` never used the proxy at all.** Despite the backend
+   `/api/neon-auth/{path}` reverse proxy and the Vercel serverless proxy
+   `api/neon-auth/[...path].js` both existing in the repo, the browser client
+   was still built with `createInternalNeonAuth(process.env.REACT_APP_NEON_AUTH_URL)`
+   — the RAW cross-domain Neon URL — bypassing both proxies entirely. That
+   makes Neon's session cookie third-party to the app's own domain, which
+   Safari/ITP (and increasingly Chrome) blocks, so `get-session` always came
+   back `null` right after a real OAuth login. **Fix**: `authClient.js` now
+   builds the URL as `${window.location.origin}/api/neon-auth` at runtime —
+   always same-origin, in every environment (this preview's ingress routes
+   `/api/*` to the FastAPI proxy; Vercel resolves it to the serverless
+   function). Verified end-to-end via curl: sign-up → cookie set host-only
+   (no `Domain=` attr, confirmed via a real Neon response) → `get-session`
+   returns the real session → `/token` mints a real JWT — full loop works
+   through the proxy.
+2. **Backend JWT verification always failed with `InvalidAudienceError`.**
+   `_verify_neon_jwt` (server.py) called `pyjwt.decode()` without an
+   `audience` param. PyJWT rejects any token that has an `aud` claim unless
+   you explicitly pass the expected audience — Neon's tokens always have
+   `aud` = the auth server's bare origin (`scheme://host`, NOT the full
+   `.../neondb/auth` path — confirmed by decoding a real signed token). So
+   even a perfectly valid session/JWT would 401 at `/api/auth/me`, which is
+   exactly "logs in then bounces back to signed-out" from the user's POV.
+   **Fix**: added `_NEON_AUTH_ORIGIN` (bare origin parsed from `NEON_AUTH_URL`)
+   and pass it as `audience=` in the decode call. Verified: minted a real JWT
+   via the proxy, `/api/auth/me` and `/api/profile` both now correctly return
+   the signed-in user (previously always "not authenticated").
+3. Added a startup print in `usage.py` (`groq key pools loaded: free=N
+   trial=N`) so Render logs make it instantly visible whether the Groq key
+   env vars were actually picked up after a redeploy — was previously
+   silent, making that recurring issue hard to confirm either way.
+
+**Could not fully click-through test via a real browser OAuth redirect in
+this preview**: Neon's trusted-origins allowlist only includes the real
+production domain (`capcode-mu.vercel.app`, confirmed accepted when spoofing
+that Origin directly against Neon) — this ephemeral preview domain isn't
+registered there (expected; it changes every fork) so `sign-up`/`sign-in`
+calls from an actual browser tab on this preview URL correctly get rejected
+with `INVALID_ORIGIN` by Neon itself, not by our code. This is why testing
+was done via curl + a real minted JWT instead of a live Google OAuth click.
+**Both fixes are code-only (`authClient.js`, `server.py`, `usage.py`) and
+must be redeployed (GitHub push → Vercel + Render) to take effect on the
+live site — nothing changes on the live site until that happens.**
+
+Regression check: existing `tests/test_auth.py` / `test_ownership.py`
+failures using a hardcoded `"MY_TEST_TOKEN"` string are pre-existing and
+unrelated (confirmed via `git stash` — identical failures before my changes;
+those tests predate the Neon Auth migration and were never passing).
+
 ## Backlog (P1/P2/P3)
 - P2: Optionally split SettingsPanel.jsx (now ~530 lines) into smaller
   components (billing / teams / roles / BYOK) — code-health only, not

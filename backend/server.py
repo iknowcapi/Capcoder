@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 import uuid
 from pathlib import Path
 from typing import List, Optional
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from fastapi import APIRouter, BackgroundTasks, FastAPI, File, HTTPException, Request, UploadFile
@@ -264,6 +265,10 @@ api = APIRouter(prefix="/api")
 # our backend. We verify the JWT against Neon Auth's JWKS (EdDSA / Ed25519).
 NEON_AUTH_URL = os.environ["NEON_AUTH_URL"].rstrip("/")
 NEON_JWKS_URL = f"{NEON_AUTH_URL}/.well-known/jwks.json"
+# Neon signs `aud`/`iss` as the bare origin (scheme://host), NOT the full
+# `.../neondb/auth` path — confirmed by decoding a real token. Must match
+# exactly or PyJWT's audience check always fails.
+_NEON_AUTH_ORIGIN = "{0.scheme}://{0.netloc}".format(urlparse(NEON_AUTH_URL))
 
 import jwt as _pyjwt  # PyJWT
 from jwt import PyJWKClient
@@ -332,11 +337,16 @@ def _verify_neon_jwt(token: str) -> Optional[dict]:
     """Verify a Neon Better Auth JWT and return the claims dict, or None on failure."""
     try:
         signing_key = _jwks_client.get_signing_key_from_jwt(token)
-        # Neon Managed Better Auth signs with EdDSA (Ed25519).
+        # Neon Managed Better Auth signs with EdDSA (Ed25519) and always sets
+        # `aud` to the Neon Auth base URL. PyJWT raises InvalidAudienceError
+        # if a token has an `aud` claim but no `audience` is passed to
+        # decode() — so this must always be supplied, or every real Neon
+        # token fails verification (silently logging every user back out).
         claims = _pyjwt.decode(
             token,
             signing_key.key,
             algorithms=["EdDSA"],
+            audience=_NEON_AUTH_ORIGIN,
             options={"require": ["sub", "exp"]},
         )
         return claims
