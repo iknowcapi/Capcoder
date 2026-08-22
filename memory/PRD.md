@@ -141,6 +141,29 @@ failures using a hardcoded `"MY_TEST_TOKEN"` string are pre-existing and
 unrelated (confirmed via `git stash` — identical failures before my changes;
 those tests predate the Neon Auth migration and were never passing).
 
+## Upgrade bug — "price specified is inactive" (Aug 2026)
+Reproduced against the real Stripe account: `checkout.Session.create` code
+path itself is correct (verified all 4 flows — paid/paid_annual/trial/topup —
+create real Stripe Checkout URLs successfully in this pod). Root cause is
+**Render's env vars are stale**, left over from before an earlier session's
+"split Stripe products for correct card images" cleanup archived the old
+prices. Confirmed via Stripe API: the OLD `CapCode Subscription` / `CapCode
+7-Day Trial` / `CapCode Credit Top-Up` products' prices are now `active:
+false` in Stripe. If Render still has those old IDs in
+`STRIPE_PRICE_ID_PAID` / `STRIPE_PRICE_ID_PAID_ANNUAL` /
+`STRIPE_PRICE_ID_TRIAL` / `STRIPE_PRICE_ID_CREDITS_*`, Stripe correctly
+rejects checkout with "price specified is inactive" — exactly the reported
+symptom. **Not a code bug** — the current CURRENT active price IDs (already
+correct in this pod's `backend/.env`, must be copied into Render as-is):
+- `STRIPE_PRICE_ID_TRIAL=price_1U6WYaRT8QV9RDE8dv78eYxT`
+- `STRIPE_PRICE_ID_PAID=price_1U6WYZRT8QV9RDE8mEA29MOB`
+- `STRIPE_PRICE_ID_PAID_ANNUAL=price_1U6OZnRT8QV9RDE8cxSJwa3Q`
+- `STRIPE_PRICE_ID_CREDITS_8=price_1U6OZoRT8QV9RDE83KLEJFea`
+- `STRIPE_PRICE_ID_CREDITS_16=price_1U6OZoRT8QV9RDE8ang5EKld`
+- `STRIPE_PRICE_ID_CREDITS_32=price_1U6OZoRT8QV9RDE8iUlOwmWn`
+Also confirm `STRIPE_SECRET_KEY`/`STRIPE_PUBLISHABLE_KEY` on Render point to
+the same sandbox account (`acct_1U6LKqRT8QV9RDE8`) these price IDs live in.
+
 ## Backlog (P1/P2/P3)
 - P2: Optionally split SettingsPanel.jsx (now ~530 lines) into smaller
   components (billing / teams / roles / BYOK) — code-health only, not
